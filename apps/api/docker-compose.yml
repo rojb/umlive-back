@@ -10,7 +10,16 @@ services:
       POSTGRES_PASSWORD: umlive
       POSTGRES_DB: umlive
     ports:
-      - "5432:5432"
+      # NOTA (descubierto durante `sdd-apply` de `auth`, 2026-09-12): el puerto
+      # 5432 del host ya está ocupado por un contenedor de OTRO proyecto en
+      # esta máquina (`mizenplace-postgres`), corriendo desde antes. Publicar
+      # ahí no falla ruidosamente: el contenedor de este proyecto queda vivo
+      # pero SIN el puerto publicado, y cualquier cliente que hable a
+      # localhost:5432 termina hablando con la base ajena — el síntoma es un
+      # rechazo de autenticación que no tiene nada que ver con las credenciales
+      # de este proyecto. Se remapea a 5434 (libre) solo en el host; el
+      # contenedor sigue escuchando 5432 puertas adentro.
+      - "5434:5432"
     volumes:
       - umlive-pgdata:/var/lib/postgresql/data
     healthcheck:

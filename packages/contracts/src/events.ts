@@ -62,5 +62,5 @@ export const PRESENCE_COLORS = ['#2B6CB8', '#7A4FD0', '#0E7C86', '#A8446B', '#B0
 export function presenceColor(userId: string): string {
   let h = 0;
   for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) >>> 0;
-  return PRESENCE_COLORS[h % PRESENCE_COLORS.length];
+  return PRESENCE_COLORS[h % PRESENCE_COLORS.length]!;
 }

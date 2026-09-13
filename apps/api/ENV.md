@@ -18,6 +18,13 @@ saber dónde está el backend.
 El valor por defecto coincide con el `docker-compose.yml` de esta carpeta, así
 que `npm run db:up` y listo. Si usás una base gestionada, cambiala.
 
+> **Puerto 5434, no 5432** (descubierto en `sdd-apply` de `auth`, 2026-09-12).
+> En esta máquina de desarrollo el 5432 ya lo ocupa un contenedor de otro
+> proyecto. `docker-compose.yml` publica `umlive-db` en `5434` del host (el
+> contenedor sigue escuchando `5432` puertas adentro). Si tu máquina no tiene
+> ese conflicto, `5432:5432` también funciona — solo mantené `DATABASE_URL`
+> coherente con el puerto que de verdad publicaste.
+
 > **Prisma 7 no carga el `.env` solo.** `prisma.config.ts` lo carga explícitamente
 > con `dotenv`, desde una ruta anclada a sí mismo. Por eso los comandos funcionan
 > igual desde `apps/api` o desde donde sea.
@@ -38,6 +45,7 @@ que `npm run db:up` y listo. Si usás una base gestionada, cambiala.
 | `JWT_REFRESH_SECRET` | Firma del refresh token. **Distinto del anterior** |
 | `ACCESS_TOKEN_TTL` | Vida del access token |
 | `REFRESH_TOKEN_TTL` | Vida del refresh token |
+| `AUTH_THROTTLE_PEPPER` | Secreto del HMAC que llavea el limitador de intentos de login (`login-attempts.service.ts`). Nunca se guarda el email en claro en memoria — ver `design.md` §2.1 |
 
 Generá cada secreto por separado:
 
@@ -118,7 +126,8 @@ como no disponible en la interfaz en vez de fallar al invocarlo (SC-D02):
 
 ```dotenv
 # ── Base de datos ───────────────────────────────────────────────
-DATABASE_URL="postgresql://umlive:umlive@localhost:5432/umlive?schema=public"
+# Puerto 5434: ver nota arriba sobre el conflicto de 5432 en esta máquina.
+DATABASE_URL="postgresql://umlive:umlive@localhost:5434/umlive?schema=public"
 
 # ── Servidor ────────────────────────────────────────────────────
 PORT=3000
@@ -131,6 +140,7 @@ JWT_ACCESS_SECRET="cambiar-esto"
 JWT_REFRESH_SECRET="cambiar-esto-tambien"
 ACCESS_TOKEN_TTL="15m"
 REFRESH_TOKEN_TTL="30d"
+AUTH_THROTTLE_PEPPER="cambiar-esto-tambien-2"
 
 # ── IA ──────────────────────────────────────────────────────────
 AI_DEFAULT_PROVIDER="gemini"
