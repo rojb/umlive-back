@@ -54,7 +54,18 @@ export const PROJECT_PERMISSIONS = {
   'diagram.create': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Create / rename / delete diagram' },
   'diagram.rename': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Create / rename / delete diagram' },
   'diagram.delete': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Create / rename / delete diagram' },
-  'diagram.view': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'projects', frA13Row: 'View diagram' },
+  /**
+   * Bajada de `'projects'` a `'M2'` el 2026-09-13, decisión del dueño del
+   * producto. Estaba declarada como verificable por la rebanada `projects`
+   * pero **ninguna ruta la ejercía**: `diagrams.controller.ts` solo tiene
+   * `POST`/`PATCH`/`DELETE`, y B1 lista los diagramas a través de
+   * `GET /projects/:projectId`, o sea `project.view`. Las dos salidas eran
+   * agregar un `GET /projects/:projectId/diagrams/:diagramId` que nadie pedía,
+   * o admitir que esta fila todavía no tiene llamador. Se eligió lo segundo:
+   * leer un diagrama individual recién significa algo cuando existe el lienzo
+   * que lo dibuja, y ese es M2.
+   */
+  'diagram.view': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M2', frA13Row: 'View diagram' },
   'joinCode.generate': { roles: ['HOST'], enforcedSince: 'join-codes', frA13Row: 'Generate / revoke join code' },
   'joinCode.revoke': { roles: ['HOST'], enforcedSince: 'join-codes', frA13Row: 'Generate / revoke join code' },
   'diagram.lock': { roles: ['HOST'], enforcedSince: 'M4', frA13Row: 'Lock / unlock diagram' },
