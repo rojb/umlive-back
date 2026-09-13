@@ -1,0 +1,28 @@
+# PostgreSQL 17 para desarrollo local.
+# En producción la base es gestionada (§9 del PRD); esto es solo para trabajar.
+services:
+  db:
+    image: postgres:17
+    container_name: umlive-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: umlive
+      POSTGRES_PASSWORD: umlive
+      POSTGRES_DB: umlive
+    ports:
+      - "5432:5432"
+    volumes:
+      - umlive-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umlive -d umlive"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  umlive-pgdata:
+
+# NOTA (M7): este compose levanta SOLO la base de desarrollo.
+# El compose de contingencia de la defensa — plataforma completa offline,
+# API + PostgreSQL + web compilada — es otro artefacto y va en la raíz del
+# repositorio, porque compone las dos apps. Ver PRD §10, Demo Configuration.

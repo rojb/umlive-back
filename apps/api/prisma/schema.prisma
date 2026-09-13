@@ -1,0 +1,689 @@
+// UMLive — Prisma schema
+// Target: PostgreSQL 17 · Prisma ORM 7.10.x
+// Companion to DATA-MODEL.md v1.0 and PRD.md v2.3
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THIS FILE IS HALF OF THE SCHEMA.
+//
+// Prisma cannot express CHECK constraints, partial unique indexes, expression
+// indexes, NULLS NOT DISTINCT, or triggers. Those live in
+//   prisma/migrations/20260912000001_integrity/migration.sql
+// and they carry most of the integrity guarantees designed in DATA-MODEL.md:
+// the append-only operation log, the composite-multiplicity rule, single-host
+// per project, active join-code uniqueness.
+//
+// Applying this file alone produces a database that accepts invalid models.
+// Read the operating rules in prisma/README.md before running any migration.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  // Prisma 7: `prisma-client` replaces `prisma-client-js`, and `output` is
+  // mandatory — the client is no longer generated into node_modules.
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Prisma 7: `url` is deprecated here. The connection string lives in
+  // prisma.config.ts so the CLI and the runtime read one source.
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ENUMS  (native PostgreSQL enum types)
+// ═════════════════════════════════════════════════════════════════════════════
+
+enum ProjectRole {
+  HOST
+  PARTICIPANT
+
+  @@map("project_role")
+}
+
+enum DiagramLockState {
+  UNLOCKED
+  LOCKED_BY_HOST
+
+  @@map("diagram_lock_state")
+}
+
+enum ElementKind {
+  PACKAGE
+  CLASS
+  INTERFACE
+  ENUMERATION
+  DATATYPE
+  PRIMITIVE_TYPE
+  COMMENT
+
+  @@map("element_kind")
+}
+
+enum FeatureKind {
+  ATTRIBUTE
+  OPERATION
+
+  @@map("feature_kind")
+}
+
+enum RelationshipKind {
+  ASSOCIATION
+  GENERALIZATION
+  INTERFACE_REALIZATION
+  DEPENDENCY
+  USAGE
+
+  @@map("relationship_kind")
+}
+
+enum Visibility {
+  PUBLIC
+  PRIVATE
+  PROTECTED
+  PACKAGE
+
+  @@map("visibility")
+}
+
+enum AggregationKind {
+  NONE
+  SHARED
+  COMPOSITE
+
+  @@map("aggregation_kind")
+}
+
+enum ParameterDirection {
+  IN
+  OUT
+  INOUT
+  RETURN
+
+  @@map("parameter_direction")
+}
+
+enum OpActorKind {
+  USER
+  AI
+  IMPORT
+
+  @@map("op_actor_kind")
+}
+
+enum AiInputMode {
+  TEXT
+  VOICE
+  IMAGE
+
+  @@map("ai_input_mode")
+}
+
+enum AiTurnStatus {
+  PENDING
+  APPLIED
+  REJECTED
+  FAILED
+  CANCELLED
+
+  @@map("ai_turn_status")
+}
+
+enum XmiVersion {
+  XMI_2_1
+  XMI_2_5_1
+
+  @@map("xmi_version")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// IDENTITY & SESSIONS
+// ═════════════════════════════════════════════════════════════════════════════
+
+model User {
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  // citext, so `@unique` is case-insensitive without an expression index.
+  // See prisma/README.md §3 for why this replaced `lower(email)`.
+  email        String  @unique @db.Citext
+  passwordHash String  @map("password_hash")
+  displayName  String  @map("display_name")
+  avatarUrl    String? @map("avatar_url")
+  locale       String  @default("es")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  refreshTokens      RefreshToken[]
+  passwordResets     PasswordResetToken[]
+  ownedProjects      Project[]            @relation("ProjectOwner")
+  memberships        ProjectMember[]
+  lockedDiagrams     Diagram[]            @relation("DiagramLockedBy")
+  createdJoinCodes   DiagramJoinCode[]
+  operations         DiagramOperation[]
+  aiTurns            AiTurn[]
+  xmiImports         XmiImport[]
+  auditEntries       AuditLogEntry[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String @map("user_id") @db.Uuid
+  tokenHash String @unique @map("token_hash")
+
+  userAgent String? @map("user_agent")
+  ipAddress String? @map("ip_address") @db.Inet
+
+  issuedAt  DateTime  @default(now()) @map("issued_at") @db.Timestamptz(6)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  // Rotation chain (FR-A02). Presenting an already-rotated token is a replay
+  // signal; the service revokes the whole chain when it sees one.
+  replacedById String?       @unique @map("replaced_by") @db.Uuid
+  replacedBy   RefreshToken? @relation("TokenRotation", fields: [replacedById], references: [id], onDelete: SetNull)
+  replaces     RefreshToken? @relation("TokenRotation")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model PasswordResetToken {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId     String    @map("user_id") @db.Uuid
+  tokenHash  String    @unique @map("token_hash")
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(6)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PROJECTS & ACCESS
+// ═════════════════════════════════════════════════════════════════════════════
+
+model Project {
+  id      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // Restrict, not Cascade: deleting a user must not destroy projects other
+  // people participate in. Account deletion has to transfer ownership first.
+  ownerId String @map("owner_id") @db.Uuid
+
+  name        String
+  description String?
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  owner        User             @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+  members      ProjectMember[]
+  diagrams     Diagram[]
+  aiConfig     ProjectAiConfig?
+  auditEntries AuditLogEntry[]
+
+  @@index([ownerId])
+  @@map("projects")
+}
+
+/// FR-A07: role is scoped to the project, never to the account. The same user
+/// is HOST here and PARTICIPANT there, simultaneously.
+model ProjectMember {
+  projectId String      @map("project_id") @db.Uuid
+  userId    String      @map("user_id") @db.Uuid
+  role      ProjectRole
+  joinedAt  DateTime    @default(now()) @map("joined_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  // The dashboard (FR-G04) reads by user, so this index carries the main screen.
+  @@index([userId, role])
+  @@map("project_members")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// DIAGRAMS
+// ═════════════════════════════════════════════════════════════════════════════
+
+model Diagram {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId String @map("project_id") @db.Uuid
+  name      String
+
+  // FR-C09: host freeze
+  lockState DiagramLockState @default(UNLOCKED) @map("lock_state")
+  lockedBy  String?          @map("locked_by") @db.Uuid
+  lockedAt  DateTime?        @map("locked_at") @db.Timestamptz(6)
+
+  /// FR-C01: the monotonic ordering authority. Allocated under
+  /// `SELECT … FOR UPDATE`, which serializes writes per diagram.
+  currentVersion BigInt @default(0) @map("current_version")
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  project       Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  lockedByUser  User?              @relation("DiagramLockedBy", fields: [lockedBy], references: [id], onDelete: SetNull)
+  joinCodes     DiagramJoinCode[]
+  elements      UmlElement[]
+  relationships UmlRelationship[]
+  operations    DiagramOperation[]
+  snapshots     DiagramSnapshot[]
+  xmiImports    XmiImport[]
+  aiTurns       AiTurn[]
+
+  @@index([projectId])
+  @@map("diagrams")
+}
+
+model DiagramJoinCode {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String @map("diagram_id") @db.Uuid
+
+  // Uniqueness among *active* codes is a partial unique index — see
+  // migration.sql `uq_join_code_active`. A revoked code's string is reusable,
+  // which is correct: uniqueness is a property of active codes, not of history.
+  code      String  @db.Citext
+  createdBy String  @map("created_by") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt DateTime? @map("expires_at") @db.Timestamptz(6)
+  maxUses   Int?      @map("max_uses")
+  useCount  Int       @default(0) @map("use_count")
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  diagram Diagram @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+  creator User    @relation(fields: [createdBy], references: [id], onDelete: Cascade)
+
+  @@index([diagramId])
+  @@map("diagram_join_codes")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// THE UML MODEL
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Classifiers, packages and comments share one table and one identity space,
+/// so relationships and the operation log can target an element without
+/// knowing its kind first. See DATA-MODEL.md §1.2.
+model UmlElement {
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String      @map("diagram_id") @db.Uuid
+  parentId  String?     @map("parent_id") @db.Uuid
+  kind      ElementKind
+
+  /// NOT citext: UML names are case-sensitive, and so is the Java the code
+  /// generator emits. `Order` and `order` are different types. (Resolves D5.)
+  name       String?
+  isAbstract Boolean @default(false) @map("is_abstract")
+  stereotype String?
+  body       String? // COMMENT content only
+
+  /// FR-E14: preserved across XMI round-trips so the originating tool
+  /// recognizes the same model instead of a set of new elements.
+  xmiId String? @map("xmi_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  diagram  Diagram      @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+  parent   UmlElement?  @relation("ElementHierarchy", fields: [parentId], references: [id], onDelete: Cascade)
+  children UmlElement[] @relation("ElementHierarchy")
+
+  features     UmlFeature[]     @relation("FeatureOwner")
+  typedBy      UmlFeature[]     @relation("FeatureType")
+  typedParams  UmlParameter[]   @relation("ParameterType")
+  enumLiterals UmlEnumLiteral[]
+  layout       ElementLayout?
+
+  relationshipsAsSource UmlRelationship[]     @relation("RelationshipSource")
+  relationshipsAsTarget UmlRelationship[]     @relation("RelationshipTarget")
+  relationshipEnds      UmlRelationshipEnd[]
+
+  @@index([diagramId])
+  @@index([parentId])
+  @@index([diagramId, xmiId])
+  @@map("uml_elements")
+}
+
+/// Attributes and operations (FR-B02, FR-B03).
+model UmlFeature {
+  id      String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ownerId String      @map("owner_id") @db.Uuid
+  kind    FeatureKind
+  name    String
+
+  visibility Visibility @default(PRIVATE)
+  /// UML features are ordered. Relying on insertion order is a bug waiting.
+  position   Int        @default(0)
+
+  /// A reference when the type resolves to a modeled element; a free string
+  /// when it is a primitive or an unresolved name.
+  typeElementId String? @map("type_element_id") @db.Uuid
+  typeName      String? @map("type_name")
+
+  /// Multiplicity. `upperBound = null` means `*`. No sentinel values.
+  lowerBound Int  @default(1) @map("lower_bound")
+  upperBound Int? @default(1) @map("upper_bound")
+
+  defaultValue String? @map("default_value")
+  isStatic     Boolean @default(false) @map("is_static")
+  isReadonly   Boolean @default(false) @map("is_readonly")
+  isDerived    Boolean @default(false) @map("is_derived")
+  isAbstract   Boolean @default(false) @map("is_abstract") // operations only
+  isQuery      Boolean @default(false) @map("is_query") // operations only
+
+  xmiId String? @map("xmi_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  owner       UmlElement     @relation("FeatureOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  typeElement UmlElement?    @relation("FeatureType", fields: [typeElementId], references: [id], onDelete: SetNull)
+  parameters  UmlParameter[]
+
+  @@index([ownerId, kind, position])
+  @@index([typeElementId])
+  @@map("uml_features")
+}
+
+model UmlParameter {
+  id          String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  operationId String             @map("operation_id") @db.Uuid
+  name        String
+  direction   ParameterDirection @default(IN)
+
+  typeElementId String? @map("type_element_id") @db.Uuid
+  typeName      String? @map("type_name")
+
+  position     Int     @default(0)
+  defaultValue String? @map("default_value")
+  xmiId        String? @map("xmi_id")
+
+  operation   UmlFeature  @relation(fields: [operationId], references: [id], onDelete: Cascade)
+  typeElement UmlElement? @relation("ParameterType", fields: [typeElementId], references: [id], onDelete: SetNull)
+
+  @@unique([operationId, position])
+  @@index([typeElementId])
+  @@map("uml_parameters")
+}
+
+model UmlEnumLiteral {
+  id            String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  enumerationId String  @map("enumeration_id") @db.Uuid
+  name          String
+  position      Int     @default(0)
+  xmiId         String? @map("xmi_id")
+
+  enumeration UmlElement @relation(fields: [enumerationId], references: [id], onDelete: Cascade)
+
+  @@unique([enumerationId, name])
+  @@map("uml_enum_literals")
+}
+
+model UmlRelationship {
+  id        String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String           @map("diagram_id") @db.Uuid
+  kind      RelationshipKind
+
+  sourceElementId String @map("source_element_id") @db.Uuid
+  targetElementId String @map("target_element_id") @db.Uuid
+
+  name       String?
+  stereotype String?
+  xmiId      String? @map("xmi_id")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  diagram Diagram @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+
+  /// ═══ FR-C07 LIVES HERE ═══
+  /// `Restrict`, never `Cascade`. Cascading would let a classifier deletion
+  /// silently remove relationships another user may hold a lock on — exactly
+  /// what FR-C07 forbids. With Restrict the database refuses, the service
+  /// catches the violation, and the whole deletion is rejected atomically.
+  sourceElement UmlElement @relation("RelationshipSource", fields: [sourceElementId], references: [id], onDelete: Restrict)
+  targetElement UmlElement @relation("RelationshipTarget", fields: [targetElementId], references: [id], onDelete: Restrict)
+
+  ends   UmlRelationshipEnd[]
+  layout RelationshipLayout?
+
+  @@index([diagramId])
+  @@index([sourceElementId])
+  @@index([targetElementId])
+  @@map("uml_relationships")
+}
+
+/// Per-end detail. Two rows for ASSOCIATION, none for the other kinds.
+/// Not over-normalization: in XMI each end carries five independent
+/// properties and the two ends are asymmetric. See DATA-MODEL.md §1.3.
+model UmlRelationshipEnd {
+  id             String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  relationshipId String @map("relationship_id") @db.Uuid
+  endIndex       Int    @map("end_index") @db.SmallInt // 0 = source, 1 = target
+  elementId      String @map("element_id") @db.Uuid
+
+  roleName    String?         @map("role_name")
+  lowerBound  Int             @default(0) @map("lower_bound")
+  upperBound  Int?            @default(1) @map("upper_bound") // null = '*'
+  isNavigable Boolean         @default(true) @map("is_navigable")
+  aggregation AggregationKind @default(NONE)
+
+  xmiId String? @map("xmi_id")
+
+  relationship UmlRelationship @relation(fields: [relationshipId], references: [id], onDelete: Cascade)
+  element      UmlElement      @relation(fields: [elementId], references: [id], onDelete: Restrict)
+
+  @@unique([relationshipId, endIndex])
+  @@index([elementId])
+  @@map("uml_relationship_ends")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// LAYOUT  (FR-B09: geometry is a separate concern from semantics)
+// ═════════════════════════════════════════════════════════════════════════════
+
+model ElementLayout {
+  elementId String @id @map("element_id") @db.Uuid
+
+  /// width/height rather than right/bottom, so a resize never has to read the
+  /// current position first. Maps to EA's Left/Top/Right/Bottom on export.
+  x      Int
+  y      Int
+  width  Int
+  height Int
+  zIndex Int @default(0) @map("z_index")
+
+  element UmlElement @relation(fields: [elementId], references: [id], onDelete: Cascade)
+
+  @@map("element_layouts")
+}
+
+model RelationshipLayout {
+  relationshipId String @id @map("relationship_id") @db.Uuid
+
+  /// [{"x":120,"y":300}, …] — variable length, no relational value.
+  waypoints    Json    @default("[]")
+  sourceAnchor String? @map("source_anchor")
+  targetAnchor String? @map("target_anchor")
+
+  relationship UmlRelationship @relation(fields: [relationshipId], references: [id], onDelete: Cascade)
+
+  @@map("relationship_layouts")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// OPERATION LOG & HISTORY
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// FR-C14: append-only. Enforced by a trigger in migration.sql, because
+/// "append-only" in a design document is a wish, not a property.
+model DiagramOperation {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String @map("diagram_id") @db.Uuid
+
+  version BigInt
+  /// FR-C13: client-generated, the idempotency key that makes a replayed
+  /// operation after reconnect a no-op instead of a duplicate.
+  opId    String @map("op_id") @db.Uuid
+
+  actorId   String?     @map("actor_id") @db.Uuid
+  actorKind OpActorKind @default(USER) @map("actor_kind")
+  aiTurnId  String?     @map("ai_turn_id") @db.Uuid
+
+  type    String // 'element.create', 'element.move', …
+  payload Json
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  diagram Diagram @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  aiTurn  AiTurn? @relation(fields: [aiTurnId], references: [id], onDelete: SetNull)
+
+  @@unique([diagramId, version])
+  @@unique([diagramId, opId])
+  @@index([diagramId, version])
+  @@index([aiTurnId])
+  @@map("diagram_operations")
+}
+
+model DiagramSnapshot {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String   @map("diagram_id") @db.Uuid
+  version   BigInt
+  state     Json
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  diagram Diagram @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+
+  @@unique([diagramId, version])
+  @@index([diagramId, version(sort: Desc)])
+  @@map("diagram_snapshots")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// XMI INTERCHANGE
+// ═════════════════════════════════════════════════════════════════════════════
+
+model XmiImport {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String  @map("diagram_id") @db.Uuid
+  userId    String? @map("user_id") @db.Uuid
+
+  sourceFilename  String     @map("source_filename")
+  detectedVersion XmiVersion @map("detected_version")
+  /// FR-E05: Enterprise Architect emits windows-1252, not UTF-8.
+  sourceEncoding  String?    @map("source_encoding")
+  exporter        String? // xmi:Documentation/@exporter
+
+  elementCount Int @default(0) @map("element_count")
+
+  /// FR-E16: every construct that could not be represented, by name and
+  /// xmi:id. Silent data loss is a defect, so the evidence is durable.
+  unsupported Json @default("[]")
+  warnings    Json @default("[]")
+
+  importedAt DateTime @default(now()) @map("imported_at") @db.Timestamptz(6)
+
+  diagram Diagram @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([diagramId, importedAt(sort: Desc)])
+  @@map("xmi_imports")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AI ASSISTANT
+// ═════════════════════════════════════════════════════════════════════════════
+
+model ProjectAiConfig {
+  projectId String @id @map("project_id") @db.Uuid
+
+  provider String @default("gemini")
+  model    String @default("gemini-flash")
+
+  /// FR-D11: BYO key, encrypted at rest. Never returned to a client.
+  apiKeyCipher Bytes? @map("api_key_cipher")
+  /// FR-D08: ordered list of providers to fail over to.
+  fallbackChain Json  @default("[]") @map("fallback_chain")
+
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("project_ai_configs")
+}
+
+/// FR-D10 / FR-D15b. This table *is* the spend counter.
+model AiTurn {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  diagramId String  @map("diagram_id") @db.Uuid
+  userId    String? @map("user_id") @db.Uuid
+
+  inputMode  AiInputMode @map("input_mode")
+  promptText String?     @map("prompt_text") // transcript for VOICE
+  /// Image content is not retained (§7 Privacy) — only its digest, which is
+  /// enough to deduplicate and audit.
+  imageSha256 String?    @map("image_sha256")
+
+  provider      String
+  model         String
+  fallbackFired Boolean @default(false) @map("fallback_fired")
+  fallbackFrom  String? @map("fallback_from")
+
+  inputTokens  Int @default(0) @map("input_tokens")
+  outputTokens Int @default(0) @map("output_tokens")
+
+  /// Decimal, never Float. The US$25 ceiling is enforced by summing this
+  /// column, and a cap that drifts is not a cap.
+  costUsd Decimal @default(0) @map("cost_usd") @db.Decimal(10, 6)
+
+  latencyMs  Int? @map("latency_ms")
+  /// FR-D15b: tool-call iterations, capped to abort runaway loops.
+  iterations Int  @default(0)
+
+  status       AiTurnStatus @default(PENDING)
+  errorMessage String?      @map("error_message")
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  diagram    Diagram            @relation(fields: [diagramId], references: [id], onDelete: Cascade)
+  user       User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  operations DiagramOperation[]
+
+  @@index([diagramId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("ai_turns")
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// AUDIT  (FR-A16)
+// ═════════════════════════════════════════════════════════════════════════════
+
+model AuditLogEntry {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId String  @map("project_id") @db.Uuid
+  actorId   String? @map("actor_id") @db.Uuid
+
+  action   String // 'member.added', 'diagram.locked', …
+  targetId String? @map("target_id") @db.Uuid
+  metadata Json    @default("{}")
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  actor   User?   @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt(sort: Desc)])
+  @@map("audit_log_entries")
+}
