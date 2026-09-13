@@ -1,44 +1,10 @@
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
-import { PROJECT_ERROR, type ProjectMemberView } from '@umlive/contracts';
+import { ForbiddenException, Injectable } from '@nestjs/common';
+import { PROJECT_ERROR } from '@umlive/contracts';
 import { PrismaService } from '../prisma/prisma.service';
-import type { AddMemberDto } from './dto/add-member.dto';
 
 @Injectable()
 export class MembersService {
   constructor(private readonly prisma: PrismaService) {}
-
-  /**
-   * FR-A08. Solo por email — `404 user_not_found` es una exposición aceptada
-   * y declarada (design.md §7.2): la alternativa (`201` sin agregar a nadie)
-   * le miente al host. El nuevo miembro siempre entra como `PARTICIPANT`;
-   * no hay forma de agregar un segundo `HOST` desde acá.
-   */
-  async add(projectId: string, dto: AddMemberDto): Promise<ProjectMemberView> {
-    const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
-      select: { id: true, displayName: true, avatarUrl: true },
-    });
-    if (!user) {
-      throw new NotFoundException({ code: PROJECT_ERROR.USER_NOT_FOUND });
-    }
-
-    const existing = await this.prisma.projectMember.findUnique({
-      where: { projectId_userId: { projectId, userId: user.id } },
-    });
-    if (existing) {
-      throw new ConflictException({ code: PROJECT_ERROR.ALREADY_MEMBER });
-    }
-
-    const member = await this.prisma.projectMember.create({
-      data: { projectId, userId: user.id, role: 'PARTICIPANT' },
-    });
-
-    return {
-      user: { id: user.id, displayName: user.displayName, avatarUrl: user.avatarUrl },
-      role: member.role,
-      joinedAt: member.joinedAt.toISOString(),
-    };
-  }
 
   /**
    * MUST rechazar con `403 cannot_remove_host` si `userId` es la fila HOST,

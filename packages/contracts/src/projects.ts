@@ -38,7 +38,18 @@ export const PROJECT_PERMISSIONS = {
   'project.create': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'projects', frA13Row: 'Create / delete project' },
   'project.delete': { roles: ['HOST'], enforcedSince: 'M5', frA13Row: 'Create / delete project' },
   'project.view': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'projects', frA13Row: '(agregada — ver design.md §2.4)' },
-  'member.add': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Add / remove project members' },
+  /**
+   * `member.add` — eliminada de esta matriz el 2026-09-13, decisión del
+   * dueño del producto. `POST /projects/:id/members` respondía `404
+   * user_not_found` cuando el email no tenía cuenta, y eso era un oráculo
+   * de registro: cualquier autenticado con un proyecto podía probar
+   * emails de a uno. La única puerta de entrada a un proyecto pasa a ser
+   * el código de acceso (FR-A10, rebanada `join-codes`). Esa redención
+   * también inserta una fila en `project_members`, pero el actor es quien
+   * se une, no el host — es otra acción, con otra autorización
+   * ("cualquier autenticado con un código válido"), que `join-codes`
+   * introduce bajo su propio nombre. No vuelve a esta fila renombrada.
+   */
   'member.remove': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Add / remove project members' },
   'diagram.create': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Create / rename / delete diagram' },
   'diagram.rename': { roles: ['HOST'], enforcedSince: 'projects', frA13Row: 'Create / rename / delete diagram' },
@@ -132,21 +143,20 @@ export interface CreateProjectRequest {
   description?: string;
 }
 
-/** Solo email — no existe búsqueda por nombre de usuario (FR-A08 corregido). */
-export interface AddMemberRequest {
-  email: string;
-}
-
 export interface RenameDiagramRequest {
   name: string;
 }
 
+/**
+ * `USER_NOT_FOUND` y `ALREADY_MEMBER` se quitaron el 2026-09-13 junto con
+ * `member.add`: eran los códigos de error de "agregar por email", que dejó
+ * de existir (ver la nota en `PROJECT_PERMISSIONS`). Verificado con
+ * ripgrep antes de borrarlos: sin otro consumidor en el árbol.
+ */
 export const PROJECT_ERROR = {
   PROJECT_NOT_FOUND: 'project_not_found',
   DIAGRAM_NOT_FOUND: 'diagram_not_found',
   INSUFFICIENT_ROLE: 'insufficient_role',
-  USER_NOT_FOUND: 'user_not_found',
-  ALREADY_MEMBER: 'already_member',
   CANNOT_REMOVE_HOST: 'cannot_remove_host',
 } as const;
 
