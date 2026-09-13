@@ -68,6 +68,23 @@ export const PROJECT_PERMISSIONS = {
   'diagram.view': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M2', frA13Row: 'View diagram' },
   'joinCode.generate': { roles: ['HOST'], enforcedSince: 'join-codes', frA13Row: 'Generate / revoke join code' },
   'joinCode.revoke': { roles: ['HOST'], enforcedSince: 'join-codes', frA13Row: 'Generate / revoke join code' },
+  /**
+   * Fila NUEVA, no en el PRD (join-codes/design.md §2.3), igual que
+   * `project.view` arriba. Después de la corrección de FR-A10 (2026-09-13),
+   * VER un código ya generado es poder repartir el proyecto entero — tan
+   * privilegiado como generarlo. No se cuelga del identificador de
+   * `joinCode.generate`: estirar una acción para tapar un hueco del PRD es
+   * el error que `project.view` ya corrigió.
+   */
+  'joinCode.list': { roles: ['HOST'], enforcedSince: 'join-codes', frA13Row: '(agregada — ver join-codes/design.md §2.3)' },
+  /**
+   * `joinCode.redeem` — deliberadamente AUSENTE de esta matriz. Redimir un
+   * código lo ejerce quien TODAVÍA NO es miembro, así que no hay `ProjectRole`
+   * contra el cual contrastar y `can()` no es aplicable. La ruta vive fuera de
+   * `/projects/:projectId` (`POST /api/join-codes/redeem`) y su autorización
+   * es «autenticado + código activo» — ver join-codes/design.md §2.1-§2.2.
+   * No es una fila pendiente: FR-A13 no tiene fila para esto.
+   */
   'diagram.lock': { roles: ['HOST'], enforcedSince: 'M4', frA13Row: 'Lock / unlock diagram' },
   'diagram.unlock': { roles: ['HOST'], enforcedSince: 'M4', frA13Row: 'Lock / unlock diagram' },
   'diagram.edit': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M2', frA13Row: 'Edit diagram content (when unlocked)' },
