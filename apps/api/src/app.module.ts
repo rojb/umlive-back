@@ -1,7 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
 import { fileURLToPath } from 'node:url';
+import { AuthModule } from './auth/auth.module.js';
+import { JwtAuthGuard } from './auth/jwt-auth.guard.js';
 import { PrismaModule } from './prisma/prisma.module.js';
+import { UsersModule } from './users/users.module.js';
 
 /**
  * Estructura por módulos de funcionalidad — la que documenta NestJS.
@@ -23,10 +27,18 @@ const envFilePath = fileURLToPath(new URL('../.env', import.meta.url));
   imports: [
     ConfigModule.forRoot({ isGlobal: true, envFilePath }),
     PrismaModule,
-    // M1  AuthModule, UsersModule, ProjectsModule, DiagramsModule
+    AuthModule,
+    UsersModule,
+    // M1  ProjectsModule, DiagramsModule
     // M3  CollaborationModule
     // M5  InteropModule, CodegenModule
     // M6  AiModule
+  ],
+  providers: [
+    // Guard de autenticación global (design.md §5): toda ruta requiere sesión
+    // válida salvo la decorada con `@Public()`. Un endpoint nuevo sin
+    // decorador queda protegido por defecto, no expuesto.
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
   ],
 })
 export class AppModule {}
