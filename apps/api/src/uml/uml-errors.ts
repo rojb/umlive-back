@@ -1,3 +1,4 @@
+import { ConflictException } from '@nestjs/common';
 import { Prisma } from '../generated/prisma/client';
 import { UML_ERROR, type UmlErrorCode } from '@umlive/contracts';
 
@@ -123,4 +124,26 @@ function extractAdapterIndexName(meta: Record<string, unknown> | undefined): str
   const constraint = cause?.constraint as Record<string, unknown> | undefined;
   const index = constraint?.index;
   return typeof index === 'string' ? index : undefined;
+}
+
+/**
+ * Extensión de fase 3/4 (tasks.md 3.2, 3.3, 4.2): envoltorio único que las
+ * 17 mutaciones usan para no repetir el mapeo `UmlErrorCode → HTTP` en cada
+ * servicio. NO relee `err.meta` por su cuenta — delega entero en
+ * `resolveUniqueViolation` de arriba, como exige la corrección de fase 1.
+ *
+ * `parameter_position_conflict` es la única excepción deliberada (design.md
+ * §6): el usuario no puede provocarlo — las posiciones las asigna el
+ * servidor — así que aunque el resolvedor lo reconozca, esta función lo
+ * RELANZA sin envolver, para que explote como `500` y no como `409`.
+ * Cualquier otro código reconocido se envuelve en `409 { code,
+ * conflictingName }` (SC-B06/B07). Un `P2002` no reconocido también se
+ * relanza tal cual — el llamador (Nest) lo convierte en `500`.
+ */
+export function handleUniqueViolation(err: unknown, conflictingName: string): never {
+  const code = resolveUniqueViolation(err);
+  if (code && code !== UML_ERROR.PARAMETER_POSITION_CONFLICT) {
+    throw new ConflictException({ code, conflictingName });
+  }
+  throw err;
 }

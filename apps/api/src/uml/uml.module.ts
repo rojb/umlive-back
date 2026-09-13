@@ -1,12 +1,24 @@
 import { Module } from '@nestjs/common';
+import { DiagramContentController } from './diagram-content.controller';
+import { DiagramContentService } from './diagram-content.service';
+import { ElementsController } from './elements.controller';
+import { ElementsService } from './elements.service';
+import { FeaturesController } from './features.controller';
+import { FeaturesService } from './features.service';
+import { ParametersController } from './parameters.controller';
+import { ParametersService } from './parameters.service';
 
 /**
- * Esqueleto (design.md §12, tasks.md 2.4). Esta unidad de trabajo (fase 1+2
- * de `uml-classifiers`) es contrato compartido + cimientos de backend
- * (`resolveUniqueViolation`, los cuatro helpers de aislamiento) — sin rutas
- * nuevas todavía. Fase 3/4 registra acá los cuatro pares controller/service:
- * `DiagramContentController/Service`, `ElementsController/Service`,
- * `FeaturesController/Service`, `ParametersController/Service`.
+ * Los cuatro pares controller/service de `uml-classifiers` (design.md §1,
+ * §12; tasks.md 3.4, 4.5): `DiagramContentController/Service` (lectura, §8),
+ * `ElementsController/Service`, `FeaturesController/Service`,
+ * `ParametersController/Service` (parámetros + literales de enum). Sin
+ * providers propios de guard — `ProjectAccessGuard` es `APP_GUARD` global
+ * (`app.module.ts`) y `PrismaService` viene de `PrismaModule`, que es
+ * `@Global()`.
  */
-@Module({})
+@Module({
+  controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController],
+  providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService],
+})
 export class UmlModule {}
