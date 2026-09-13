@@ -11,6 +11,7 @@ Companion to `../DATA-MODEL.md` v1.0
 |---|---|---|
 | `schema.prisma` | Models, relations, referential actions, plain indexes and uniques | Hand-written; drives `prisma migrate` |
 | `migrations/20260912000001_integrity/migration.sql` | CHECK constraints, partial unique indexes, `NULLS NOT DISTINCT`, the `citext` extension, the append-only trigger | Hand-written; **never regenerated** |
+| `migrations/20260912000002_project_host_coherence/migration.sql` | `assert_project_host_is_owner()` function + two `CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED` (`trg_projects_host_is_owner`, `trg_members_host_is_owner`) — the `owner_id` ⇔ `HOST` row backstop from the `projects` slice (design.md §3.2) | Hand-written; **never regenerated** |
 
 > **Applying `schema.prisma` alone produces a database that accepts invalid models.** It would allow two hosts on one project, a composite association end with multiplicity `*`, an operation log that can be rewritten, two root classes with the same name, and a `LOCKED_BY_HOST` diagram with no host. Prisma simply has no syntax for any of those rules.
 
@@ -80,7 +81,9 @@ Prisma compares `schema.prisma` against a shadow database. Objects it cannot exp
 
 2. **If a generated migration contains `DROP CONSTRAINT ck_…`, `DROP INDEX uq_…`, or `DROP TRIGGER`, delete those lines before applying.** They are drift artifacts, not intended changes.
 
-3. `20260912000001_integrity` is immutable. New constraints go in a *new* hand-written migration, never by editing this one.
+3. `20260912000001_integrity` and `20260912000002_project_host_coherence` are both immutable. New constraints go in a *new* hand-written migration, never by editing either of these.
+
+3b. `20260912000002_project_host_coherence` adds `trg_projects_host_is_owner` and `trg_members_host_is_owner` (plus the `assert_project_host_is_owner()` function they call). Prisma does not see triggers or functions — same blind spot as everything else in this file — so a bare `prisma migrate dev` will offer to `DROP TRIGGER` these two. **Never accept that.** Apply this migration only with `prisma migrate deploy`.
 
 4. Never run `prisma db push` against any database that matters. It reconciles by dropping what it does not recognize.
 
