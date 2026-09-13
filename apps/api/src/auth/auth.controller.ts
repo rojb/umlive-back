@@ -12,12 +12,12 @@ import {
 import type { AuthSession, RefreshResponse } from '@umlive/contracts';
 import { AUTH_ERROR } from '@umlive/contracts';
 import type { CookieOptions, Request, Response } from 'express';
-import { AuthService } from './auth.service.js';
-import { CurrentUser, type CurrentUserPayload } from './current-user.decorator.js';
-import { LoginDto } from './dto/login.dto.js';
-import { RegisterDto } from './dto/register.dto.js';
-import { LoginThrottleGuard } from './login-throttle.guard.js';
-import { Public } from './public.decorator.js';
+import { AuthService } from './auth.service';
+import { CurrentUser, type CurrentUserPayload } from './current-user.decorator';
+import { LoginDto } from './dto/login.dto';
+import { RegisterDto } from './dto/register.dto';
+import { LoginThrottleGuard } from './login-throttle.guard';
+import { Public } from './public.decorator';
 
 /** Nombre y atributos fijos de la cookie de refresh (design.md §4.3). */
 const COOKIE_NAME = 'umlive_rt';

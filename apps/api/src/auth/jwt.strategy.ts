@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
-import type { CurrentUserPayload } from './current-user.decorator.js';
+import type { CurrentUserPayload } from './current-user.decorator';
 
 /** Forma exacta firmada por `TokensService.signAccess` (design.md §4.1). */
 interface JwtAccessPayload {

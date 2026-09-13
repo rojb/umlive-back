@@ -1,9 +1,9 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Patch, Post } from '@nestjs/common';
 import type { AuthUser, MeResponse } from '@umlive/contracts';
-import { CurrentUser, type CurrentUserPayload } from '../auth/current-user.decorator.js';
-import { ChangePasswordDto } from './dto/change-password.dto.js';
-import { UpdateMeDto } from './dto/update-me.dto.js';
-import { UsersService } from './users.service.js';
+import { CurrentUser, type CurrentUserPayload } from '../auth/current-user.decorator';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { UpdateMeDto } from './dto/update-me.dto';
+import { UsersService } from './users.service';
 
 /** Todo protegido por el `JwtAuthGuard` global (sin `@Public()`) — design.md §5. */
 @Controller('users')

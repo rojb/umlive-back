@@ -1,7 +1,7 @@
 import { type ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { AuthGuard } from '@nestjs/passport';
-import { IS_PUBLIC_KEY } from './public.decorator.js';
+import { IS_PUBLIC_KEY } from './public.decorator';
 
 /**
  * Registrado como `APP_GUARD` global en `app.module.ts` (design.md §5). El

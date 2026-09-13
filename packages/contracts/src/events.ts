@@ -7,7 +7,7 @@
 import type {
   LockDenied, LockGranted, LockReleased,
   OperationCommitted, OperationRejected, OperationRequest,
-} from './operations.js';
+} from './operations';
 
 /** Cliente → servidor. */
 export interface ClientEvents {

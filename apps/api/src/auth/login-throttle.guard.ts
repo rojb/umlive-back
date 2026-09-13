@@ -7,7 +7,7 @@ import {
 } from '@nestjs/common';
 import { AUTH_ERROR } from '@umlive/contracts';
 import type { Request, Response } from 'express';
-import { LoginAttemptsService } from './login-attempts.service.js';
+import { LoginAttemptsService } from './login-attempts.service';
 
 /** FR-A02, design.md §2.1 — tabla de cubetas. */
 const IP_LIMIT = 30;

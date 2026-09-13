@@ -3,9 +3,8 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import cookieParser from 'cookie-parser';
-import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
-import { AppModule } from './app.module.js';
+import { AppModule } from './app.module';
 
 /**
  * ORIGEN ÚNICO (PRD §9, Apéndice B.7).
@@ -28,8 +27,7 @@ import { AppModule } from './app.module.js';
  * a `apps/web/dist`.
  */
 const webRoot =
-  process.env.WEB_DIST_PATH ??
-  fileURLToPath(new URL('../../web/dist/', import.meta.url));
+  process.env.WEB_DIST_PATH ?? join(__dirname, '..', '..', 'web', 'dist');
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);

@@ -17,7 +17,7 @@ import type {
   ParameterDirection,
   RelationshipKind,
   Visibility,
-} from './uml.js';
+} from './uml';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sobre

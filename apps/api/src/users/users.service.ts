@@ -1,11 +1,11 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
 import { hash, verify } from '@node-rs/argon2';
 import { AUTH_ERROR, type AuthUser, type MeResponse } from '@umlive/contracts';
-import { ARGON2_PARAMS } from '../auth/password.constants.js';
-import { TokensService } from '../auth/tokens.service.js';
-import { PrismaService } from '../prisma/prisma.service.js';
-import type { ChangePasswordDto } from './dto/change-password.dto.js';
-import type { UpdateMeDto } from './dto/update-me.dto.js';
+import { ARGON2_PARAMS } from '../auth/password.constants';
+import { TokensService } from '../auth/tokens.service';
+import { PrismaService } from '../prisma/prisma.service';
+import type { ChangePasswordDto } from './dto/change-password.dto';
+import type { UpdateMeDto } from './dto/update-me.dto';
 
 @Injectable()
 export class UsersService {

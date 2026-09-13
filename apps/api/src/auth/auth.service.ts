@@ -7,13 +7,13 @@ import {
 import { hash, verify } from '@node-rs/argon2';
 import { AUTH_ERROR, type AuthSession, type AuthUser } from '@umlive/contracts';
 import { randomBytes } from 'node:crypto';
-import { Prisma } from '../generated/prisma/client.js';
-import { PrismaService } from '../prisma/prisma.service.js';
-import type { LoginDto } from './dto/login.dto.js';
-import type { RegisterDto } from './dto/register.dto.js';
-import { LoginAttemptsService } from './login-attempts.service.js';
-import { ARGON2_PARAMS } from './password.constants.js';
-import { TokensService } from './tokens.service.js';
+import { Prisma } from '../generated/prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import type { LoginDto } from './dto/login.dto';
+import type { RegisterDto } from './dto/register.dto';
+import { LoginAttemptsService } from './login-attempts.service';
+import { ARGON2_PARAMS } from './password.constants';
+import { TokensService } from './tokens.service';
 
 /** Metadatos de la petición que se guardan junto al refresh token. */
 interface RequestMeta {

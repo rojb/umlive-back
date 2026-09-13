@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { LocksService } from './locks.service.js';
+import { LocksService } from './locks.service';
 
 /**
  * Tiempo real y concurrencia. Es el hito M4 y el de mayor riesgo del proyecto.

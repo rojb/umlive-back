@@ -1,11 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
-import { fileURLToPath } from 'node:url';
-import { AuthModule } from './auth/auth.module.js';
-import { JwtAuthGuard } from './auth/jwt-auth.guard.js';
-import { PrismaModule } from './prisma/prisma.module.js';
-import { UsersModule } from './users/users.module.js';
+import { join } from 'node:path';
+import { AuthModule } from './auth/auth.module';
+import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { PrismaModule } from './prisma/prisma.module';
+import { UsersModule } from './users/users.module';
 
 /**
  * Estructura por módulos de funcionalidad — la que documenta NestJS.
@@ -21,7 +21,7 @@ import { UsersModule } from './users/users.module.js';
  * y se debe encontrar igual arranque desde donde arranque. Compilado queda en
  * `dist/app.module.js`, así que `../.env` es `apps/api/.env`.
  */
-const envFilePath = fileURLToPath(new URL('../.env', import.meta.url));
+const envFilePath = join(__dirname, '..', '.env');
 
 @Module({
   imports: [
