@@ -172,7 +172,23 @@ export class LocksService implements OnModuleDestroy {
     return true;
   }
 
-  /** SC-C06. Al cerrarse el socket, sin esperar el TTL. */
+  /**
+   * SC-C06. Al cerrarse el socket, sin esperar el TTL.
+   *
+   * ⚠️ **ALCANCE GLOBAL — no sirve para SC-A12.** Suelta los locks del usuario
+   * en **todos** los diagramas, de todos los proyectos. Eso es correcto para una
+   * desconexión, porque al caerse el socket el usuario deja de estar en todos
+   * lados a la vez.
+   *
+   * **No lo uses para expulsar a alguien de un proyecto.** Quitar a Diego de
+   * `P1` con este método también le soltaría lo que tiene tomado en `P2`, donde
+   * sigue siendo miembro y puede estar editando en ese mismo momento. Nadie
+   * vería un error: simplemente perdería su trabajo en otro proyecto.
+   *
+   * SC-A12 necesita un método con alcance por proyecto, que todavía no existe:
+   * hay que resolver los diagramas de ese proyecto y soltar solo esas claves.
+   * Detectado al proponer la rebanada `projects`, 2026-09-12.
+   */
   releaseAllForUser(userId: string, cause = 'disconnected'): void {
     const keys = this.byUser.get(userId);
     if (!keys) return;
@@ -184,6 +200,32 @@ export class LocksService implements OnModuleDestroy {
       this.onRelease?.(diagramId, elementId, cause);
     }
     this.byUser.delete(userId);
+  }
+
+  /**
+   * SC-A12. Alcance por proyecto: suelta los locks del usuario, pero SOLO en
+   * los diagramas de `diagramIds` — nunca en todos los suyos como
+   * `releaseAllForUser`. Quien llama resuelve primero los diagramas del
+   * proyecto del que se quitó al usuario (design.md §4).
+   *
+   * Sin llamador en esta rebanada — ver el comentario de enganche en
+   * `members.service.ts` (`remove()`). Existe para que M3, cuando
+   * `collaboration.gateway.ts` exista, lo enchufe sin tener que diseñar el
+   * alcance correcto desde cero.
+   */
+  releaseAllForUserInDiagrams(userId: string, diagramIds: string[], cause = 'removed_from_project'): void {
+    const keys = this.byUser.get(userId);
+    if (!keys) return;
+    const scope = new Set(diagramIds);
+    for (const key of [...keys]) {
+      const sep = key.indexOf(':');
+      const diagramId = key.slice(0, sep);
+      if (!scope.has(diagramId)) continue;
+      const elementId = key.slice(sep + 1);
+      this.byDiagram.get(diagramId)?.delete(elementId);
+      this.deindex(userId, diagramId, elementId);
+      this.onRelease?.(diagramId, elementId, cause);
+    }
   }
 
   /**

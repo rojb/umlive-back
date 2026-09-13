@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { PrismaModule } from './prisma/prisma.module';
+import { ProjectAccessGuard } from './projects/guards/project-access.guard';
+import { ProjectsModule } from './projects/projects.module';
 import { UsersModule } from './users/users.module';
 
 /**
@@ -29,7 +31,7 @@ const envFilePath = join(__dirname, '..', '.env');
     PrismaModule,
     AuthModule,
     UsersModule,
-    // M1  ProjectsModule, DiagramsModule
+    ProjectsModule,
     // M3  CollaborationModule
     // M5  InteropModule, CodegenModule
     // M6  AiModule
@@ -39,6 +41,15 @@ const envFilePath = join(__dirname, '..', '.env');
     // válida salvo la decorada con `@Public()`. Un endpoint nuevo sin
     // decorador queda protegido por defecto, no expuesto.
     { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // Segundo APP_GUARD, DESPUÉS de JwtAuthGuard — orden obligatorio (design.md
+    // §2.2, tasks.md 2.3). Nest ejecuta los guards globales en el orden en que
+    // aparecen en este arreglo. Si ProjectAccessGuard quedara antes,
+    // `req.user` todavía no existiría cuando intenta resolver la membresía
+    // del solicitante contra `project_members`, y reventaría en TODA ruta de
+    // proyecto, autenticada o no. Con JwtAuthGuard primero, cuando
+    // ProjectAccessGuard corre, `req.user` ya está poblado (o la petición ya
+    // fue rechazada con 401 antes de llegar acá).
+    { provide: APP_GUARD, useClass: ProjectAccessGuard },
   ],
 })
 export class AppModule {}
