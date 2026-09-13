@@ -97,11 +97,38 @@ npm install prisma@7.10 @prisma/client@7.10
 
 > **Pin the version explicitly.** The npm `latest` tag for `prisma` currently points at an `8.0.0-rc`; an unpinned install pulls a release candidate.
 
-Prisma 7 is ESM-first. In `tsconfig.json`:
-
-```json
-{ "compilerOptions": { "module": "ESNext", "moduleResolution": "bundler" } }
-```
+> ### ⚠️ `apps/api` is **CommonJS** — corrected 2026-09-12
+>
+> This section used to say *"Prisma 7 is ESM-first"* and prescribe
+> `module: ESNext` + `moduleResolution: bundler`. **That configuration does not
+> run.** The Prisma *package* is ESM-first; the client it *generates* is not
+> loadable under pure Node ESM, because it emits extensionless relative imports:
+>
+> ```ts
+> import * as $Enums from "./enums"          // no .js
+> import * as $Class from "./internal/class" // no .js
+> ```
+>
+> Those typecheck under `moduleResolution: "bundler"` and then fail at runtime,
+> where Node ESM demands an explicit extension. The symptom is misleading:
+> **`nest build` compiles clean and `nest start` dies with
+> `ERR_MODULE_NOT_FOUND`** — the compiled `client.js` exists, its internal
+> imports are what break.
+>
+> The API therefore runs as CommonJS:
+>
+> ```json
+> { "compilerOptions": { "module": "CommonJS", "moduleResolution": "node" } }
+> ```
+>
+> Consequences that bite if forgotten: relative imports carry **no** `.js`
+> extension, and `import.meta.url` does not exist — use `__dirname`.
+> `packages/contracts` is CommonJS too, since a CJS API cannot `require()` an ESM
+> package. `apps/web` stays ESM under Vite and consumes the CJS contracts through
+> `resolve.preserveSymlinks: true`.
+>
+> The `prisma.config.ts` below is the one exception: the Prisma CLI loads it as
+> ESM regardless, so it keeps `import.meta.url`.
 
 `prisma.config.ts` sits at `apps/api/`, next to `package.json`. In Prisma 7 the connection string lives here, not in the `datasource` block — and the environment is **not** loaded automatically any more, so it is loaded explicitly:
 
