@@ -43,12 +43,23 @@ export class DiagramsService {
    * Borrado suave. Sin endpoint de restauración ni tarea de purga en esta
    * rebanada (propuesta, contradicción 4): `ix_diagrams_project_active`
    * filtra `deletedAt: null` en toda lectura.
+   *
+   * `join-codes/design.md` §2.5: revoca en la MISMA transacción los códigos
+   * activos del diagrama — dejarlo vivo sería una puerta abierta que el
+   * host ya no ve en B1. La redención re-chequea `diagram.deletedAt`
+   * defensivamente, pero esto es lo que hace que la fila diga la verdad.
    */
   async softDelete(diagramId: string): Promise<void> {
-    await this.prisma.diagram.update({
-      where: { id: diagramId },
-      data: { deletedAt: new Date() },
-    });
+    await this.prisma.$transaction([
+      this.prisma.diagram.update({
+        where: { id: diagramId },
+        data: { deletedAt: new Date() },
+      }),
+      this.prisma.diagramJoinCode.updateMany({
+        where: { diagramId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
   }
 
   private toSummary(d: DiagramRow): DiagramSummary {

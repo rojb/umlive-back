@@ -4,6 +4,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { JoinCodesModule } from './join-codes/join-codes.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectAccessGuard } from './projects/guards/project-access.guard';
 import { ProjectsModule } from './projects/projects.module';
@@ -32,6 +33,7 @@ const envFilePath = join(__dirname, '..', '.env');
     AuthModule,
     UsersModule,
     ProjectsModule,
+    JoinCodesModule,
     // M3  CollaborationModule
     // M5  InteropModule, CodegenModule
     // M6  AiModule
