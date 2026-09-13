@@ -8,6 +8,7 @@ import { JoinCodesModule } from './join-codes/join-codes.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectAccessGuard } from './projects/guards/project-access.guard';
 import { ProjectsModule } from './projects/projects.module';
+import { UmlModule } from './uml/uml.module';
 import { UsersModule } from './users/users.module';
 
 /**
@@ -34,6 +35,9 @@ const envFilePath = join(__dirname, '..', '.env');
     UsersModule,
     ProjectsModule,
     JoinCodesModule,
+    // M2 — contrato + cimientos (uml-classifiers, fase 1+2). Sin rutas
+    // todavía: fase 3/4 registra los controllers dentro de este módulo.
+    UmlModule,
     // M3  CollaborationModule
     // M5  InteropModule, CodegenModule
     // M6  AiModule
