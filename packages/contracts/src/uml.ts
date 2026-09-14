@@ -140,14 +140,14 @@ export interface ElementLayoutView {
 }
 
 /**
- * Carga completa de un diagrama (design.md §8, FR-B09). Cinco colecciones
+ * Carga completa de un diagrama (design.md §8, FR-B09). Ocho colecciones
  * planas, cada una filtrada por relación hasta `diagramId` — nunca un árbol
  * anidado ni una lista de ids acumulada entre consultas. `features` viene
  * ordenada por `(ownerId, kind, position)` y `parameters` por
  * `(operationId, position)` — el orden es parte del contrato.
  *
- * Sin `relationships`/`relationshipLayouts` en esta rebanada: son campos
- * NUEVOS que agrega `uml-relationships`, no campos vacíos.
+ * `relationships`/`relationshipEnds`/`relationshipLayouts` los agregó
+ * `uml-relationships` (ver el comentario del campo más abajo).
  */
 export interface DiagramContent {
   diagram: DiagramSummary;
@@ -161,19 +161,17 @@ export interface DiagramContent {
    * solo trae las de `ASSOCIATION` (D4), ordenadas por `(relationshipId,
    * endIndex)` — el orden es parte del contrato.
    *
-   * NOTA de fase 1 (tasks.md 1.2 vs 3.2): las tres colecciones quedan acá
-   * como parte del contrato compartido, pero `DiagramContentService` (el
-   * único constructor de `DiagramContent`) no las llena todavía —
-   * `diagram-content.service.ts` es tarea 3.2, fase 3. Si se declararan
-   * `required`, `apps/api` dejaría de compilar desde esta unidad hasta que
-   * corra la fase 3, lo que rompe el criterio de regresión de la tarea 1.6.
-   * Quedan `?:` por esa razón — ver apply-progress de esta unidad, "Issues
-   * Found", para el detalle. Fase 3 las vuelve obligatorias cuando
-   * `diagram-content.service.ts` las llene de verdad.
+   * Requeridas desde fase 3 (tasks.md 3.2): `diagram-content.service.ts` ya
+   * las llena en las nueve consultas del `Promise.all`. Quedaron `?:` en
+   * fase 1 (tasks.md 1.2) solo porque `DiagramContentService` todavía no las
+   * poblaba — declararlas `required` en esa unidad habría roto la
+   * compilación de `apps/api` antes de que existiera el service que las
+   * llena. Esa razón ya no aplica: si quedaran opcionales acá, el contrato
+   * mentiría sobre lo que el `GET` realmente devuelve.
    */
-  relationships?: UmlRelationshipView[];
-  relationshipEnds?: UmlRelationshipEndView[];
-  relationshipLayouts?: RelationshipLayoutView[];
+  relationships: UmlRelationshipView[];
+  relationshipEnds: UmlRelationshipEndView[];
+  relationshipLayouts: RelationshipLayoutView[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
