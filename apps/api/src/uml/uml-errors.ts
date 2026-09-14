@@ -147,3 +147,122 @@ export function handleUniqueViolation(err: unknown, conflictingName: string): ne
   }
   throw err;
 }
+
+/**
+ * Resolvedor de `P2039` (violación de `CHECK`, PostgreSQL `23514`) para
+ * `uml-relationships` (design.md D1; tasks.md 1.1, bloqueante — PRIMERA
+ * tarea de la unidad). Forzado contra PostgreSQL real (puerto 5434,
+ * `@prisma/adapter-pg`) con el `PrismaClient` real de esta app — script
+ * descartable, borrado antes de este commit. Mismo precedente que el
+ * hallazgo de `P2002` de arriba: `design.md` dejaba el "plan A" en blanco a
+ * propósito porque la forma era desconocida.
+ *
+ * ── HALLAZGO — para `P2039` NO hay plan A, a diferencia de `P2002`/`P2003` ──
+ *
+ * Forzado real, dos violaciones:
+ *
+ * 1) `ck_relationship_not_self_generalization` (creando una `GENERALIZATION`
+ *    con `source = target`):
+ *
+ *      err.code = 'P2039'
+ *      err.meta = {
+ *        modelName: 'UmlRelationship',
+ *        driverAdapterError: { name: 'DriverAdapterError', cause: {
+ *          originalCode: '23514',
+ *          kind: 'postgres',
+ *          originalMessage: 'new row for relation "uml_relationships" ' +
+ *            'violates check constraint "ck_relationship_not_self_generalization"',
+ *          message: '<mismo texto que originalMessage>',
+ *          severity: 'ERROR',
+ *          detail: 'Failing row contains (...).',
+ *        } },
+ *      }
+ *
+ *    **NO hay `cause.constraint` en absoluto.** A diferencia de un `23505`
+ *    (índice único, `P2002`) y de un `23503` (FK, ver `P2003` abajo), un
+ *    `23514` (CHECK) de `adapter-pg` no trae el nombre de la restricción en
+ *    NINGÚN campo estructurado — el único lugar donde aparece
+ *    `ck_relationship_not_self_generalization` es como texto libre dentro de
+ *    `originalMessage`.
+ *
+ * 2) Bonus verificado, no un `P2039` — forzado también por la tarea 1.1
+ *    (`P2003`, borrando un elemento con una relación `ON DELETE RESTRICT`
+ *    apuntándolo vía `uml_relationships.source_element_id`):
+ *
+ *      err.code = 'P2003'
+ *      err.meta = {
+ *        modelName: 'UmlElement',
+ *        driverAdapterError: { name: 'DriverAdapterError', cause: {
+ *          originalCode: '23503',
+ *          kind: 'ForeignKeyConstraintViolation',
+ *          constraint: { index: 'uml_relationships_source_element_id_fkey' },
+ *          originalMessage: 'update or delete on table "uml_elements" ' +
+ *            'violates foreign key constraint ' +
+ *            '"uml_relationships_source_element_id_fkey" on table "uml_relationships"',
+ *        } },
+ *      }
+ *
+ *    A diferencia de `P2039`, un `P2003` SÍ trae `cause.constraint.index`
+ *    — igual que `P2002`. Documentado acá por completitud de la tarea 1.1
+ *    (pide forzar los DOS), pero D6 (fase 3, `deleteElement`) no lo
+ *    consume: la comprobación previa autoritativa es la que produce el
+ *    `409`, y la captura de `P2003` ahí es solo red de carrera que relanza
+ *    tal cual sin inspeccionar esta forma. No hace falta un
+ *    `resolveForeignKeyViolation` en esta unidad.
+ *
+ * CONSECUENCIA para el resolvedor de abajo: no existe plan A posible para
+ * `P2039` — no hay campo estructurado que leer. El único plan viable es el
+ * plan C (substring sobre `message + JSON.stringify(meta)`, mismo criterio
+ * que `resolveUniqueViolation` arriba). Esto SÍ distingue las tres
+ * constraints alcanzables sin ambigüedad: `ck_relationship_not_self_
+ * generalization`, `ck_composite_multiplicity` y `ck_end_multiplicity` son
+ * tres substrings literales, mutuamente exclusivos, y cada uno aparece
+ * textualmente en el mensaje de PostgreSQL para su propia violación — no hay
+ * caso en que el resolvedor no pueda distinguir cuál de las tres fue.
+ */
+const CHECK_CONSTRAINT_TO_UML_ERROR: Record<string, UmlErrorCode> = {
+  ck_relationship_not_self_generalization: UML_ERROR.RELATIONSHIP_SELF_GENERALIZATION,
+  ck_composite_multiplicity: UML_ERROR.COMPOSITE_MULTIPLICITY_INVALID,
+  ck_end_multiplicity: UML_ERROR.END_MULTIPLICITY_INVALID,
+};
+
+const KNOWN_CHECK_NAMES = Object.keys(CHECK_CONSTRAINT_TO_UML_ERROR);
+
+/**
+ * `null` si no reconoce nada — el llamador relanza como `500`, nunca `409`
+ * genérico (design.md D1). Un `P2039` no reconocido por esta tabla es un bug
+ * o una CHECK nueva que esta tabla todavía no contempla.
+ */
+export function resolveCheckViolation(err: unknown): UmlErrorCode | null {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== 'P2039') {
+    return null;
+  }
+
+  const meta = err.meta as Record<string, unknown> | undefined;
+
+  // Único plan viable para P2039 (ver comentario de cabecera): no hay campo
+  // estructurado que leer, así que se busca el nombre de la constraint en
+  // el mensaje completo (mensaje + meta serializado) — mismo criterio que el
+  // plan C de `resolveUniqueViolation`.
+  const haystack = `${err.message} ${meta ? JSON.stringify(meta) : ''}`;
+  for (const name of KNOWN_CHECK_NAMES) {
+    if (haystack.includes(name)) return CHECK_CONSTRAINT_TO_UML_ERROR[name] ?? null;
+  }
+
+  return null;
+}
+
+/**
+ * Envoltorio único que las mutaciones de `uml-relationships` usan para no
+ * repetir el mapeo `UmlErrorCode → HTTP` (mismo patrón que
+ * `handleUniqueViolation`). Un `P2039` reconocido se envuelve en `409 {
+ * code }`; uno no reconocido, o cualquier otro error, se relanza tal cual —
+ * nunca un `409` genérico que esconda un bug (design.md D1).
+ */
+export function handleCheckViolation(err: unknown): never {
+  const code = resolveCheckViolation(err);
+  if (code) {
+    throw new ConflictException({ code });
+  }
+  throw err;
+}

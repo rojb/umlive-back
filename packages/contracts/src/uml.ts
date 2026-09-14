@@ -156,6 +156,24 @@ export interface DiagramContent {
   parameters: UmlParameterView[];
   enumLiterals: UmlEnumLiteralView[];
   layouts: ElementLayoutView[];
+  /**
+   * Agregado por `uml-relationships` (design.md §6, FR-B09). `relationshipEnds`
+   * solo trae las de `ASSOCIATION` (D4), ordenadas por `(relationshipId,
+   * endIndex)` — el orden es parte del contrato.
+   *
+   * NOTA de fase 1 (tasks.md 1.2 vs 3.2): las tres colecciones quedan acá
+   * como parte del contrato compartido, pero `DiagramContentService` (el
+   * único constructor de `DiagramContent`) no las llena todavía —
+   * `diagram-content.service.ts` es tarea 3.2, fase 3. Si se declararan
+   * `required`, `apps/api` dejaría de compilar desde esta unidad hasta que
+   * corra la fase 3, lo que rompe el criterio de regresión de la tarea 1.6.
+   * Quedan `?:` por esa razón — ver apply-progress de esta unidad, "Issues
+   * Found", para el detalle. Fase 3 las vuelve obligatorias cuando
+   * `diagram-content.service.ts` las llene de verdad.
+   */
+  relationships?: UmlRelationshipView[];
+  relationshipEnds?: UmlRelationshipEndView[];
+  relationshipLayouts?: RelationshipLayoutView[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,6 +291,145 @@ export interface ReorderEnumLiteralsRequest {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AMPLIADO por `uml-relationships` (M2, rebanada 5 de 5, unidad 1/4 — fase 1)
+// ─────────────────────────────────────────────────────────────────────────────
+// Se AGREGA sobre lo existente — `operations.ts` (M3) ya importa de este
+// archivo y NO se toca ni se sobrescribe. Diseño:
+// `openspec/changes/uml-relationships/design.md` §6. Especificación:
+// `.../specs/uml-relationships-backend/spec.md`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Waypoint {
+  x: number;
+  y: number;
+}
+
+export interface UmlRelationshipView {
+  id: string;
+  diagramId: string;
+  kind: RelationshipKind;
+  /** FUENTE DE VERDAD del enrutado (D3). El cliente NUNCA enruta por `end.elementId`. */
+  sourceElementId: string;
+  targetElementId: string;
+  name: string | null;
+  stereotype: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * SOLO existe para `kind: 'ASSOCIATION'` — dos filas, `endIndex` 0 y 1 (D4).
+ * Los otros cuatro tipos no tienen extremos: sus cinco propiedades
+ * (`roleName`, bounds, `isNavigable`, `aggregation`) son de
+ * `Association::memberEnd` en UML 2.5 y no existen para `Generalization`,
+ * `Dependency`, `Usage` ni `InterfaceRealization`, que quedan completamente
+ * descritos por `sourceElementId`/`targetElementId` + `kind`.
+ *
+ * M5 (FR-E07): ramificar por `kind`, no por presencia de filas.
+ */
+export interface UmlRelationshipEndView {
+  id: string;
+  relationshipId: string;
+  endIndex: 0 | 1;
+  /** Espejo derivado de `UmlRelationshipView.{source,target}ElementId` (D3). */
+  elementId: string;
+  roleName: string | null;
+  lowerBound: number;
+  /** `null` es `*`. Sin centinelas. */
+  upperBound: number | null;
+  isNavigable: boolean;
+  /** `COMPOSITE`/`SHARED` marcan el extremo que es el TODO; el rombo va acá (D5). */
+  aggregation: AggregationKind;
+}
+
+export interface RelationshipLayoutView {
+  relationshipId: string;
+  waypoints: Waypoint[];
+  sourceAnchor: string | null;
+  targetAnchor: string | null;
+}
+
+/**
+ * Una fila del cuerpo `409 { code: 'element_has_relationships' }` de
+ * `deleteElement` (D6). El endpoint que la produce es fase 3
+ * (`elements.service.ts`, tasks.md 3.1) — el tipo vive acá porque es parte
+ * del contrato compartido de esta rebanada, no porque fase 1 lo consuma.
+ */
+export interface IncidentRelationshipView {
+  relationshipId: string;
+  kind: RelationshipKind;
+  name: string | null;
+  otherElementId: string;
+  otherElementName: string | null;
+}
+
+// ── Cuerpos de petición — once mutaciones (design.md §3, "Superficie HTTP") ─
+// Mismo criterio que el resto del archivo: el cuerpo nunca lleva el verbo ni
+// el tipo del objetivo.
+
+/** Un extremo dentro de `CreateRelationshipRequest.ends` — solo `ASSOCIATION` (D4). */
+export interface CreateRelationshipEndRequest {
+  roleName?: string | null;
+  lowerBound: number;
+  upperBound: number | null;
+  isNavigable: boolean;
+  aggregation: AggregationKind;
+}
+
+export interface CreateRelationshipRequest {
+  kind: RelationshipKind;
+  sourceElementId: string;
+  targetElementId: string;
+  name?: string | null;
+  /**
+   * MUST venir solo si `kind === 'ASSOCIATION'` (D4) — el servidor responde
+   * `400` si `ends` viene junto con cualquier otro `kind`.
+   */
+  ends?: [CreateRelationshipEndRequest, CreateRelationshipEndRequest];
+}
+
+export interface RenameRelationshipRequest {
+  name: string;
+}
+
+/** Reencaminar un extremo — comparte forma entre `.../source` y `.../target` (design.md §6). */
+export interface RerouteRelationshipEndRequest {
+  elementId: string;
+  anchor?: string | null;
+}
+
+export interface SetEndRoleNameRequest {
+  roleName: string | null;
+}
+
+export interface SetEndMultiplicityRequest {
+  lowerBound: number;
+  upperBound: number | null;
+}
+
+export interface SetEndNavigabilityRequest {
+  isNavigable: boolean;
+}
+
+/**
+ * Sin `upperBound` (D2, deliberado): `setEndAggregation` no puede ver el
+ * `upperBound` ya guardado, y `ck_composite_multiplicity` es el ÚNICO punto
+ * de aplicación de SC-B09 — un guard de DTO acá lo evitaría.
+ */
+export interface SetEndAggregationRequest {
+  aggregation: AggregationKind;
+}
+
+export interface SetRelationshipWaypointsRequest {
+  waypoints: Waypoint[];
+}
+
+export interface SetRelationshipAnchorsRequest {
+  sourceAnchor: string | null;
+  targetAnchor: string | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Errores propios de esta rebanada (design.md §6)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -295,6 +452,23 @@ export const UML_ERROR = {
   PARAMETER_POSITION_CONFLICT: 'parameter_position_conflict',
   /** Guarda de `reorderParameters`: el conjunto recibido no coincide con el real (§5 de design.md). */
   PARAMETER_SET_MISMATCH: 'parameter_set_mismatch',
+
+  // ── Agregados por `uml-relationships` (design.md §6, D1/D4/D6) ────────────
+  /** `ck_relationship_not_self_generalization`: `GENERALIZATION` con `source = target`. */
+  RELATIONSHIP_SELF_GENERALIZATION: 'relationship_self_generalization',
+  /**
+   * `ck_composite_multiplicity`: `aggregation === 'COMPOSITE'` con
+   * `upperBound` > 1, `null` (`*`) o sin definir — los tres casos, un solo
+   * código.
+   */
+  COMPOSITE_MULTIPLICITY_INVALID: 'composite_multiplicity_invalid',
+  /** `ck_end_multiplicity`: `upperBound < lowerBound` en `setEndMultiplicity`. */
+  END_MULTIPLICITY_INVALID: 'end_multiplicity_invalid',
+  /**
+   * `deleteElement` con relaciones incidentes (D6, fase 3). Cuerpo del `409`:
+   * `{ code, count, relationships: IncidentRelationshipView[] }`.
+   */
+  ELEMENT_HAS_RELATIONSHIPS: 'element_has_relationships',
 } as const;
 
 export type UmlErrorCode = (typeof UML_ERROR)[keyof typeof UML_ERROR];

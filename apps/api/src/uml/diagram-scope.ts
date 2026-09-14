@@ -66,3 +66,22 @@ export async function assertLiteralInDiagram(tx: Tx, literalId: string, diagramI
   });
   if (!row) throw new NotFoundException();
 }
+
+/**
+ * Agregado por `uml-relationships` (design.md §3 "Superficie HTTP"; tasks.md
+ * 1.5). Mismo patrón que los cuatro helpers de arriba — `404`, nunca `403`.
+ *
+ * No hace falta un `assertEndInDiagram` aparte (design.md §3): un extremo se
+ * direcciona por `endIndex` dentro de la ruta de su propia relación, así que
+ * esta función + `endIndex ∈ {0,1}` ya lo aíslan por completo. Las cuatro
+ * mutaciones de extremo (fase 2) cargan la fila `(relationshipId, endIndex)`
+ * y responden `404` si no existe — que es también el caso de los cuatro
+ * tipos sin extremos (D4); ese `404` no pasa por esta función.
+ */
+export async function assertRelationshipInDiagram(tx: Tx, relationshipId: string, diagramId: string): Promise<void> {
+  const row = await tx.umlRelationship.findFirst({
+    where: { id: relationshipId, diagramId },
+    select: { id: true },
+  });
+  if (!row) throw new NotFoundException();
+}
