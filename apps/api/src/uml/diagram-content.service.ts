@@ -47,7 +47,18 @@ export class DiagramContentService {
         where: { id: diagramId },
         select: { id: true, name: true, lockState: true, currentVersion: true, createdAt: true, updatedAt: true },
       }),
-      this.prisma.umlElement.findMany({ where: { diagramId } }),
+      // `orderBy` en las cuatro colecciones sin orden natural — agregado
+      // 2026-09-14. PostgreSQL NO garantiza orden sin `ORDER BY`, y el
+      // comentario de cabecera ya afirmaba que "el orden es parte del
+      // contrato". Hoy no rompe nada porque el cliente indexa por id, pero lo
+      // necesitan DOS consumidores futuros: el exportador XMI (un documento
+      // que cambia de orden entre corridas hace fallar el ida y vuelta de
+      // forma intermitente — el peor modo de falla: pasa en la demo, falla en
+      // la corrección) y el snapshot `version = 0` de M3 (dos clientes que
+      // sincronizan tienen que recibir lo mismo). Se arregla una vez acá en
+      // vez de dos veces en cada consumidor. Es aditivo: no cambia qué filas
+      // vuelven, solo las vuelve deterministas.
+      this.prisma.umlElement.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
       this.prisma.umlFeature.findMany({
         where: { owner: { diagramId } },
         orderBy: [{ ownerId: 'asc' }, { kind: 'asc' }, { position: 'asc' }],
@@ -60,13 +71,13 @@ export class DiagramContentService {
         where: { enumeration: { diagramId } },
         orderBy: [{ enumerationId: 'asc' }, { position: 'asc' }],
       }),
-      this.prisma.elementLayout.findMany({ where: { element: { diagramId } } }),
-      this.prisma.umlRelationship.findMany({ where: { diagramId } }),
+      this.prisma.elementLayout.findMany({ where: { element: { diagramId } }, orderBy: { elementId: 'asc' } }),
+      this.prisma.umlRelationship.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
       this.prisma.umlRelationshipEnd.findMany({
         where: { relationship: { diagramId } },
         orderBy: [{ relationshipId: 'asc' }, { endIndex: 'asc' }],
       }),
-      this.prisma.relationshipLayout.findMany({ where: { relationship: { diagramId } } }),
+      this.prisma.relationshipLayout.findMany({ where: { relationship: { diagramId } }, orderBy: { relationshipId: 'asc' } }),
     ]);
 
     return {
