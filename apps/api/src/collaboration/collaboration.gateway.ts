@@ -23,8 +23,8 @@ import type { Server, Socket } from 'socket.io';
 import type { CurrentUserPayload } from '../auth/current-user.decorator';
 import { SocketAuthService } from '../auth/socket-auth.service';
 import { ProjectAccessResolver, type ProjectAccessResult } from '../projects/project-access.resolver';
-import { DiagramContentService } from '../uml/diagram-content.service';
 import { OperationsService } from './operations.service';
+import { ReconnectService } from './reconnect.service';
 
 /**
  * Lo que el middleware de handshake deja en `socket.data` (design.md §D6).
@@ -48,11 +48,14 @@ const SOCKET_AUTH_GRACE_MS = 30_000;
 const SOCKET_AUTH_SWEEP_INTERVAL_MS = 10_000;
 
 /**
- * Transporte WebSocket de M3 (collaboration-gateway/design.md, rebanada 1 de
- * 4). Middleware de handshake (D1/D3), gate de membresía a `diagram:join`
- * (D3), snapshot v0 al vuelo (D8/D9), renovación de sesión sin reconectar
- * (D5), contabilidad de sala por socket (D6). **Sin** `LocksService` (D7) —
- * no hay handler `lock:request` todavía.
+ * Transporte WebSocket de M3. Middleware de handshake (`collaboration-gateway`
+ * D1/D3), gate de membresía a `diagram:join` (D3), renovación de sesión sin
+ * reconectar (D5), contabilidad de sala por socket (D6). `diagram:sync` honra
+ * `lastVersion` vía `ReconnectService` — delta o estado completo según el
+ * hueco (`reconnect-and-presence/design.md` §D3-D6, rebanada 3 de 4). **Sin**
+ * `LocksService` todavía (D7 de la rebanada 1) — el protocolo `lock:*`/
+ * `presence:*` y `teardown` bajo INV-WS-1 se cablean en la Fase 3 de esta
+ * misma rebanada.
  */
 @WebSocketGateway()
 export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGatewayDisconnect<CollabSocket> {
@@ -90,8 +93,8 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   constructor(
     private readonly socketAuth: SocketAuthService,
     private readonly accessResolver: ProjectAccessResolver,
-    private readonly diagramContent: DiagramContentService,
     private readonly operations: OperationsService,
+    private readonly reconnect: ReconnectService,
   ) {}
 
   /**
@@ -190,19 +193,24 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       return;
     }
 
+    // INV-RC-1 (reconnect-and-presence/design.md §D3): el join va PRIMERO,
+    // SIEMPRE antes de leer la versión o las filas del log. Toda operación
+    // confirmada es entonces anterior a la lectura de versión (y está en el
+    // delta/snapshot) o posterior al join (y llega por difusión) — los dos
+    // conjuntos se solapan, no dejan hueco. Si esto se reordena, el delta
+    // deja de ser completo y nada falla ruidosamente.
     await client.join(this.roomOf(client.data.diagramId));
 
-    // `lastVersion` se acepta y se DESCARTA a propósito (design.md §D9): el
-    // log de operaciones está vacío en esta rebanada y la versión siempre es
-    // 0 — `mode: 'delta'` no puede existir todavía.
+    // `lastVersion` ahora se HONRA (design.md §D4/§D9 — ya no se descarta):
+    // `ReconnectService.sync` decide delta vs. estado completo por el hueco.
     //
-    // W-1 (verify 2026-09-18): el snapshot va SOLO al socket que se une, vía
+    // W-1 (verify 2026-09-18): el sync va SOLO al socket que se une, vía
     // `emitToSocket`, nunca a la sala entera. `emitTo` (sala) difundía el
     // sync completo a los demás miembros en cada join — costo innecesario y
     // la vía por la que W-2 encontró que un expulsado seguía recibiendo
     // contenido.
-    const state = await this.diagramContent.getDiagramContent(client.data.diagramId);
-    this.emitToSocket(client, 'diagram:sync', { mode: 'snapshot', version: 0, state, operations: [] });
+    const sync = await this.reconnect.sync(client.data.diagramId, payload.lastVersion);
+    this.emitToSocket(client, 'diagram:sync', sync);
   }
 
   /**

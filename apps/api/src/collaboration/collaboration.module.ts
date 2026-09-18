@@ -6,6 +6,7 @@ import { CollaborationGateway } from './collaboration.gateway';
 import { LocksService } from './locks.service';
 import { OperationDispatcher } from './operation-dispatch';
 import { OperationsService } from './operations.service';
+import { ReconnectService } from './reconnect.service';
 
 /**
  * Tiempo real y concurrencia — M3 (`collaboration-gateway`, rebanada 1 de 4;
@@ -13,23 +14,25 @@ import { OperationsService } from './operations.service';
  * M4).
  *
  * Piezas:
- *   locks.service.ts          exclusión por elemento — hecho (rebanada 1)
- *   operations.service.ts     validación, orden y persistencia del log — hecho (esta rebanada)
- *   operation-dispatch.ts     mapa OperationType → …In(tx), 32 entradas — hecho (esta rebanada)
- *   operation-rejection.ts    traducción de errores → OperationRejected — hecho (esta rebanada)
- *   presence.service.ts       cursores y selección — rebanada 3
- *   collaboration.gateway.ts  el WebSocket que las une — modificado esta rebanada (handler `op:submit`)
+ *   locks.service.ts          exclusión por elemento — hecho (rebanada 1), cableado (rebanada 3)
+ *   operations.service.ts     validación, orden y persistencia del log — hecho (rebanada 2)
+ *   operation-dispatch.ts     mapa OperationType → …In(tx), 32 entradas — hecho (rebanada 2)
+ *   operation-rejection.ts    traducción de errores → OperationRejected — hecho (rebanada 2)
+ *   reconnect.service.ts      delta/snapshot de `diagram:sync` — hecho (esta rebanada)
+ *   presence.ts               color por sala, roster — rebanada 3 (helpers puros)
+ *   collaboration.gateway.ts  el WebSocket que las une — modificado esta rebanada (join honra `lastVersion`)
  *
  * `AuthModule` por `SocketAuthService`, `ProjectsModule` por
  * `ProjectAccessResolver`, `UmlModule` por `DiagramContentService` (design.md
- * §D10 de la rebanada 1) Y por los cuatro services de mutación
- * (`ElementsService`, `RelationshipsService`, `FeaturesService`,
- * `ParametersService`) que `OperationDispatcher` inyecta (contradicción #7
- * de la propuesta de `operations-pipeline`).
+ * §D10 de la rebanada 1, y §D4 de `reconnect-and-presence` para `ReconnectService`)
+ * Y por los cuatro services de mutación (`ElementsService`,
+ * `RelationshipsService`, `FeaturesService`, `ParametersService`) que
+ * `OperationDispatcher` inyecta (contradicción #7 de la propuesta de
+ * `operations-pipeline`).
  */
 @Module({
   imports: [AuthModule, ProjectsModule, UmlModule],
-  providers: [LocksService, CollaborationGateway, OperationsService, OperationDispatcher],
+  providers: [LocksService, CollaborationGateway, OperationsService, OperationDispatcher, ReconnectService],
   exports: [LocksService],
 })
 export class CollaborationModule {}
