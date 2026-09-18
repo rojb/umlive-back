@@ -47,6 +47,6 @@ import { ValidationService } from './validation.service';
 @Module({
   controllers: [DiagramContentController, ValidationController],
   providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService, ValidationService],
-  exports: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService],
+  exports: [DiagramContentService, ValidationService, ElementsService, FeaturesService, ParametersService, RelationshipsService],
 })
 export class UmlModule {}

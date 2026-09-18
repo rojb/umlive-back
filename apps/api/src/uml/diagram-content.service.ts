@@ -1,6 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import type { DiagramContent } from '@umlive/contracts';
 import { PrismaService } from '../prisma/prisma.service';
+// Alias compartido, no uno local (`prisma/tx.type.ts`): el mismo tipo para todo
+// el repo, y una copia local es exactamente lo que ese archivo existe para
+// evitar (`operations-pipeline` D2).
+import type { Tx } from '../prisma/tx.type';
+
 import {
   toDiagramSummary,
   toElementView,
@@ -32,6 +37,20 @@ export class DiagramContentService {
   constructor(private readonly prisma: PrismaService) {}
 
   async getDiagramContent(diagramId: string): Promise<DiagramContent> {
+    return this.getDiagramContentIn(this.prisma, diagramId);
+  }
+
+  /**
+   * Misma lectura, sobre un `tx` ajeno (`codegen-core` D1, tarea 2.1). Es el
+   * patrón extract-method `…In(tx)` de `operations-pipeline`: el cuerpo es
+   * **idéntico** al de `getDiagramContent` —solo cambió el receptor de las
+   * nueve consultas—, así que quien ya tenía una transacción abierta puede
+   * leer el contenido dentro de su MISMO snapshot en vez de abrir uno nuevo.
+   *
+   * `codegen-core` lo usa para que la compuerta (`validateIn`) y la lectura
+   * que genera vean el mismo estado del diagrama (`RepeatableRead`).
+   */
+  async getDiagramContentIn(tx: Tx, diagramId: string): Promise<DiagramContent> {
     const [
       diagram,
       elements,
@@ -43,7 +62,7 @@ export class DiagramContentService {
       relationshipEnds,
       relationshipLayouts,
     ] = await Promise.all([
-      this.prisma.diagram.findUniqueOrThrow({
+      tx.diagram.findUniqueOrThrow({
         where: { id: diagramId },
         select: { id: true, name: true, lockState: true, currentVersion: true, createdAt: true, updatedAt: true },
       }),
@@ -58,26 +77,26 @@ export class DiagramContentService {
       // sincronizan tienen que recibir lo mismo). Se arregla una vez acá en
       // vez de dos veces en cada consumidor. Es aditivo: no cambia qué filas
       // vuelven, solo las vuelve deterministas.
-      this.prisma.umlElement.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
-      this.prisma.umlFeature.findMany({
+      tx.umlElement.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
+      tx.umlFeature.findMany({
         where: { owner: { diagramId } },
         orderBy: [{ ownerId: 'asc' }, { kind: 'asc' }, { position: 'asc' }],
       }),
-      this.prisma.umlParameter.findMany({
+      tx.umlParameter.findMany({
         where: { operation: { owner: { diagramId } } },
         orderBy: [{ operationId: 'asc' }, { position: 'asc' }],
       }),
-      this.prisma.umlEnumLiteral.findMany({
+      tx.umlEnumLiteral.findMany({
         where: { enumeration: { diagramId } },
         orderBy: [{ enumerationId: 'asc' }, { position: 'asc' }],
       }),
-      this.prisma.elementLayout.findMany({ where: { element: { diagramId } }, orderBy: { elementId: 'asc' } }),
-      this.prisma.umlRelationship.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
-      this.prisma.umlRelationshipEnd.findMany({
+      tx.elementLayout.findMany({ where: { element: { diagramId } }, orderBy: { elementId: 'asc' } }),
+      tx.umlRelationship.findMany({ where: { diagramId }, orderBy: { id: 'asc' } }),
+      tx.umlRelationshipEnd.findMany({
         where: { relationship: { diagramId } },
         orderBy: [{ relationshipId: 'asc' }, { endIndex: 'asc' }],
       }),
-      this.prisma.relationshipLayout.findMany({ where: { relationship: { diagramId } }, orderBy: { relationshipId: 'asc' } }),
+      tx.relationshipLayout.findMany({ where: { relationship: { diagramId } }, orderBy: { relationshipId: 'asc' } }),
     ]);
 
     return {
