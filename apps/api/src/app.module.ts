@@ -4,6 +4,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { CollaborationModule } from './collaboration/collaboration.module';
 import { JoinCodesModule } from './join-codes/join-codes.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ProjectAccessGuard } from './projects/guards/project-access.guard';
@@ -38,7 +39,9 @@ const envFilePath = join(__dirname, '..', '.env');
     // M2 — contrato + cimientos (uml-classifiers, fase 1+2). Sin rutas
     // todavía: fase 3/4 registra los controllers dentro de este módulo.
     UmlModule,
-    // M3  CollaborationModule
+    // M3 — transporte WebSocket, gate de membresía, snapshot v0
+    // (collaboration-gateway, rebanada 1 de 4).
+    CollaborationModule,
     // M5  InteropModule, CodegenModule
     // M6  AiModule
   ],

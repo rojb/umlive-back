@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import type { CurrentUserPayload } from './current-user.decorator';
+import { JWT_ACCESS_AUDIENCE, JWT_ACCESS_ISSUER } from './jwt-access.constants';
 
 /** Forma exacta firmada por `TokensService.signAccess` (design.md §4.1). */
 interface JwtAccessPayload {
@@ -19,8 +20,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       secretOrKey: config.get<string>('JWT_ACCESS_SECRET') ?? '',
-      issuer: 'umlive',
-      audience: 'umlive-web',
+      issuer: JWT_ACCESS_ISSUER,
+      audience: JWT_ACCESS_AUDIENCE,
       ignoreExpiration: false,
     });
   }

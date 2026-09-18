@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomUUID } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
+import { JWT_ACCESS_AUDIENCE, JWT_ACCESS_ISSUER } from './jwt-access.constants';
 
 /**
  * Emisión, rotación y revocación de sesión (access + refresh token).
@@ -23,8 +24,11 @@ import { PrismaService } from '../prisma/prisma.service';
  *      tampoco valida, porque su sha256 no va a coincidir con la fila.
  */
 
-const ISS = 'umlive';
-const AUD = 'umlive-web';
+// `ISS`/`AUD` mudados a `jwt-access.constants.ts` (collaboration-gateway/
+// design.md §D4) — `SocketAuthService` los importa desde ahí también. Mismos
+// valores, un solo lugar.
+const ISS = JWT_ACCESS_ISSUER;
+const AUD = JWT_ACCESS_AUDIENCE;
 
 /**
  * Convierte un TTL humano ("15m", "30d") o segundos crudos ("900") a

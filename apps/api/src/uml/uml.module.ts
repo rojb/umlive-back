@@ -27,9 +27,15 @@ import { ValidationService } from './validation.service';
  *
  * `ValidationController/Service` agregado por `uml-validation` (design.md §1,
  * D6; tasks.md 2.5) — sexto par, capa de lectura consultiva de FR-B14.
+ *
+ * `DiagramContentService` se exporta (collaboration-gateway/design.md §D8):
+ * `CollaborationGateway` lo reusa para el snapshot `version = 0` al vuelo, sin
+ * inyectar `PrismaService` — es su única fuente de estado de diagrama, y ya
+ * devuelve datos mapeados (sin `BigInt`).
  */
 @Module({
   controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController, RelationshipsController, ValidationController],
   providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService, ValidationService],
+  exports: [DiagramContentService],
 })
 export class UmlModule {}

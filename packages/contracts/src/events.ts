@@ -8,6 +8,22 @@ import type {
   LockDenied, LockGranted, LockReleased,
   OperationCommitted, OperationRejected, OperationRequest,
 } from './operations';
+import type { DiagramContent } from './uml';
+
+/**
+ * Lo que viaja en `handshake.auth` (collaboration-gateway/design.md §D3).
+ * `diagramId` va ACÁ y no solo en `diagram:join` porque SC-C28 exige que el
+ * rechazo ocurra EN EL HANDSHAKE, y sin `diagramId` el handshake no puede
+ * resolver membresía contra un proyecto. Un socket sirve a un solo
+ * diagrama: `diagram:join` con otro id se rechaza.
+ */
+export interface SocketHandshakeAuth {
+  token: string;
+  diagramId: string;
+}
+
+/** Códigos de `connect_error` (design.md §D3). No-miembro y rol insuficiente comparten `forbidden`. */
+export type SocketRejectionCode = 'unauthenticated' | 'bad_request' | 'diagram_not_found' | 'forbidden';
 
 /** Cliente → servidor. */
 export interface ClientEvents {
@@ -20,6 +36,8 @@ export interface ClientEvents {
   'lock:heartbeat': (p: { diagramId: string; elementIds: string[] }) => void;
   'presence:cursor': (p: { diagramId: string; x: number; y: number }) => void;
   'presence:select': (p: { diagramId: string; elementIds: string[] }) => void;
+  /** Token renovado por el cliente HTTP. El socket NUNCA llama a /auth/refresh (SC-A06, design.md §D5). */
+  'auth:token': (p: { token: string }) => void;
 }
 
 /** Servidor → cliente. */
@@ -40,11 +58,16 @@ export interface ServerEvents {
   'presence:select': (p: { userId: string; elementIds: string[] }) => void;
   /** Expulsión: se quitó al usuario del proyecto (SC-A12). */
   'access:revoked': (p: { reason: string }) => void;
+  /** Emitido justo antes de desconectar por `exp` vencido — distingue vencimiento de caída de red (design.md §D5). */
+  'auth:expired': () => void;
 }
 
 export type DiagramSync =
   | { mode: 'delta'; fromVersion: number; toVersion: number; operations: OperationCommitted[] }
-  | { mode: 'snapshot'; version: number; state: unknown; operations: OperationCommitted[] };
+  // `state: DiagramContent` — era `unknown` (design.md §D9). Import de solo
+  // tipo: se borra al compilar, sin ciclo en runtime con `./operations`, que
+  // ya importa de `./uml`.
+  | { mode: 'snapshot'; version: number; state: DiagramContent; operations: OperationCommitted[] };
 
 export interface PresenceUser {
   userId: string;
