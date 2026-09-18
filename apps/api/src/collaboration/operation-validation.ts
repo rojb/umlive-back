@@ -133,10 +133,24 @@ const VALIDATORS: { [T in OperationType]: Validator } = {
     const record = asRecord(payload);
     if (!record) return fail('El payload no es un objeto.');
     const id = requireNonEmptyString(record.id, 'id');
-    const layout = asRecord(record.layout);
+    const layoutValue = record.layout;
+    const layout = asRecord(layoutValue);
+    if (layoutValue !== undefined && !layout) return fail('`layout` debe ser un objeto.');
     const err = collectErrors(id);
     if (err) return fail(err.error);
     const { rest } = splitFields(record, ['id', 'layout']);
+    // RS-1 (verify-report 2026-09-18): `x`/`y`/`width`/`height` viajan SOLO
+    // anidados en `layout` — un valor de primer nivel se perdía en silencio
+    // al aplanar (`flat` lo pisaba con `layout?.x`, que puede ser
+    // `undefined`), y las claves extra DENTRO de `layout` nunca llegaban a
+    // `checkDto`, así que `forbidNonWhitelisted` nunca las veía. Las dos
+    // formas rechazan ahora, igual que cualquier otro campo no reconocido.
+    const strayGeometryKeys = (['x', 'y', 'width', 'height'] as const).filter((k) => k in rest);
+    if (strayGeometryKeys.length > 0) return fail(`Campos no reconocidos: ${strayGeometryKeys.join(', ')} (van anidados en \`layout\`).`);
+    if (layout) {
+      const layoutExtra = noExtraFields(splitFields(layout, ['x', 'y', 'width', 'height']).rest);
+      if (layoutExtra) return fail(layoutExtra.error);
+    }
     const flat = { ...rest, x: layout?.x, y: layout?.y, width: layout?.width, height: layout?.height };
     const dto = await checkDto(CreateElementDto, flat);
     if (isFieldError(dto)) return fail(dto.error);
@@ -199,6 +213,16 @@ const VALIDATORS: { [T in OperationType]: Validator } = {
     const { picked, rest } = splitFields(record, ['id', 'position']);
     const id = requireUuid4(picked.id, 'id');
     if (isFieldError(id)) return fail(id.error);
+    // RW-3 (verify-report 2026-09-18): `{id}` a secas (o `{id, position}`,
+    // que `updateFeatureIn` ignora) pasaba entero y confirmaba un NO-OP que
+    // consumía versión — la tabla de Correcciones decía "nunca un no-op
+    // silencioso", pero eso valía para `element.rename`, no para acá. El
+    // chequeo es sobre `rest` (objeto PLANO), nunca sobre la instancia del
+    // DTO: con `target: ES2023` (`useDefineForClassFields`), TypeScript
+    // define TODOS los campos declarados como propiedades propias en el
+    // constructor — `Object.keys(instanciaDto)` nunca da `[]`, aunque
+    // `plainToInstance` no haya copiado ningún valor real.
+    if (Object.keys(rest).length === 0) return fail('La operación no cambia ningún campo.');
     const dto = await checkDto(UpdateFeatureDto, rest);
     if (isFieldError(dto)) return fail(dto.error);
     return ok({ id, ...dto });
@@ -237,6 +261,9 @@ const VALIDATORS: { [T in OperationType]: Validator } = {
     const { picked, rest } = splitFields(record, ['id']);
     const id = requireUuid4(picked.id, 'id');
     if (isFieldError(id)) return fail(id.error);
+    // RW-3 (verify-report 2026-09-18): mismo arreglo que `feature.update` —
+    // el chequeo es sobre `rest` (plano), no sobre la instancia del DTO.
+    if (Object.keys(rest).length === 0) return fail('La operación no cambia ningún campo.');
     const dto = await checkDto(UpdateParameterDto, rest);
     if (isFieldError(dto)) return fail(dto.error);
     return ok({ id, ...dto });
@@ -321,8 +348,15 @@ const VALIDATORS: { [T in OperationType]: Validator } = {
   'relationship.delete': async (payload) => idOnly(payload),
 
   'relationshipEnd.setRoleName': async (payload) => withRelEndAnd(payload, SetEndRoleNameDto, (relationshipId, endIndex, dto) => ({ relationshipId, endIndex, roleName: dto.roleName })),
+  // RW-5 (verify-report 2026-09-18): `dto.upperBound` es `undefined` cuando
+  // el cliente no manda la clave (el DTO la deja pasar vía `@ValidateIf`).
+  // Sin `?? null`, la clave con valor `undefined` se caía del JSON logueado
+  // (`JSON.stringify` la omite), mientras `relationships.service.ts` SÍ
+  // escribía `upper_bound = NULL` — el hecho logueado dejaba de cumplir su
+  // propio tipo de contrato (`upperBound: number | null`, obligatorio) y no
+  // decía lo que se persistió (D5 MUST).
   'relationshipEnd.setMultiplicity': async (payload) =>
-    withRelEndAnd(payload, SetEndMultiplicityDto, (relationshipId, endIndex, dto) => ({ relationshipId, endIndex, lowerBound: dto.lowerBound, upperBound: dto.upperBound })),
+    withRelEndAnd(payload, SetEndMultiplicityDto, (relationshipId, endIndex, dto) => ({ relationshipId, endIndex, lowerBound: dto.lowerBound, upperBound: dto.upperBound ?? null })),
   'relationshipEnd.setNavigability': async (payload) =>
     withRelEndAnd(payload, SetEndNavigabilityDto, (relationshipId, endIndex, dto) => ({ relationshipId, endIndex, isNavigable: dto.isNavigable })),
   'relationshipEnd.setAggregation': async (payload) =>
