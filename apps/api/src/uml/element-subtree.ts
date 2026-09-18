@@ -23,13 +23,24 @@ type Tx = Prisma.TransactionClient;
  * borrado necesita las relaciones PROPIAS del elemento (no solo las de sus
  * descendientes), y la guarda de ciclo necesita que `parentId === elementId`
  * caiga dentro del mismo subárbol que el resto de la comprobación.
+ *
+ * **`diagramId` obligatorio — defensa en profundidad (verify-report
+ * CRITICAL-1)**: el llamador YA verificó `rootId` con `assertElementInDiagram`
+ * antes de invocar esta función, así que el filtro acá es redundante para
+ * cualquier llamador correcto. Pero un `parent_id` corrupto o un llamador
+ * futuro que se salte esa verificación no tiene por qué descubrirlo
+ * recorriendo el árbol de contención de OTRO diagrama (y por lo tanto de
+ * otro proyecto) — la recursión ahora nunca cruza `diagram_id`, ni en la fila
+ * ancla ni en el paso recursivo.
  */
-export async function collectSubtreeIds(tx: Tx, rootId: string): Promise<string[]> {
+export async function collectSubtreeIds(tx: Tx, rootId: string, diagramId: string): Promise<string[]> {
   const rows = await tx.$queryRaw<{ id: string }[]>`
     WITH RECURSIVE subtree(id) AS (
-      SELECT id FROM uml_elements WHERE id = ${rootId}::uuid
+      SELECT id FROM uml_elements WHERE id = ${rootId}::uuid AND diagram_id = ${diagramId}::uuid
       UNION
-      SELECT e.id FROM uml_elements e JOIN subtree s ON e.parent_id = s.id
+      SELECT e.id FROM uml_elements e
+        JOIN subtree s ON e.parent_id = s.id
+       WHERE e.diagram_id = ${diagramId}::uuid
     )
     SELECT id FROM subtree
   `;

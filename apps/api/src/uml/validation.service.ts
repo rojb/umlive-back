@@ -186,6 +186,11 @@ export class ValidationService {
       // ilegible") — cada token de la firma cruda es un `type_element_id`
       // (se resuelve a nombre con el índice) o ya es un `type_name`/`?`.
       detail: `${row.name}(${this.resolveSignatureTypes(row.signature, index)})`,
+      // W-6 (verify-report): la consulta YA traía `feature_ids` vía
+      // `array_agg(ops.id)` y el mapeo los descartaba — sin ellos, dos
+      // operaciones con la MISMA firma comparten el mismo `detail` y ni el
+      // cliente ni M5 pueden distinguir cuál de las dos sobra.
+      featureIds: row.feature_ids,
     }));
   }
 

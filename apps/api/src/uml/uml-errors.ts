@@ -211,14 +211,31 @@ export function handleUniqueViolation(err: unknown, conflictingName: string): ne
  *    `resolveForeignKeyViolation` en esta unidad.
  *
  * CONSECUENCIA para el resolvedor de abajo: no existe plan A posible para
- * `P2039` — no hay campo estructurado que leer. El único plan viable es el
- * plan C (substring sobre `message + JSON.stringify(meta)`, mismo criterio
- * que `resolveUniqueViolation` arriba). Esto SÍ distingue las tres
- * constraints alcanzables sin ambigüedad: `ck_relationship_not_self_
- * generalization`, `ck_composite_multiplicity` y `ck_end_multiplicity` son
- * tres substrings literales, mutuamente exclusivos, y cada uno aparece
- * textualmente en el mensaje de PostgreSQL para su propia violación — no hay
- * caso en que el resolvedor no pueda distinguir cuál de las tres fue.
+ * `P2039` — no hay campo estructurado que leer. El plan viable es leer
+ * `cause.originalMessage` con una regex (`violates check constraint
+ * "(\w+)"`) y, si por algún motivo no matchea, un plan B de substring — pero
+ * el uno y el otro miran SOLO `originalMessage`, nunca `detail` ni el `meta`
+ * completo serializado.
+ *
+ * **Corrección `uml-validation` (verify-report W-4).** La versión anterior de
+ * este resolvedor buscaba el nombre de la constraint en
+ * `err.message + JSON.stringify(meta)` — y `meta` incluye
+ * `cause.detail: 'Failing row contains (...)'`, que trae DATOS DEL USUARIO
+ * (p. ej. `roleName`, cualquier columna de la fila que violó la CHECK).
+ * Forzado real: crear una `ASSOCIATION` con un extremo `COMPOSITE` y
+ * `upperBound: null` (viola `ck_composite_multiplicity`) pero con
+ * `roleName: 'ck_relationship_not_self_generalization'` — el resolvedor
+ * viejo encontraba ese substring en `detail` ANTES que el nombre real de la
+ * constraint en `originalMessage`, y devolvía
+ * `409 { code: 'relationship_self_generalization' }` en vez del
+ * `composite_multiplicity_invalid` correcto. Restringir la búsqueda a
+ * `originalMessage` (el único campo que PostgreSQL usa para el nombre de la
+ * constraint, nunca para datos de fila) cierra la clasificación errónea sin
+ * perder ningún caso real: las tres constraints alcanzables
+ * (`ck_relationship_not_self_generalization`, `ck_composite_multiplicity`,
+ * `ck_end_multiplicity`) y ahora también `ck_element_not_own_parent`
+ * aparecen SIEMPRE, textualmente, en `originalMessage` — nunca solo en
+ * `detail`.
  */
 /**
  * Fila agregada por `uml-validation` (design.md D3; tasks.md 1.3, bloqueante
@@ -255,12 +272,23 @@ const CHECK_CONSTRAINT_TO_UML_ERROR: Record<string, UmlErrorCode> = {
   ck_composite_multiplicity: UML_ERROR.COMPOSITE_MULTIPLICITY_INVALID,
   ck_end_multiplicity: UML_ERROR.END_MULTIPLICITY_INVALID,
   /**
-   * Red de carrera para la guarda de ciclo de contención de
-   * `setElementParent` (D3, Hallazgo 5): `collectSubtreeIds` hace el ciclo
-   * *raro*, no *imposible* — dos `PATCH /parent` concurrentes bajo
-   * `READ COMMITTED` pueden pasar las dos comprobaciones. Si eso ocurre, la
-   * base rechaza igual y este mapeo produce el mismo `409
-   * containment_cycle` que la comprobación autoritativa, nunca un `500`.
+   * Red de carrera ESTRECHA, no la garantía general de D3 (corrección
+   * verify-report W-3 — el comentario anterior sobrestimaba lo que esta
+   * CHECK cubre). `ck_element_not_own_parent` es
+   * `CHECK (parent_id IS NULL OR parent_id <> id)`: **solo** prohíbe el
+   * autolazo directo (`parentId === elementId`). Un ciclo de DOS elementos
+   * armado por carrera (`PATCH A.parent=B` y `PATCH B.parent=A` concurrentes,
+   * cada uno pasando la comprobación de `collectSubtreeIds` porque el otro
+   * todavía no confirmó) pasa esta CHECK INTACTO — no hay ninguna constraint
+   * de base que lo detecte; es exactamente el ciclo que D3 documenta como
+   * "raro, no imposible" y que `qualifiedName()` tiene que poder cortar sin
+   * colgarse. Esta fila solo cierra el caso de autolazo alcanzado por
+   * carrera (una escritura fuera de `setElementParent`, o la ventana entre
+   * la comprobación y el `UPDATE`): produce el mismo `409 containment_cycle`
+   * que la comprobación autoritativa, nunca un `500`. Antes de W-3, además,
+   * esta fila estaba MUERTA en la práctica: `setElementParent` nunca llamaba
+   * a `handleCheckViolation`, así que aunque la CHECK se disparara, salía
+   * `500` de todos modos.
    */
   ck_element_not_own_parent: UML_ERROR.CONTAINMENT_CYCLE,
 };
@@ -278,17 +306,42 @@ export function resolveCheckViolation(err: unknown): UmlErrorCode | null {
   }
 
   const meta = err.meta as Record<string, unknown> | undefined;
+  const originalMessage = extractOriginalMessage(meta);
 
-  // Único plan viable para P2039 (ver comentario de cabecera): no hay campo
-  // estructurado que leer, así que se busca el nombre de la constraint en
-  // el mensaje completo (mensaje + meta serializado) — mismo criterio que el
-  // plan C de `resolveUniqueViolation`.
-  const haystack = `${err.message} ${meta ? JSON.stringify(meta) : ''}`;
+  // Sin `originalMessage` estructurado no hay nada seguro que leer — a
+  // diferencia del resolvedor de `P2002`, este NO cae a un plan D que mire
+  // `err.message`/`meta` completos: esos campos pueden traer `detail`
+  // (`Failing row contains (...)`), que es DATO DEL USUARIO, no el nombre de
+  // la constraint (W-4).
+  if (!originalMessage) return null;
+
+  // Plan A — regex sobre el mensaje real de PostgreSQL para un `23514`:
+  // `new row for relation "..." violates check constraint "NOMBRE"`. El
+  // nombre entre comillas es SIEMPRE el identificador de la constraint, así
+  // que un match acá es inequívoco.
+  const match = /violates check constraint "([^"]+)"/.exec(originalMessage);
+  if (match) {
+    return CHECK_CONSTRAINT_TO_UML_ERROR[match[1]!] ?? null;
+  }
+
+  // Plan B — substring, por si una versión futura de PostgreSQL/el adapter
+  // cambia la forma exacta del mensaje. Mismo criterio que el plan C de
+  // `resolveUniqueViolation`, pero acotado a `originalMessage` SOLAMENTE
+  // (W-4) — nunca a `err.message` ni al `meta` completo, que pueden
+  // contener `detail` con datos de la fila.
   for (const name of KNOWN_CHECK_NAMES) {
-    if (haystack.includes(name)) return CHECK_CONSTRAINT_TO_UML_ERROR[name] ?? null;
+    if (originalMessage.includes(name)) return CHECK_CONSTRAINT_TO_UML_ERROR[name] ?? null;
   }
 
   return null;
+}
+
+/** Mismo camino que `extractAdapterIndexName` (arriba), pero para `cause.originalMessage` — el único campo confiable para P2039 (W-4). */
+function extractOriginalMessage(meta: Record<string, unknown> | undefined): string | undefined {
+  const adapterError = meta?.driverAdapterError as Record<string, unknown> | undefined;
+  const cause = adapterError?.cause as Record<string, unknown> | undefined;
+  const originalMessage = cause?.originalMessage;
+  return typeof originalMessage === 'string' ? originalMessage : undefined;
 }
 
 /**

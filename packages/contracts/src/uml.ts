@@ -671,6 +671,16 @@ export interface ValidationFinding {
   elements: { id: string; qualifiedName: string | null }[];
   /** p. ej. `transferir(Cuenta, BigDecimal)` — `null` si la regla no arma detalle. */
   detail: string | null;
+  /**
+   * Agregado por `uml-validation` (verify-report W-6). Solo lo llena
+   * `duplicate_feature_signature` — los `UmlFeature.id` de las operaciones
+   * involucradas (≥2), en el mismo orden que `array_agg` de la consulta. Sin
+   * esto, dos operaciones duplicadas comparten el mismo `detail` (misma
+   * firma) y ni el cliente ni M5 pueden decir cuál de las dos sobra.
+   * `undefined`/ausente para el resto de las reglas — no forma parte de su
+   * contrato.
+   */
+  featureIds?: string[];
 }
 
 export interface ValidationReport {

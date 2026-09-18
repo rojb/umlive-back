@@ -1,4 +1,4 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable } from '@nestjs/common';
 import {
   normalizeStereotype,
   StereotypeTooLongError,
@@ -20,7 +20,7 @@ import type { SetElementBodyDto } from './dto/set-element-body.dto';
 import type { SetElementParentDto } from './dto/set-element-parent.dto';
 import type { SetElementStereotypeDto } from './dto/set-element-stereotype.dto';
 import { toElementView, toLayoutView } from './uml-mappers';
-import { handleUniqueViolation } from './uml-errors';
+import { handleCheckViolation, handleUniqueViolation } from './uml-errors';
 
 type Tx = Prisma.TransactionClient;
 
@@ -40,10 +40,63 @@ export class ElementsService {
    * `uml_elements` + `element_layouts` en UNA transacción — un `UmlElement`
    * sin fila de layout es un elemento que el lienzo no puede ubicar
    * (design.md §2.1, spec "Alta de clasificador con miembros ordenados").
+   *
+   * **Corrección de `uml-validation` (verify-report CRITICAL-1).** Esta era
+   * la ÚNICA ruta que persistía `parentId`/`stereotype` sin ninguna de las
+   * guardas que `setElementParent`/`setElementStereotype` (fase 1 de esta
+   * misma rebanada) ya aplican: sin `assertElementInDiagram` sobre el padre
+   * (un elemento de OTRO diagrama, y por lo tanto de otro proyecto, entraba
+   * como padre), sin la regla D4 de padre por `kind` del hijo, y sin
+   * `normalizeStereotype`/tope de 64. Ahora corre el MISMO chequeo que
+   * `setElementParent`, dentro de la misma transacción que el `create` —
+   * nunca antes de abrirla, mismo criterio que el resto del módulo. No hace
+   * falta la guarda de ciclo de contención (`collectSubtreeIds`, D1/D3): un
+   * elemento recién creado no tiene descendientes todavía, así que no puede
+   * ser su propio ancestro.
    */
   async createElement(diagramId: string, dto: CreateElementDto): Promise<UmlElementView> {
+    // Mismo criterio "sin código de dominio propio" que
+    // `RelationshipsService.createRelationship` (`dto.ends && dto.kind !==
+    // 'ASSOCIATION'` → `BadRequestException`, sin envolver ninguna CHECK):
+    // una combinación `kind`/`name`/`body`/`isAbstract` malformada es un
+    // `400` de PETICIÓN, no un estado en carrera que amerite una fila en
+    // `CHECK_CONSTRAINT_TO_UML_ERROR`. Verify-report W-5: sin esto,
+    // `COMMENT` sin `body` (`ck_element_named`) y `PACKAGE` con
+    // `isAbstract: true` (`ck_element_abstract`) llegaban a Postgres como
+    // `P2039` sin resolvedor y salían `500`.
+    if (dto.kind === 'COMMENT' ? !dto.body?.trim() : !dto.name?.trim()) {
+      throw new BadRequestException();
+    }
+    if (dto.isAbstract && dto.kind !== 'CLASS' && dto.kind !== 'INTERFACE') {
+      throw new BadRequestException();
+    }
+
+    // D10: misma normalización que las dos rutas PATCH — fuera de la
+    // transacción porque no depende de nada persistido.
+    let stereotype: string | null;
+    try {
+      stereotype = normalizeStereotype(dto.stereotype ?? null);
+    } catch (err) {
+      if (err instanceof StereotypeTooLongError) {
+        throw new ConflictException({ code: UML_ERROR.STEREOTYPE_INVALID });
+      }
+      throw err;
+    }
+
     try {
       const element = await this.prisma.$transaction(async (tx) => {
+        if (dto.parentId !== null) {
+          await assertElementInDiagram(tx, dto.parentId, diagramId);
+          const parent = await tx.umlElement.findUniqueOrThrow({ where: { id: dto.parentId }, select: { kind: true } });
+
+          // D4: la regla se decide por el `kind` del HIJO, no del padre —
+          // idéntica a `setElementParent`.
+          const parentAllowed = dto.kind === 'COMMENT' ? parent.kind !== 'COMMENT' : parent.kind === 'PACKAGE';
+          if (!parentAllowed) {
+            throw new ConflictException({ code: UML_ERROR.INVALID_PARENT_KIND, parentKind: parent.kind });
+          }
+        }
+
         const created = await tx.umlElement.create({
           data: {
             diagramId,
@@ -51,7 +104,7 @@ export class ElementsService {
             kind: dto.kind,
             name: dto.name,
             isAbstract: dto.isAbstract ?? false,
-            stereotype: dto.stereotype ?? null,
+            stereotype,
             body: dto.body ?? null,
           },
         });
@@ -62,6 +115,7 @@ export class ElementsService {
       });
       return toElementView(element);
     } catch (err) {
+      if (err instanceof ConflictException) throw err;
       handleUniqueViolation(err, dto.name ?? '');
     }
   }
@@ -121,7 +175,7 @@ export class ElementsService {
           // El root (`elementId`) se incluye en `collectSubtreeIds` (D1) —
           // cubre el autolazo (`parentId === elementId`) con el mismo
           // rechazo que un ciclo más largo.
-          const subtreeIds = await collectSubtreeIds(tx, elementId);
+          const subtreeIds = await collectSubtreeIds(tx, elementId, diagramId);
           if (subtreeIds.includes(dto.parentId)) {
             throw new ConflictException({ code: UML_ERROR.CONTAINMENT_CYCLE });
           }
@@ -132,6 +186,19 @@ export class ElementsService {
       });
     } catch (err) {
       if (err instanceof ConflictException) throw err;
+      // W-3 (verify-report): la red de carrera de `ck_element_not_own_parent`
+      // (D3, `uml-errors.ts`) llega como `P2039`, no `P2002` —
+      // `handleUniqueViolation` sola nunca la reconocía (`resolveUniqueViolation`
+      // solo mira `P2002`) y la CHECK quedaba muerta, relanzando como `500`
+      // en el caso (raro, pero real) de que dos `PATCH /parent` concurrentes
+      // pasaran las dos comprobaciones. `handleCheckViolation` es `never` —
+      // si `err` es `P2039` SIEMPRE termina acá (mapeado a `409
+      // containment_cycle`, o relanzado tal cual si no lo reconoce);
+      // `handleUniqueViolation` de abajo queda para el resto (`P2002` de
+      // `element_name_taken`, y cualquier otro error, que relanza igual).
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2039') {
+        handleCheckViolation(err);
+      }
       handleUniqueViolation(err, movedName);
     }
   }
@@ -237,7 +304,7 @@ export class ElementsService {
       await this.prisma.$transaction(async (tx) => {
         await assertElementInDiagram(tx, elementId, diagramId);
 
-        const subtreeIds = await collectSubtreeIds(tx, elementId);
+        const subtreeIds = await collectSubtreeIds(tx, elementId, diagramId);
         const incidents = await this.findIncidentRelationships(tx, subtreeIds);
         if (incidents.length > 0) {
           throw new ConflictException({
@@ -252,7 +319,7 @@ export class ElementsService {
     } catch (err) {
       if (err instanceof ConflictException) throw err;
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003') {
-        const subtreeIds = await collectSubtreeIds(this.prisma, elementId);
+        const subtreeIds = await collectSubtreeIds(this.prisma, elementId, diagramId);
         const incidents = await this.findIncidentRelationships(this.prisma, subtreeIds);
         if (incidents.length > 0) {
           throw new ConflictException({
