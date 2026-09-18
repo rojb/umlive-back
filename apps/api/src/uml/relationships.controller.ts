@@ -4,6 +4,7 @@ import { RequiresProjectAction } from '../projects/guards/requires-project-actio
 import { CreateRelationshipDto } from './dto/create-relationship.dto';
 import { RenameRelationshipDto } from './dto/rename-relationship.dto';
 import { RerouteRelationshipEndDto } from './dto/reroute-relationship-end.dto';
+import { SetAssociationClassDto } from './dto/set-association-class.dto';
 import { SetEndAggregationDto } from './dto/set-end-aggregation.dto';
 import { SetEndMultiplicityDto } from './dto/set-end-multiplicity.dto';
 import { SetEndNavigabilityDto } from './dto/set-end-navigability.dto';
@@ -151,5 +152,16 @@ export class RelationshipsController {
     @Body() dto: SetRelationshipAnchorsDto,
   ): Promise<RelationshipLayoutView> {
     return this.relationships.setRelationshipAnchors(diagramId, relationshipId, dto);
+  }
+
+  /** FR-B10 (`association-class`, D5; design.md §4). Ligar y desligar comparten un solo verbo. */
+  @Patch(':relationshipId/association-class')
+  @RequiresProjectAction('diagram.edit')
+  setAssociationClass(
+    @Param('diagramId', ParseUUIDPipe) diagramId: string,
+    @Param('relationshipId', ParseUUIDPipe) relationshipId: string,
+    @Body() dto: SetAssociationClassDto,
+  ): Promise<UmlRelationshipView> {
+    return this.relationships.setAssociationClass(diagramId, relationshipId, dto);
   }
 }

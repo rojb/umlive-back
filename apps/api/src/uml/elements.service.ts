@@ -20,7 +20,7 @@ import type { SetElementBodyDto } from './dto/set-element-body.dto';
 import type { SetElementParentDto } from './dto/set-element-parent.dto';
 import type { SetElementStereotypeDto } from './dto/set-element-stereotype.dto';
 import { toElementView, toLayoutView } from './uml-mappers';
-import { handleCheckViolation, handleUniqueViolation } from './uml-errors';
+import { handleCheckViolation, handleUniqueViolation, resolveForeignKeyViolation } from './uml-errors';
 
 type Tx = Prisma.TransactionClient;
 
@@ -328,6 +328,17 @@ export class ElementsService {
             relationships: incidents,
           });
         }
+        // FR-B10 (`association-class`, D4, AC-B16): la relectura vino vacía
+        // por carrera — alguien ligó la clase COMO clase asociación entre la
+        // comprobación previa y el `DELETE`. `resolveForeignKeyViolation`
+        // reconoce `uml_relationships_association_class_id_fkey` (la única FK
+        // de este archivo con un resolvedor propio, design.md D3) y responde
+        // `409`, nunca `500` — sin lista de incidentes porque la relectura no
+        // encontró ninguno que enumerar.
+        const fkCode = resolveForeignKeyViolation(err);
+        if (fkCode) {
+          throw new ConflictException({ code: fkCode, count: 0, relationships: [] });
+        }
       }
       throw err;
     }
@@ -351,6 +362,16 @@ export class ElementsService {
    * por la cláusula `OR` de arriba, y `ends.elementId` es espejo de
    * source/target, nunca aporta un tercer elemento). `otherElementName` se
    * calcula RELATIVO a `viaElementId`, no al elemento borrado.
+   *
+   * **Cuarto término, agregado por `association-class` (design.md D4):**
+   * `{ associationClassId: { in: elementIds } }` — una clase asociación NO
+   * es ninguno de los dos extremos (`ck_assoc_class_not_endpoint` lo
+   * garantiza), así que sin este término borrarla daría `500`, no `409`. El
+   * discriminante `role` distingue los dos casos: `'ENDPOINT'` reusa el
+   * cálculo de siempre; `'ASSOCIATION_CLASS'` calcula `otherElementId`/
+   * `otherElementName` como el extremo `source` de la asociación — la clase
+   * no está en ninguna punta, así que "el otro extremo relativo al elemento
+   * borrado" no tiene significado para ella.
    */
   private async findIncidentRelationships(tx: Tx, elementIds: string[]): Promise<IncidentRelationshipView[]> {
     const subtreeIds = new Set(elementIds);
@@ -360,27 +381,49 @@ export class ElementsService {
           { sourceElementId: { in: elementIds } },
           { targetElementId: { in: elementIds } },
           { ends: { some: { elementId: { in: elementIds } } } },
+          { associationClassId: { in: elementIds } },
         ],
       },
       orderBy: { createdAt: 'asc' },
       include: {
         sourceElement: { select: { id: true, name: true } },
         targetElement: { select: { id: true, name: true } },
+        associationClass: { select: { id: true, name: true } },
       },
     });
 
     return incidents.map((r) => {
       const viaIsSource = subtreeIds.has(r.sourceElementId);
-      const via = viaIsSource ? r.sourceElement : r.targetElement;
-      const other = viaIsSource ? r.targetElement : r.sourceElement;
+      const viaIsTarget = !viaIsSource && subtreeIds.has(r.targetElementId);
+
+      if (viaIsSource || viaIsTarget) {
+        const via = viaIsSource ? r.sourceElement : r.targetElement;
+        const other = viaIsSource ? r.targetElement : r.sourceElement;
+        return {
+          relationshipId: r.id,
+          kind: r.kind,
+          name: r.name,
+          viaElementId: via.id,
+          viaElementName: via.name,
+          otherElementId: other.id,
+          otherElementName: other.name,
+          role: 'ENDPOINT',
+        };
+      }
+
+      // Solo llega acá si NINGUNO de los tres primeros términos del `OR`
+      // matcheó — por construcción, el cuarto sí lo hizo: `r.associationClass`
+      // existe.
+      const associationClass = r.associationClass!;
       return {
         relationshipId: r.id,
         kind: r.kind,
         name: r.name,
-        viaElementId: via.id,
-        viaElementName: via.name,
-        otherElementId: other.id,
-        otherElementName: other.name,
+        viaElementId: associationClass.id,
+        viaElementName: associationClass.name,
+        otherElementId: r.sourceElement.id,
+        otherElementName: r.sourceElement.name,
+        role: 'ASSOCIATION_CLASS',
       };
     });
   }

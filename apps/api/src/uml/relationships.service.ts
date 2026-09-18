@@ -9,10 +9,11 @@ import {
 } from '@umlive/contracts';
 import type { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { assertElementInDiagram, assertRelationshipInDiagram } from './diagram-scope';
+import { assertElementInDiagram, assertRelationshipInDiagram, loadLinkableClass } from './diagram-scope';
 import type { CreateRelationshipDto } from './dto/create-relationship.dto';
 import type { RenameRelationshipDto } from './dto/rename-relationship.dto';
 import type { RerouteRelationshipEndDto } from './dto/reroute-relationship-end.dto';
+import type { SetAssociationClassDto } from './dto/set-association-class.dto';
 import type { SetEndAggregationDto } from './dto/set-end-aggregation.dto';
 import type { SetEndMultiplicityDto } from './dto/set-end-multiplicity.dto';
 import type { SetEndNavigabilityDto } from './dto/set-end-navigability.dto';
@@ -20,7 +21,7 @@ import type { SetEndRoleNameDto } from './dto/set-end-role-name.dto';
 import type { SetRelationshipAnchorsDto } from './dto/set-relationship-anchors.dto';
 import type { SetRelationshipStereotypeDto } from './dto/set-relationship-stereotype.dto';
 import type { SetRelationshipWaypointsDto } from './dto/set-relationship-waypoints.dto';
-import { handleCheckViolation } from './uml-errors';
+import { handleCheckViolation, resolveUniqueViolation } from './uml-errors';
 import { toRelationshipEndView, toRelationshipLayoutView, toRelationshipView } from './uml-mappers';
 
 type Tx = Prisma.TransactionClient;
@@ -169,6 +170,75 @@ export class RelationshipsService {
       const updated = await tx.umlRelationship.update({ where: { id: relationshipId }, data: { stereotype } });
       return toRelationshipView(updated);
     });
+  }
+
+  /**
+   * FR-B10 (`association-class`, D1 + D5; tasks.md 2.2). Ligar
+   * (`dto.elementId` no nulo) y desligar (`null`) son la MISMA mutación con
+   * carga útil nullable (D5) — mismo precedente que `setEndRoleName`.
+   *
+   * **Ligar**: `loadLinkableClass` (D2, `diagram-scope.ts`) valida existencia
+   * en el diagrama (`404`) y `kind === 'CLASS'` (`409`); que la clase no sea
+   * uno de los dos extremos de la relación lo garantiza
+   * `ck_assoc_class_not_endpoint` (`CHECK`, capturado como `P2039` abajo) —
+   * no se pre-chequea en el servicio, mismo criterio D2 de
+   * `uml-relationships` (un solo punto de aplicación). D1, transferencia de
+   * `xmi_id`: si la relación YA trae uno, se conserva y el de la clase se
+   * descarta; si no, se adopta el de la clase. La clase SIEMPRE queda con
+   * `xmi_id: null` tras ligar — es la regla de D1, no un efecto condicional
+   * de si traía uno o no.
+   *
+   * **Desligar** (`elementId: null`): solo `UPDATE association_class_id =
+   * NULL`. El `xmi_id` de la relación NO se toca (la identidad se queda en
+   * ella, D1); la clase ya nació sin `xmi_id` propio al ligarse, así que
+   * "vuelve a nacer sin identidad XMI" es automático — no requiere otro
+   * `UPDATE`.
+   */
+  async setAssociationClass(diagramId: string, relationshipId: string, dto: SetAssociationClassDto): Promise<UmlRelationshipView> {
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await assertRelationshipInDiagram(tx, relationshipId, diagramId);
+
+        if (dto.elementId === null) {
+          const updated = await tx.umlRelationship.update({
+            where: { id: relationshipId },
+            data: { associationClassId: null },
+          });
+          return toRelationshipView(updated);
+        }
+
+        const cls = await loadLinkableClass(tx, dto.elementId, diagramId);
+        const current = await tx.umlRelationship.findUniqueOrThrow({
+          where: { id: relationshipId },
+          select: { xmiId: true },
+        });
+
+        // D1: la clase SIEMPRE queda sin `xmi_id` propio tras ligar.
+        await tx.umlElement.update({ where: { id: cls.id }, data: { xmiId: null } });
+
+        const updated = await tx.umlRelationship.update({
+          where: { id: relationshipId },
+          data: {
+            associationClassId: dto.elementId,
+            // D1: prevalece el `xmi_id` de la relación si ya traía uno;
+            // si no, se transfiere el de la clase; si ninguna traía, null.
+            xmiId: current.xmiId ?? cls.xmiId ?? null,
+          },
+        });
+        return toRelationshipView(updated);
+      });
+    } catch (err) {
+      if (err instanceof ConflictException || err instanceof NotFoundException) throw err;
+      // D3: dos formas de Prisma en juego acá — `P2002` (índice único, ya
+      // ligada a otra asociación) y `P2039` (los dos `CHECK` nuevos). Ninguna
+      // de las dos pasa por `handleUniqueViolation`/`handleCheckViolation`
+      // solas: la primera espera un `conflictingName` que este endpoint no
+      // tiene (el cuerpo del 409 no lo lleva, spec AC-B05); la segunda ya es
+      // exactamente lo que necesitamos para P2039.
+      const uniqueCode = resolveUniqueViolation(err);
+      if (uniqueCode) throw new ConflictException({ code: uniqueCode });
+      handleCheckViolation(err);
+    }
   }
 
   /** El `id` de la relación nunca se regenera (FR-B06) — solo se reescribe el extremo `source`. */

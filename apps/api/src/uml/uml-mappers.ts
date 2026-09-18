@@ -127,6 +127,8 @@ export function toRelationshipView(r: UmlRelationship): UmlRelationshipView {
     stereotype: r.stereotype,
     createdAt: r.createdAt.toISOString(),
     updatedAt: r.updatedAt.toISOString(),
+    // FR-B10 (`association-class`, D1) — agregado por esa rebanada.
+    associationClassId: r.associationClassId,
   };
 }
 

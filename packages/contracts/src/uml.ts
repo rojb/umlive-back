@@ -313,6 +313,14 @@ export interface UmlRelationshipView {
   stereotype: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * FR-B10 (`association-class`, D1). `null` = asociación normal. Solo puede
+   * ser ≠ `null` si `kind === 'ASSOCIATION'` (`ck_assoc_class_only_on_association`).
+   * Cuando es ≠ `null`, el `xmi:id` de la `uml:AssociationClass` es el de
+   * ESTA fila, no el del elemento apuntado — la fila de la clase queda con
+   * `xmiId: null` (D1 del diseño).
+   */
+  associationClassId: string | null;
 }
 
 /**
@@ -361,6 +369,17 @@ export interface RelationshipLayoutView {
  * borrar un paquete devolvía «la otra punta» de una relación que el paquete
  * no tiene.
  */
+/**
+ * Discriminante agregado por `association-class` (design.md D4). Un
+ * incidente `'ASSOCIATION_CLASS'` significa que el elemento del subárbol
+ * sostiene la relación siendo su clase asociación (`association_class_id`),
+ * NO uno de sus dos extremos — la clase no está en ninguna punta, así que
+ * `otherElementId`/`otherElementName` no pueden calcularse "relativo al
+ * elemento borrado" como en el caso `'ENDPOINT'`; se calculan como el
+ * extremo `source` de la asociación.
+ */
+export type IncidentRole = 'ENDPOINT' | 'ASSOCIATION_CLASS';
+
 export interface IncidentRelationshipView {
   relationshipId: string;
   kind: RelationshipKind;
@@ -370,6 +389,13 @@ export interface IncidentRelationshipView {
   viaElementName: string | null;
   otherElementId: string;
   otherElementName: string | null;
+  /**
+   * `'ENDPOINT'`: `viaElementId` es `sourceElementId`/`targetElementId`/
+   * `ends.elementId`. `'ASSOCIATION_CLASS'`: `viaElementId` es
+   * `associationClassId` — sin este discriminante, `otherElementName`
+   * mentiría, porque la clase asociación no está en ninguna punta (D4).
+   */
+  role: IncidentRole;
 }
 
 // ── Cuerpos de petición — once mutaciones (design.md §3, "Superficie HTTP") ─
@@ -436,6 +462,16 @@ export interface SetRelationshipWaypointsRequest {
 export interface SetRelationshipAnchorsRequest {
   sourceAnchor: string | null;
   targetAnchor: string | null;
+}
+
+/**
+ * FR-B10 (`association-class`, D5). Ligar y desligar son una sola mutación
+ * con carga útil nullable — mismo precedente que `SetEndRoleNameRequest`.
+ * `elementId: string` liga (debe ser `kind: 'CLASS'` del mismo diagrama,
+ * validado en el servicio); `elementId: null` desliga.
+ */
+export interface SetAssociationClassRequest {
+  elementId: string | null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
