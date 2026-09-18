@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import {
   normalizeStereotype,
   StereotypeTooLongError,
@@ -7,7 +7,7 @@ import {
   type UmlRelationshipEndView,
   type UmlRelationshipView,
 } from '@umlive/contracts';
-import type { Prisma } from '../generated/prisma/client';
+import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { assertElementInDiagram, assertRelationshipInDiagram, loadLinkableClass } from './diagram-scope';
 import type { CreateRelationshipDto } from './dto/create-relationship.dto';
@@ -47,6 +47,8 @@ export interface RelationshipMutationResult {
  */
 @Injectable()
 export class RelationshipsService {
+  private readonly log = new Logger(RelationshipsService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   /**
@@ -216,6 +218,16 @@ export class RelationshipsService {
         // D1: la clase SIEMPRE queda sin `xmi_id` propio tras ligar.
         await tx.umlElement.update({ where: { id: cls.id }, data: { xmiId: null } });
 
+        // D1: se registra el descarte cuando las DOS filas traían `xmi_id`
+        // propio — es la única rama con pérdida real de identidad (verify-report
+        // W-6; `design.md:52`, "ese descarte se registra"). Cuando solo una de
+        // las dos traía uno, no hay descarte: se transfiere sin pérdida.
+        if (current.xmiId && cls.xmiId) {
+          this.log.warn(
+            `xmi_id descartado al ligar clase asociación: relación ${relationshipId} conserva '${current.xmiId}', clase ${cls.id} traía '${cls.xmiId}' (design.md D1)`,
+          );
+        }
+
         const updated = await tx.umlRelationship.update({
           where: { id: relationshipId },
           data: {
@@ -229,6 +241,23 @@ export class RelationshipsService {
       });
     } catch (err) {
       if (err instanceof ConflictException || err instanceof NotFoundException) throw err;
+      // W-1 (verify-report): carrera del lado del ligado — la clase se borra
+      // ENTRE `loadLinkableClass` (la ve) y el `UPDATE xmi_id: null` de acá
+      // arriba, que queda bloqueado por el lock de fila del `DELETE`
+      // concurrente. `design.md` D2 asumía que esa carrera salía como
+      // `P2003` (FK `Restrict`, igual que en `deleteElement`), pero el
+      // `UPDATE` (no un `INSERT`/otro `UPDATE` que sí dispare la FK) sobre
+      // una fila que ya no existe nunca llega a evaluar la constraint:
+      // Prisma reporta `P2025` ("Record to update not found") ANTES. Mismo
+      // criterio 404 que `loadLinkableClass`/AC-B09 — para cuando la
+      // transacción termina, la clase elegida ya no existe, ni distinto de
+      // pedir una de otro diagrama: un recurso ajeno es un oráculo, nunca un
+      // `409`/`500`. Forzado real: `psql` retiene el `DELETE` de la clase sin
+      // commit, el `PATCH` de ligado queda bloqueado en el `UPDATE`, el
+      // commit del `DELETE` lo libera con `P2025`.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+        throw new NotFoundException();
+      }
       // D3: dos formas de Prisma en juego acá — `P2002` (índice único, ya
       // ligada a otra asociación) y `P2039` (los dos `CHECK` nuevos). Ninguna
       // de las dos pasa por `handleUniqueViolation`/`handleCheckViolation`
