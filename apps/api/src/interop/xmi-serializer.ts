@@ -160,7 +160,20 @@ function indexDiagram(content: DiagramContent, suppressed: ReadonlySet<string>):
   for (const literal of content.enumLiterals) push(literalsByEnumeration, literal.enumerationId, literal);
   for (const end of content.relationshipEnds) push(endsByRelationship, end.relationshipId, end);
 
+  /**
+   * D5: una relación con clase asociación fija sus dos `ownedEnd` ADENTRO del
+   * `uml:AssociationClass` fusionado. Los MISMOS extremos no pueden emitirse
+   * además como propiedad del participante: la fila es una sola y su `xmi:id`
+   * también, así que emitirla dos veces produce un `xmi:id` duplicado — «un
+   * documento que valida y no significa nada» (E.3 regla 4). Defecto real
+   * encontrado por la compuerta G2 (XSD, `xsd:ID`) sobre un diagrama con dos
+   * clases asociación: cuatro ids repetidos, uno por extremo navegable.
+   */
+  const fusedRelationshipIds = new Set(
+    content.relationships.filter((relationship) => relationship.associationClassId !== null).map((relationship) => relationship.id),
+  );
   for (const end of content.relationshipEnds) {
+    if (fusedRelationshipIds.has(end.relationshipId)) continue;
     const participant = elementsById.get(end.elementId);
     if (end.isNavigable && participant !== undefined && CLASSIFIER_KINDS.has(participant.kind)) {
       push(navigableEndsByElement, end.elementId, end);

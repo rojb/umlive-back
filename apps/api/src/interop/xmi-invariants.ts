@@ -35,6 +35,13 @@ export class XmiExportError extends Error {
     readonly code: XmiErrorCode,
     message: string,
     readonly rows: readonly XmiIdRow[] = [],
+    /**
+     * Mensajes crudos del validador de esquema (G2, tarea 3.5). El 422 tiene
+     * que llevar LOS ERRORES, no un resumen: el cliente los muestra tal cual
+     * (FR-E04) y quien depure no debería tener que reproducir el documento.
+     * Vacío en los errores que no vienen del XSD.
+     */
+    readonly errors: readonly string[] = [],
   ) {
     super(message);
     this.name = 'XmiExportError';
@@ -49,9 +56,10 @@ const ATTRIBUTE = /([A-Za-z_][A-Za-z0-9_:.\-]*)="([^"]*)"/g;
  * el XSD los declara `xs:string`, así que un valor colgado **valida y no
  * significa nada**: esta es la única compuerta que lo ve. `type` es el caso
  * que D1 existe para prevenir; `general`/`client`/`supplier`/`contract` son
- * los otros cuatro sitios de `idref` del mapeo E.2.
+ * los otros cuatro sitios de `idref` del mapeo E.2, y `subject` es el sexto:
+ * la forma del bloque de extensión EA (E.4) apunta al elemento que dibuja.
  */
-const REFERENCE_ATTRIBUTES: ReadonlySet<string> = new Set(['xmi:idref', 'type', 'general', 'client', 'supplier', 'contract']);
+const REFERENCE_ATTRIBUTES: ReadonlySet<string> = new Set(['xmi:idref', 'type', 'general', 'client', 'supplier', 'contract', 'subject']);
 
 function attributes(document: string): { name: string; value: string }[] {
   const found: { name: string; value: string }[] = [];

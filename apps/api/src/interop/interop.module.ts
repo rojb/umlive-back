@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { UmlModule } from '../uml/uml.module';
 import { XmiExportController } from './xmi-export.controller';
 import { XmiExportService } from './xmi-export.service';
+import { XsdValidatorService } from './xsd-validator.service';
 
 /**
  * M5 — Intercambio XMI (rebanada 1 de 4, Unidad 1). Estructura por defecto de
@@ -18,11 +19,18 @@ import { XmiExportService } from './xmi-export.service';
  * (Unidad 3, D6/D7). Hasta entonces el reporte declara
  * `eaExtensionIncluded: false` — un hecho sobre los bytes, no sobre lo pedido
  * — y la compuerta G1 es la única activa.
+ *
+ * ── Unidad 3 (tareas 3.1–3.6) ─────────────────────────────────────────────
+ * Lo de arriba ya NO vale: la extensión EA vive en `ea-extension.ts`, los
+ * XSD en `src/interop/xsd/` (con el glob de `assets` de `nest-cli.json`,
+ * D7/Trampa de empaquetado) y `XsdValidatorService` (G2, fail-closed) es
+ * provider de ESTE módulo. `XmiExportService` lo inyecta y corre G2 al final
+ * del pipeline, después de G1.
  */
 @Module({
   imports: [UmlModule],
   controllers: [XmiExportController],
-  providers: [XmiExportService],
+  providers: [XmiExportService, XsdValidatorService],
   exports: [XmiExportService],
 })
 export class InteropModule {}

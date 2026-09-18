@@ -18,12 +18,14 @@ import {
 } from '@umlive/contracts';
 import { PrismaService } from '../prisma/prisma.service';
 import { DiagramContentService } from '../uml/diagram-content.service';
+import { DEFAULT_INCLUDE_EA_EXTENSION, emitEaExtension } from './ea-extension';
 import { XmiEmitter } from './xmi-emitter';
 import { IdentityMap } from './xmi-identity';
 import { assertInvariants, assertOrderContract, XmiExportError } from './xmi-invariants';
 import { serializeModel } from './xmi-serializer';
 import { emitPrimitiveTypesPackage, TypeResolver } from './xmi-types';
 import { versionStrategyFor } from './xmi-version-strategy';
+import { XsdValidatorService } from './xsd-validator.service';
 
 /**
  * Orquestador del export (tarea 1.5, cableado real en 2.8).
@@ -47,6 +49,13 @@ import { versionStrategyFor } from './xmi-version-strategy';
  *    (el paquete `UMLIVE_TYPES` va primero en el documento).
  * 4. La emisión es el prólogo + el paquete de tipos + los diagramas.
  * 5. G1 valida los bytes emitidos.
+ * 6. G2 los valida contra el XSD (fail-closed, tarea 3.5): un documento que no
+ *    cumple el esquema NUNCA se entrega.
+ *
+ * Piezas de la Unidad 3: el bloque de extensión EA (`ea-extension.ts`, E.4)
+ * se emite DESPUÉS del `uml:Model` y solo si `includeEaExtension` está
+ * encendido (default `true`, FR-E09); apagado, el documento no contiene
+ * ninguna ocurrencia de `xmi:Extension` (SC-E15).
  *
  * Solo lectura: no escribe una fila, no muta un `xmi_id`.
  */
@@ -55,6 +64,7 @@ export class XmiExportService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly diagrams: DiagramContentService,
+    private readonly validator: XsdValidatorService,
   ) {}
 
   async export(projectId: string, diagramId: string | undefined, request: XmiExportRequest): Promise<XmiExportResponse> {
@@ -102,16 +112,29 @@ export class XmiExportService {
     emitPrimitiveTypesPackage(emitter, types);
     const outcome = serializeModel(emitter, { contents, identity, types });
     emitter.closeModel();
+
+    // 4-bis) E.4 — extensión EA, DESPUÉS del `uml:Model` y solo si el
+    //       interruptor está encendido (FR-E09).
+    const includeEaExtension = request.includeEaExtension ?? DEFAULT_INCLUDE_EA_EXTENSION;
+    const ea = includeEaExtension ? emitEaExtension(emitter, { contents, identity }) : null;
+
     emitter.closeDocument();
     const document = emitter.toXml();
 
     // 5) G1 — sobre los BYTES, no sobre el modelo en memoria.
     assertInvariants(document, strategy);
 
+    // 6) G2 — XSD de OMG vendorizado, DESPUÉS de G1 y antes de entregar
+    //    (tarea 3.5). Un documento que viola el esquema corta acá con
+    //    `422 schema_invalid` y los errores del validador, SIN campo
+    //    `document`; un validador no disponible corta con `503`.
+    await this.validator.assertValid(document, strategy);
+
     const notes: XmiExportNote[] = [
       ...identity.notes(),
       ...types.notes(),
       ...outcome.notes,
+      ...(ea?.notes ?? []),
       ...emitter.illegalCharNotes(),
     ];
     if (scope === 'PROJECT') notes.push(crossDiagramIdentityNote(contents));
@@ -122,8 +145,8 @@ export class XmiExportService {
       report: {
         version: strategy.version,
         scope,
-        // Hecho sobre los BYTES: hasta que la Unidad 3 emita el bloque de
-        // extensión, el documento no lo contiene aunque se pidiera encendido.
+        // Hecho sobre los BYTES, no sobre lo pedido (FR-E09): es la única
+        // respuesta honesta a «¿el documento que te entrego trae el bloque?».
         eaExtensionIncluded: document.includes('xmi:Extension'),
         diagramIds,
         counts: {
@@ -253,7 +276,14 @@ function sanitize(name: string): string {
 
 /** El contrato fija el estado por código (`XMI_ERROR_STATUS`); acá solo se traduce a la excepción de Nest. */
 function toHttpException(error: XmiExportError): HttpException {
-  const body = { code: error.code, message: error.message, rows: error.rows.map((row) => ({ table: row.table, id: row.id, name: row.name })) };
+  const body = {
+    code: error.code,
+    message: error.message,
+    rows: error.rows.map((row) => ({ table: row.table, id: row.id, name: row.name })),
+    // El 422 de G2 lleva los errores CRUDOS del validador: el cliente los
+    // muestra tal cual (FR-E04) y nadie tiene que reproducir el documento.
+    errors: [...error.errors],
+  };
   switch (XMI_ERROR_STATUS[error.code]) {
     case 409:
       return new ConflictException(body);

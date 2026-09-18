@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Contenedor XMI 2.1 — UMLive, tarea 3.2 (M5, rebanada 1 de 4).
+
+  ORIGEN Y ALCANCE, sin adornos:
+
+  · El esquema oficial de OMG para XMI 2.5.1 se descargó y se vendorizó
+    VERBATIM en `xsd/omg/XMI-2.1.xsd` (ver la nota fechada en `tasks.md`:
+    URL de origen y SHA-256).
+  · Este archivo es un contenedor DERIVADO, escrito por UMLive, porque el
+    oficial NO puede validar el documento que el exportador entrega:
+      1. no declara el atributo `xmi:version`, y la estrategia de versión (D4)
+         y E.1 lo exigen (el oficial fue pensado para documentos de OMG, que
+         —comprobado en `omg/UML.xmi`— no llevan `xmi:version`);
+      2. su `<xsd:any processContents="strict"/>` sobre `xmi:XMI` exige una
+         declaración global por cada hijo, y OMG NO publica un XSD del
+         metamodelo UML: la mitad `uml:` no tiene a qué resolverse.
+  · La FORMA del contenedor sí es la oficial: misma wildcard `strict`, mismo
+    `xmi:id`/`xmi:idref` (`xsd:ID`/`xsd:IDREF`), misma `Extension`.
+  · La mitad UML la aporta la clausura autorada `UML-2.1.xsd`, importada acá.
+-->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            xmlns:xmi="http://schema.omg.org/spec/XMI/2.1"
+            targetNamespace="http://schema.omg.org/spec/XMI/2.1"
+            elementFormDefault="unqualified"
+            attributeFormDefault="unqualified">
+
+  <xsd:import namespace="http://schema.omg.org/spec/UML/2.1" schemaLocation="UML-2.1.xsd"/>
+
+  <xsd:attribute name="id" type="xsd:ID"/>
+  <xsd:attribute name="idref" type="xsd:IDREF"/>
+  <xsd:attribute name="href" type="xsd:anyURI"/>
+  <xsd:attribute name="type" type="xsd:QName"/>
+  <xsd:attribute name="uuid" type="xsd:string"/>
+  <xsd:attribute name="label" type="xsd:string"/>
+  <xsd:attribute name="version" type="xsd:string"/>
+
+  <!-- `xmi:XMI`: misma wildcard `strict` que el oficial, más `xmi:version`. -->
+  <xsd:complexType name="XMI">
+    <xsd:choice minOccurs="0" maxOccurs="unbounded">
+      <xsd:any processContents="strict"/>
+    </xsd:choice>
+    <xsd:attribute ref="xmi:id"/>
+    <xsd:attribute ref="xmi:version"/>
+    <xsd:attribute ref="xmi:type"/>
+    <xsd:attribute ref="xmi:uuid"/>
+  </xsd:complexType>
+  <xsd:element name="XMI" type="xmi:XMI"/>
+
+  <!-- El dialecto de EA (E.1/E.4): `<xmi:Documentation exporter=…/>`. -->
+  <xsd:element name="Documentation">
+    <xsd:complexType>
+      <xsd:attribute name="exporter" type="xsd:string"/>
+      <xsd:attribute name="exporterVersion" type="xsd:string"/>
+      <xsd:attribute ref="xmi:id"/>
+    </xsd:complexType>
+  </xsd:element>
+
+  <xsd:element name="Extension">
+    <xsd:complexType>
+      <xsd:sequence>
+        <xsd:element name="elements" type="xmi:EaModelElements" minOccurs="0"/>
+        <xsd:element name="connectors" type="xmi:EaConnectors" minOccurs="0"/>
+        <xsd:element name="diagrams" type="xmi:EaDiagrams" minOccurs="0"/>
+      </xsd:sequence>
+      <xsd:attribute name="extender" type="xsd:string"/>
+      <xsd:attribute name="extenderID" type="xsd:string"/>
+      <xsd:attribute ref="xmi:id"/>
+      <xsd:attribute ref="xmi:type"/>
+    </xsd:complexType>
+  </xsd:element>
+
+  <!-- `<elements>`: referencias a elementos del modelo (E.3 regla 4). -->
+  <xsd:complexType name="EaModelElements">
+    <xsd:sequence>
+      <xsd:element name="element" type="xmi:EaModelElement" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="EaModelElement">
+    <xsd:attribute ref="xmi:idref" use="required"/>
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="stereotype" type="xsd:string"/>
+    <xsd:attribute name="scope" type="xmi:Scope"/>
+  </xsd:complexType>
+  <xsd:simpleType name="Scope">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="public"/>
+      <xsd:enumeration value="protected"/>
+      <xsd:enumeration value="private"/>
+      <xsd:enumeration value="package"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- `<connectors>`: pares origen/destino, cada uno por `xmi:idref`. -->
+  <xsd:complexType name="EaConnectors">
+    <xsd:sequence>
+      <xsd:element name="connector" type="xmi:EaConnector" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="EaConnector">
+    <xsd:sequence>
+      <xsd:element name="source" type="xmi:EaEnd"/>
+      <xsd:element name="target" type="xmi:EaEnd"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xmi:idref" use="required"/>
+  </xsd:complexType>
+  <xsd:complexType name="EaEnd">
+    <xsd:attribute ref="xmi:idref" use="required"/>
+  </xsd:complexType>
+
+  <!-- `<diagrams>`: acá el diagrama DEFINE identidad (`xmi:id`), y las formas
+       la referencian con `subject`. La geometría lleva el `;` final. -->
+  <xsd:complexType name="EaDiagrams">
+    <xsd:sequence>
+      <xsd:element name="diagram" type="xmi:EaDiagram" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="EaDiagram">
+    <xsd:sequence>
+      <xsd:element name="elements" type="xmi:EaShapes" minOccurs="0"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+  </xsd:complexType>
+  <xsd:complexType name="EaShapes">
+    <xsd:sequence>
+      <xsd:element name="element" type="xmi:EaShape" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+  </xsd:complexType>
+  <xsd:complexType name="EaShape">
+    <xsd:attribute name="geometry" type="xmi:Geometry" use="required"/>
+    <xsd:attribute name="subject" type="xsd:IDREF" use="required"/>
+    <xsd:attribute name="seqno" type="xsd:positiveInteger" use="required"/>
+  </xsd:complexType>
+
+  <!-- E.4: `Left=…;Top=…;Right=…;Bottom=…;` — punto y coma final obligatorio,
+       coordenadas negativas aceptadas. -->
+  <xsd:simpleType name="Geometry">
+    <xsd:restriction base="xsd:string">
+      <xsd:pattern value="Left=-?[0-9]+;Top=-?[0-9]+;Right=-?[0-9]+;Bottom=-?[0-9]+;"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+</xsd:schema>

@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Clausura UML 2.5 — UMLive, tarea 3.2 (M5, rebanada 1 de 4).
+
+  OMG publica el metamodelo de UML 2.5.1 como INSTANCIA XMI
+  (`https://www.omg.org/spec/UML/20161101/UML.xmi`, HTTP 200; **no** se
+  vendoriza acá por tamaño —1,9 MB—, solo se cita) y **no publica ningún XSD
+  del metamodelo**: probados 404 en esta corrida (`UML.xsd`, `uml.xsd`,
+  `PrimitiveTypes.xsd`, `UMLDI.xsd`, `Infrastructure.xsd`, `MOF.xsd`). Sin un
+  XSD del metamodelo, la wildcard `strict` del contenedor no tiene a qué
+  resolverse y NINGÚN documento UML puede validar.
+
+  Por eso este archivo es una clausura AUTORADA por UMLive: declara el
+  subconjunto del metamodelo que el exportador emite (E.2 + D3 + D5), con la
+  forma que el documento realmente usa — elementos de propiedad SIN namespace
+  (`elementFormDefault="unqualified"`, como EA y como el propio `UML.xmi`),
+  atributos de identidad en el namespace XMI.
+
+  Lo que esta clausura sí comprueba, y no es decorativo: `xmi:id` es `xsd:ID`
+  (unicidad en todo el documento), `xmi:idref`/`subject` son `xsd:IDREF` (un
+  `idref` colgado es un error de esquema), `xmi:type` y `xmi:id` son
+  obligatorios en todo elemento de modelo, y las claves de geometría llevan el
+  `;` final.
+
+  Lo que NO es: el metamodelo UML completo. Un consumidor que necesite validar
+  UML entero (o EA 17, FR-E22) sigue necesitando el metamodelo real.
+-->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            xmlns:xmi="http://www.omg.org/spec/XMI/20131001"
+            xmlns:uml="http://www.omg.org/spec/UML/20131001"
+            targetNamespace="http://www.omg.org/spec/UML/20131001"
+            elementFormDefault="unqualified"
+            attributeFormDefault="unqualified">
+
+  <xsd:import namespace="http://www.omg.org/spec/XMI/20131001" schemaLocation="XMI-2.5.1.xsd"/>
+
+  <!-- Raíz de la mitad semántica: el hijo `uml:Model` de `xmi:XMI`. NO exige
+       `xmi:id`: `uml:Model` es contenedor, no un elemento con identidad que
+       alguien referencie, y el emisor no lo acuña (E.1 tampoco lo trae). -->
+  <xsd:element name="Model">
+    <xsd:complexType>
+      <xsd:choice minOccurs="0" maxOccurs="unbounded">
+        <xsd:element name="packagedElement" type="uml:PackagedElement"/>
+        <xsd:element name="ownedComment" type="uml:OwnedComment"/>
+      </xsd:choice>
+      <xsd:attribute ref="xmi:type" use="required"/>
+      <xsd:attribute ref="xmi:id"/>
+      <xsd:attribute name="name" type="xsd:string"/>
+      <xsd:attribute name="visibility" type="xsd:string"/>
+    </xsd:complexType>
+  </xsd:element>
+
+  <!-- Atributos comunes de E.2: identidad (obligatoria) + nombre + visibilidad. -->
+  <xsd:complexType name="ElementBase">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="visibility" type="xsd:string"/>
+    <xsd:attribute name="isAbstract" type="xsd:boolean"/>
+  </xsd:complexType>
+
+  <!-- `packagedElement`: paquetes, clases, interfaces, enumeraciones, datatypes,
+       primitivos, asociaciones, asociaciones-clase, dependencias y usos. Una
+       sola declaración con el superconjunto de atributos y de hijos, porque
+       XSD 1.0 no condiciona el contenido al valor de `xmi:type`. -->
+  <xsd:complexType name="PackagedElement">
+    <xsd:complexContent>
+      <xsd:extension base="uml:ElementBase">
+        <xsd:choice minOccurs="0" maxOccurs="unbounded">
+          <xsd:element name="packagedElement" type="uml:PackagedElement"/>
+          <xsd:element name="ownedAttribute" type="uml:OwnedAttribute"/>
+          <xsd:element name="ownedOperation" type="uml:OwnedOperation"/>
+          <xsd:element name="ownedEnd" type="uml:OwnedEnd"/>
+          <xsd:element name="ownedLiteral" type="uml:OwnedLiteral"/>
+          <xsd:element name="memberEnd" type="uml:MemberEnd"/>
+          <xsd:element name="generalization" type="uml:Generalization"/>
+          <xsd:element name="interfaceRealization" type="uml:InterfaceRealization"/>
+          <xsd:element name="ownedComment" type="uml:OwnedComment"/>
+        </xsd:choice>
+        <xsd:attribute name="client" type="xsd:string"/>
+        <xsd:attribute name="supplier" type="xsd:string"/>
+      </xsd:extension>
+    </xsd:complexContent>
+  </xsd:complexType>
+
+  <!-- `ownedAttribute` (E.2): `type` es `xs:string` en XMI, NO `xs:IDREF` —
+       por eso G1 lo valida aparte. `lowerValue`/`upperValue` van adentro. -->
+  <xsd:complexType name="OwnedAttribute">
+    <xsd:sequence>
+      <xsd:element name="lowerValue" type="uml:LiteralInteger" minOccurs="0"/>
+      <xsd:element name="upperValue" type="uml:LiteralUnlimitedNatural" minOccurs="0"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="visibility" type="xsd:string"/>
+    <xsd:attribute name="isStatic" type="xsd:boolean"/>
+    <xsd:attribute name="isReadOnly" type="xsd:boolean"/>
+    <xsd:attribute name="isDerived" type="xsd:boolean"/>
+    <xsd:attribute name="type" type="xsd:string"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="OwnedOperation">
+    <xsd:sequence>
+      <xsd:element name="ownedParameter" type="uml:OwnedParameter" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="visibility" type="xsd:string"/>
+    <xsd:attribute name="isStatic" type="xsd:boolean"/>
+    <xsd:attribute name="isAbstract" type="xsd:boolean"/>
+    <xsd:attribute name="isQuery" type="xsd:boolean"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="OwnedParameter">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="direction" type="uml:Direction"/>
+    <xsd:attribute name="type" type="xsd:string"/>
+  </xsd:complexType>
+  <xsd:simpleType name="Direction">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="in"/>
+      <xsd:enumeration value="out"/>
+      <xsd:enumeration value="inout"/>
+      <xsd:enumeration value="return"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <!-- `ownedEnd` (E.2 / E.5 trampa 5): rol, multiplicidad, `aggregation` y tipo. -->
+  <xsd:complexType name="OwnedEnd">
+    <xsd:sequence>
+      <xsd:element name="lowerValue" type="uml:LiteralInteger" minOccurs="0"/>
+      <xsd:element name="upperValue" type="uml:LiteralUnlimitedNatural" minOccurs="0"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+    <xsd:attribute name="aggregation" type="uml:Aggregation"/>
+    <xsd:attribute name="type" type="xsd:string"/>
+  </xsd:complexType>
+  <xsd:simpleType name="Aggregation">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="none"/>
+      <xsd:enumeration value="shared"/>
+      <xsd:enumeration value="composite"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+
+  <xsd:complexType name="MemberEnd">
+    <xsd:attribute ref="xmi:idref" use="required"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="Generalization">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="general" type="xsd:IDREF" use="required"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="InterfaceRealization">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="client" type="xsd:IDREF" use="required"/>
+    <xsd:attribute name="supplier" type="xsd:IDREF" use="required"/>
+    <xsd:attribute name="contract" type="xsd:IDREF" use="required"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="OwnedLiteral">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="name" type="xsd:string"/>
+  </xsd:complexType>
+
+  <!-- Un `COMMENT` no tiene columna de anotación: `annotatedElement` NO se
+       emite (design §3 / hallazgo A) y acá tampoco se declara. -->
+  <xsd:complexType name="OwnedComment">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute ref="xmi:id" use="required"/>
+    <xsd:attribute name="body" type="xsd:string"/>
+  </xsd:complexType>
+
+  <xsd:complexType name="LiteralInteger">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute name="value" type="xsd:integer" use="required"/>
+  </xsd:complexType>
+  <xsd:complexType name="LiteralUnlimitedNatural">
+    <xsd:attribute ref="xmi:type" use="required"/>
+    <xsd:attribute name="value" type="xsd:string" use="required"/>
+  </xsd:complexType>
+
+</xsd:schema>
