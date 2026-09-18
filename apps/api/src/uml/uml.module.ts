@@ -9,6 +9,8 @@ import { ParametersController } from './parameters.controller';
 import { ParametersService } from './parameters.service';
 import { RelationshipsController } from './relationships.controller';
 import { RelationshipsService } from './relationships.service';
+import { ValidationController } from './validation.controller';
+import { ValidationService } from './validation.service';
 
 /**
  * Los cuatro pares controller/service de `uml-classifiers` (design.md §1,
@@ -22,9 +24,12 @@ import { RelationshipsService } from './relationships.service';
  * `RelationshipsController/Service` agregado por `uml-relationships`
  * (design.md §5; tasks.md 2.10) — quinto par, mismo criterio, sin provider
  * propio.
+ *
+ * `ValidationController/Service` agregado por `uml-validation` (design.md §1,
+ * D6; tasks.md 2.5) — sexto par, capa de lectura consultiva de FR-B14.
  */
 @Module({
-  controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController, RelationshipsController],
-  providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService],
+  controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController, RelationshipsController, ValidationController],
+  providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService, ValidationService],
 })
 export class UmlModule {}

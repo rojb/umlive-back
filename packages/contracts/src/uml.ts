@@ -571,3 +571,147 @@ export const UML_ERROR = {
 } as const;
 
 export type UmlErrorCode = (typeof UML_ERROR)[keyof typeof UML_ERROR];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AMPLIADO por `uml-validation` (M2, rebanada 3 de 3 — fase 2)
+// ─────────────────────────────────────────────────────────────────────────────
+// Catálogo de validación (design.md D5, D7, D9; tasks.md 2.1). `VALIDATION_RULES`
+// vive ACÁ (no en `apps/api`, ajuste sobre la propuesta — D5): servidor,
+// lienzo y M5 leen la MISMA tabla de severidad. Precedente literal:
+// `PROJECT_PERMISSIONS` en `projects.ts`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type ValidationSeverity = 'blocking' | 'warning';
+export type ValidationEnforcement = 'query' | 'constraint' | 'mixed';
+
+export type ValidationRuleId =
+  | 'generalization_cycle'
+  | 'interface_instance_attribute'
+  | 'abstract_without_concrete'
+  | 'duplicate_feature_signature'
+  | 'composite_multiplicity'
+  | 'dangling_relationship_end';
+
+export interface ValidationRule {
+  readonly severity: ValidationSeverity;
+  readonly enforcedBy: ValidationEnforcement;
+  /** Qué `409` ve el usuario cuando la regla se aplica al escribir. `null` si solo se marca (o si, como `dangling_relationship_end`, ningún DTO puede alcanzarla). */
+  readonly writeErrorCode: UmlErrorCode | null;
+  readonly source: string;
+}
+
+/**
+ * Fuente ÚNICA de severidad (D5, D7) — servidor (`ValidationService`,
+ * `report.blocking`), lienzo (color del marcador) y M5 (compuerta FR-F09)
+ * leen ESTA tabla. Las dos reglas `enforcedBy: 'constraint'` NO ejecutan
+ * consulta — devolverían siempre cero filas sobre datos ya almacenados
+ * (Hallazgo 4). Se declaran igual porque `writeErrorCode` es lo que le
+ * permite al panel decir "esto te dio 409 al escribir" sin adivinarlo.
+ */
+export const VALIDATION_RULES = {
+  generalization_cycle: {
+    severity: 'blocking',
+    enforcedBy: 'query',
+    writeErrorCode: null,
+    source: 'SC-B10',
+  },
+  interface_instance_attribute: {
+    severity: 'blocking',
+    enforcedBy: 'query',
+    writeErrorCode: null,
+    source: 'SC-B11',
+  },
+  abstract_without_concrete: {
+    severity: 'warning',
+    enforcedBy: 'query',
+    writeErrorCode: null,
+    source: 'DATA-MODEL.md:942',
+  },
+  duplicate_feature_signature: {
+    severity: 'blocking',
+    // La mitad de atributos la hace imposible `uq_attribute_name_per_owner`
+    // (parcial, `WHERE kind = 'ATTRIBUTE'`); la mitad de operaciones SÍ
+    // consulta (Hallazgo 3, D8) — de ahí `mixed`, no `query` a secas.
+    enforcedBy: 'mixed',
+    writeErrorCode: null,
+    source: 'Hallazgo 3, D8',
+  },
+  composite_multiplicity: {
+    severity: 'blocking',
+    enforcedBy: 'constraint',
+    writeErrorCode: UML_ERROR.COMPOSITE_MULTIPLICITY_INVALID,
+    source: 'SC-B09',
+  },
+  dangling_relationship_end: {
+    severity: 'blocking',
+    enforcedBy: 'constraint',
+    // Sin `writeErrorCode`: ningún DTO puede provocarla — `sourceElementId`/
+    // `targetElementId` son `NOT NULL` en todos los DTOs de creación, así
+    // que la CHECK nunca se alcanza desde la API (Hallazgo 4). No hay un
+    // `409` real que nombrar.
+    writeErrorCode: null,
+    source: 'FK NOT NULL + RESTRICT (Hallazgo 4)',
+  },
+} as const satisfies Record<ValidationRuleId, ValidationRule>;
+
+export const isBlockingRule = (id: ValidationRuleId): boolean => VALIDATION_RULES[id].severity === 'blocking';
+
+/**
+ * Una fila del informe de validación. `ruleId`, NUNCA `severity` (D5,
+ * Corolario): la severidad se resuelve leyendo `VALIDATION_RULES` — en
+ * servidor y cliente por igual — para que no puedan divergir.
+ *
+ * `elements` siempre trae ≥1 elemento (FR-F09: cada hallazgo enlaza a un
+ * nodo real del lienzo). Un ciclo de herencia de tres clases produce TRES
+ * `ValidationFinding`, cada uno con exactamente un elemento — nunca uno con
+ * los tres (D9).
+ */
+export interface ValidationFinding {
+  ruleId: ValidationRuleId;
+  elements: { id: string; qualifiedName: string | null }[];
+  /** p. ej. `transferir(Cuenta, BigDecimal)` — `null` si la regla no arma detalle. */
+  detail: string | null;
+}
+
+export interface ValidationReport {
+  diagramId: string;
+  generatedAt: string;
+  findings: ValidationFinding[];
+  /** Derivada en el servidor: `∃ finding` cuya regla es `severity: 'blocking'` (D6). Compuerta de FR-F09. */
+  blocking: boolean;
+}
+
+/**
+ * Pliegue hacia arriba por `parentId`, PURO — la misma función que usa el
+ * servidor para nombrar elementos en los hallazgos y el cliente para el
+ * árbol y las etiquetas de nodo (D3, D5 flujo de datos). `null` para
+ * `kind: 'COMMENT'` (una nota no tiene nombre calificado — `name` es
+ * siempre `null` para ese `kind`) y para cualquier id ausente del índice.
+ *
+ * Corta al repetir un id — NUNCA se cuelga, incluso sobre un ciclo de
+ * contención preexistente (Hallazgo 5, D3): la guarda de escritura hace el
+ * ciclo *raro*, no *imposible* bajo `READ COMMITTED` sin el registro de
+ * locks de M4, y M5 puede importar un XMI que ya traiga uno. Devuelve el
+ * camino PARCIAL construido hasta el corte, no `null` — un nombre parcial
+ * es más útil que ninguno para depurar un ciclo real.
+ */
+export function qualifiedName(
+  elementId: string,
+  index: Record<string, Pick<UmlElementView, 'parentId' | 'name' | 'kind'>>,
+): string | null {
+  const start = index[elementId];
+  if (!start || start.kind === 'COMMENT') return null;
+
+  const segments: string[] = [];
+  const visited = new Set<string>();
+  let currentId: string | null = elementId;
+  while (currentId !== null) {
+    if (visited.has(currentId)) break;
+    visited.add(currentId);
+    const node: Pick<UmlElementView, 'parentId' | 'name' | 'kind'> | undefined = index[currentId];
+    if (!node || node.name === null) break;
+    segments.unshift(node.name);
+    currentId = node.parentId;
+  }
+  return segments.length > 0 ? segments.join('::') : null;
+}
