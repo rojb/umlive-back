@@ -32,10 +32,16 @@ import { ValidationService } from './validation.service';
  * `CollaborationGateway` lo reusa para el snapshot `version = 0` al vuelo, sin
  * inyectar `PrismaService` — es su única fuente de estado de diagrama, y ya
  * devuelve datos mapeados (sin `BigInt`).
+ *
+ * Los cuatro services de mutación (`ElementsService`, `RelationshipsService`,
+ * `FeaturesService`, `ParametersService`) se exportan además
+ * (`operations-pipeline/design.md` §5, contradicción #7 de la propuesta):
+ * `CollaborationModule` los necesita para el `OperationDispatcher`, que solo
+ * llama a sus variantes `…In(tx)` — nunca a las funciones públicas.
  */
 @Module({
   controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController, RelationshipsController, ValidationController],
   providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService, ValidationService],
-  exports: [DiagramContentService],
+  exports: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService],
 })
 export class UmlModule {}
