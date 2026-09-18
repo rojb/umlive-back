@@ -7,12 +7,14 @@ import { assertElementInDiagram, assertFeatureInDiagram } from './diagram-scope'
 import type { AddFeatureDto } from './dto/add-feature.dto';
 import type { ReorderFeaturesDto } from './dto/reorder-features.dto';
 import type { UpdateFeatureDto } from './dto/update-feature.dto';
-import { handleUniqueViolation } from './uml-errors';
 import { toFeatureView } from './uml-mappers';
 
 /**
- * `addFeature`, `updateFeature`, `removeFeature`, `reorderFeatures`
- * (design.md §2, §12; tasks.md 3.3).
+ * Cuerpos transaccionales de las cuatro mutaciones de miembro de clasificador.
+ * **Nota fechada 2026-09-18 (`frontend-cutover`, tarea 4.4).** Los envoltorios
+ * públicos (`addFeature`, `updateFeature`, `removeFeature`, `reorderFeatures`)
+ * se retiraron con las rutas HTTP que los llamaban; lo que queda son los
+ * cuerpos `…In(tx)` que invoca `OperationDispatcher`.
  */
 @Injectable()
 export class FeaturesService {
@@ -24,14 +26,6 @@ export class FeaturesService {
    * no de numeración separada; spec "Alta de clasificador con miembros
    * ordenados").
    */
-  async addFeature(diagramId: string, elementId: string, dto: AddFeatureDto): Promise<UmlFeatureView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.addFeatureIn(tx, diagramId, elementId, dto));
-    } catch (err) {
-      handleUniqueViolation(err, dto.name);
-    }
-  }
-
   async addFeatureIn(tx: Tx, diagramId: string, elementId: string, dto: AddFeatureDto): Promise<UmlFeatureView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const agg = await tx.umlFeature.aggregate({ where: { ownerId: elementId }, _max: { position: true } });
@@ -58,14 +52,6 @@ export class FeaturesService {
     return toFeatureView(created);
   }
 
-  async updateFeature(diagramId: string, featureId: string, dto: UpdateFeatureDto): Promise<UmlFeatureView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.updateFeatureIn(tx, diagramId, featureId, dto));
-    } catch (err) {
-      handleUniqueViolation(err, dto.name ?? '');
-    }
-  }
-
   async updateFeatureIn(tx: Tx, diagramId: string, featureId: string, dto: UpdateFeatureDto): Promise<UmlFeatureView> {
     await assertFeatureInDiagram(tx, featureId, diagramId);
     const updated = await tx.umlFeature.update({
@@ -88,10 +74,6 @@ export class FeaturesService {
     return toFeatureView(updated);
   }
 
-  async removeFeature(diagramId: string, featureId: string): Promise<void> {
-    await this.prisma.$transaction((tx) => this.removeFeatureIn(tx, diagramId, featureId));
-  }
-
   async removeFeatureIn(tx: Tx, diagramId: string, featureId: string): Promise<void> {
     await assertFeatureInDiagram(tx, featureId, diagramId);
     await tx.umlFeature.delete({ where: { id: featureId } });
@@ -105,10 +87,6 @@ export class FeaturesService {
    * simplemente no toca ninguna fila, no hace falta la guarda de conjunto
    * que sí necesita `reorderParameters`.
    */
-  async reorderFeatures(diagramId: string, elementId: string, dto: ReorderFeaturesDto): Promise<UmlFeatureView[]> {
-    return this.prisma.$transaction((tx) => this.reorderFeatureIn(tx, diagramId, elementId, dto));
-  }
-
   async reorderFeatureIn(tx: Tx, diagramId: string, elementId: string, dto: ReorderFeaturesDto): Promise<UmlFeatureView[]> {
     await assertElementInDiagram(tx, elementId, diagramId);
     if (dto.orderedFeatureIds.length > 0) {

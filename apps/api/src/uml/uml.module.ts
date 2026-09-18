@@ -1,32 +1,37 @@
 import { Module } from '@nestjs/common';
 import { DiagramContentController } from './diagram-content.controller';
 import { DiagramContentService } from './diagram-content.service';
-import { ElementsController } from './elements.controller';
 import { ElementsService } from './elements.service';
-import { FeaturesController } from './features.controller';
 import { FeaturesService } from './features.service';
-import { ParametersController } from './parameters.controller';
 import { ParametersService } from './parameters.service';
-import { RelationshipsController } from './relationships.controller';
 import { RelationshipsService } from './relationships.service';
 import { ValidationController } from './validation.controller';
 import { ValidationService } from './validation.service';
 
 /**
- * Los cuatro pares controller/service de `uml-classifiers` (design.md §1,
- * §12; tasks.md 3.4, 4.5): `DiagramContentController/Service` (lectura, §8),
- * `ElementsController/Service`, `FeaturesController/Service`,
- * `ParametersController/Service` (parámetros + literales de enum). Sin
- * providers propios de guard — `ProjectAccessGuard` es `APP_GUARD` global
+ * Módulo del modelo UML. Tras `frontend-cutover` Fase 4 (tarea 4.2, D1)
+ * conserva SOLO los controllers de lectura: `DiagramContentController`
+ * (`@Get :diagramId`, §8) y `ValidationController` (`@Get .../validation`,
+ * `uml-validation` D6). Los cuatro controllers de mutación de
+ * `uml-classifiers`/`uml-relationships`/`uml-validation`/`association-class`
+ * se borraron enteros. Los services de mutación siguen registrados porque el
+ * `OperationDispatcher` los inyecta.
+ *
+ * Sin providers propios de guard — `ProjectAccessGuard` es `APP_GUARD` global
  * (`app.module.ts`) y `PrismaService` viene de `PrismaModule`, que es
  * `@Global()`.
  *
- * `RelationshipsController/Service` agregado por `uml-relationships`
- * (design.md §5; tasks.md 2.10) — quinto par, mismo criterio, sin provider
- * propio.
- *
- * `ValidationController/Service` agregado por `uml-validation` (design.md §1,
- * D6; tasks.md 2.5) — sexto par, capa de lectura consultiva de FR-B14.
+ * **Nota fechada 2026-09-18 (`frontend-cutover`, tarea 4.3, D1).** El array
+ * `controllers` queda con **DOS** entradas, no una: `DiagramContentController`
+ * (único `@Get` de la familia del contenido, D4-bis) y `ValidationController`
+ * (la `@Get .../validation` que agregó `uml-validation` en M2, después de que
+ * `frontend-cutover/design.md` §D1 se escribiera). Los cuatro controllers de
+ * mutación (`Elements`, `Relationships`, `Features`, `Parameters`) se
+ * borraron ENTEROS en la tarea 4.2 — no se vaciaron, para no dejar el lugar
+ * donde un refactor futuro volviera a colgar un `@Patch`. Los cuatro services
+ * siguen registrados como `providers`/`exports` porque `CollaborationModule`
+ * los inyecta para el `OperationDispatcher`, que solo llama a sus variantes
+ * `…In(tx)`.
  *
  * `DiagramContentService` se exporta (collaboration-gateway/design.md §D8):
  * `CollaborationGateway` lo reusa para el snapshot `version = 0` al vuelo, sin
@@ -40,7 +45,7 @@ import { ValidationService } from './validation.service';
  * llama a sus variantes `…In(tx)` — nunca a las funciones públicas.
  */
 @Module({
-  controllers: [DiagramContentController, ElementsController, FeaturesController, ParametersController, RelationshipsController, ValidationController],
+  controllers: [DiagramContentController, ValidationController],
   providers: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService, ValidationService],
   exports: [DiagramContentService, ElementsService, FeaturesService, ParametersService, RelationshipsService],
 })

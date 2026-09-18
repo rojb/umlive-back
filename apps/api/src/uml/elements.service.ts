@@ -7,7 +7,6 @@ import {
   type IncidentRelationshipView,
   type UmlElementView,
 } from '@umlive/contracts';
-import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Tx } from '../prisma/tx.type';
 import { assertElementInDiagram } from './diagram-scope';
@@ -21,7 +20,6 @@ import type { SetElementBodyDto } from './dto/set-element-body.dto';
 import type { SetElementParentDto } from './dto/set-element-parent.dto';
 import type { SetElementStereotypeDto } from './dto/set-element-stereotype.dto';
 import { toElementView, toLayoutView } from './uml-mappers';
-import { handleCheckViolation, handleUniqueViolation, resolveForeignKeyViolation } from './uml-errors';
 
 /**
  * Guarda pura de `createElement` (design.md D2 regla 4 de `operations-pipeline`,
@@ -61,10 +59,15 @@ export function resolveElementCreateStereotype(raw: string | undefined): string 
 }
 
 /**
- * `createElement`, `renameElement`, `setElementAbstract`, `setElementParent`,
- * `setElementStereotype`, `setElementBody`, `moveElement`, `resizeElement`,
- * `deleteElement` (design.md §2, §12; tasks.md 3.2; `uml-validation` fase 1
- * agrega las tres de `set*`).
+ * Cuerpos transaccionales de las nueve mutaciones de elemento. **Nota fechada
+ * 2026-09-18 (`frontend-cutover`, tarea 4.4).** Los envoltorios públicos que
+ * exponía esta clase (`createElement`, `renameElement`, `setElementAbstract`,
+ * `setElementParent`, `setElementStereotype`, `setElementBody`, `moveElement`,
+ * `resizeElement`, `deleteElement`) se retiraron: sus únicos llamadores eran
+ * las rutas HTTP que la Fase 4 borró. Lo que queda son los cuerpos `…In(tx)`,
+ * que invoca `OperationDispatcher` (`apps/api/src/collaboration/`), más las
+ * dos guardas puras exportadas (`validateElementCreatePayload`,
+ * `resolveElementCreateStereotype`).
  *
  * `moveElement`/`resizeElement` son DOS funciones, no un `updateLayout`
  * (design.md §2.1): el cliente ya sabe cuál gesto ocurrió y no hay que
@@ -73,37 +76,6 @@ export function resolveElementCreateStereotype(raw: string | undefined): string 
 @Injectable()
 export class ElementsService {
   constructor(private readonly prisma: PrismaService) {}
-
-  /**
-   * `uml_elements` + `element_layouts` en UNA transacción — un `UmlElement`
-   * sin fila de layout es un elemento que el lienzo no puede ubicar
-   * (design.md §2.1, spec "Alta de clasificador con miembros ordenados").
-   *
-   * **Corrección de `uml-validation` (verify-report CRITICAL-1).** Esta era
-   * la ÚNICA ruta que persistía `parentId`/`stereotype` sin ninguna de las
-   * guardas que `setElementParent`/`setElementStereotype` (fase 1 de esta
-   * misma rebanada) ya aplican: sin `assertElementInDiagram` sobre el padre
-   * (un elemento de OTRO diagrama, y por lo tanto de otro proyecto, entraba
-   * como padre), sin la regla D4 de padre por `kind` del hijo, y sin
-   * `normalizeStereotype`/tope de 64. Ahora corre el MISMO chequeo que
-   * `setElementParent`, dentro de la misma transacción que el `create` —
-   * nunca antes de abrirla, mismo criterio que el resto del módulo. No hace
-   * falta la guarda de ciclo de contención (`collectSubtreeIds`, D1/D3): un
-   * elemento recién creado no tiene descendientes todavía, así que no puede
-   * ser su propio ancestro.
-   */
-  async createElement(diagramId: string, dto: CreateElementDto): Promise<UmlElementView> {
-    validateElementCreatePayload(dto);
-    const stereotype = resolveElementCreateStereotype(dto.stereotype);
-
-    try {
-      const element = await this.prisma.$transaction((tx) => this.createElementIn(tx, diagramId, dto, stereotype));
-      return toElementView(element);
-    } catch (err) {
-      if (err instanceof ConflictException) throw err;
-      handleUniqueViolation(err, dto.name ?? '');
-    }
-  }
 
   /**
    * Cuerpo transaccional mudado (`operations-pipeline/design.md` D2) — el
@@ -142,77 +114,16 @@ export class ElementsService {
     return created;
   }
 
-  async renameElement(diagramId: string, elementId: string, dto: RenameElementDto): Promise<UmlElementView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.renameElementIn(tx, diagramId, elementId, dto));
-    } catch (err) {
-      handleUniqueViolation(err, dto.name);
-    }
-  }
-
   async renameElementIn(tx: Tx, diagramId: string, elementId: string, dto: RenameElementDto): Promise<UmlElementView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const updated = await tx.umlElement.update({ where: { id: elementId }, data: { name: dto.name } });
     return toElementView(updated);
   }
 
-  async setElementAbstract(diagramId: string, elementId: string, dto: SetElementAbstractDto): Promise<UmlElementView> {
-    return this.prisma.$transaction((tx) => this.setElementAbstractIn(tx, diagramId, elementId, dto));
-  }
-
   async setElementAbstractIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementAbstractDto): Promise<UmlElementView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const updated = await tx.umlElement.update({ where: { id: elementId }, data: { isAbstract: dto.isAbstract } });
     return toElementView(updated);
-  }
-
-  /**
-   * `uml-validation` fase 1 (design.md D1, D3, D4; tasks.md 1.6). Orden fijo
-   * DENTRO de la misma transacción que el `UPDATE`, nunca antes de abrirla
-   * (spec "Package como contenedor"): pertenencia al diagrama (elemento y
-   * padre propuesto) → regla de padre por `kind` DEL HIJO (D4, no del padre)
-   * → `409 invalid_parent_kind` si falla → guarda de ciclo de contención
-   * (`collectSubtreeIds`, D1) → `409 containment_cycle` → `UPDATE`,
-   * envuelto en `handleUniqueViolation` con el nombre del elemento MOVIDO
-   * (no el del contenedor destino) — mover `Order` a un paquete que ya
-   * tiene un `Order` es el `element_name_taken` de siempre por una ruta
-   * nueva, no un caso distinto.
-   */
-  async setElementParent(diagramId: string, elementId: string, dto: SetElementParentDto): Promise<UmlElementView> {
-    // Nota fechada 2026-09-18 (verify-report W-5). Antes de la extracción de
-    // `operations-pipeline` (`14fd124`), `movedName` era una variable de
-    // CIERRE (`let movedName = ''` en este mismo scope, asignada dentro del
-    // callback de `$transaction`, leída acá en el `catch` — las dos partes
-    // compartían función). La extracción D2 separa el cuerpo en
-    // `setElementParentIn(tx, …)`: ese callback ya NO es un closure de este
-    // método, así que `movedName` no puede seguir siendo una variable local
-    // de acá. La solución NO es la relectura post-rollback que hubo entre
-    // `14fd124` y esta corrección (una consulta extra en TODO camino de
-    // error, con riesgo de enmascarar el error original si esa relectura
-    // fallara) — es pasar un receptor mutable que `setElementParentIn`
-    // rellena en el mismo punto donde el cuerpo original hacía la
-    // asignación. El cuerpo de la transacción queda así, de nuevo, línea por
-    // línea idéntico a `14fd124~1` salvo esa única asignación condicional.
-    const moved = { name: '' };
-    try {
-      return await this.prisma.$transaction((tx) => this.setElementParentIn(tx, diagramId, elementId, dto, moved));
-    } catch (err) {
-      if (err instanceof ConflictException) throw err;
-      // W-3 (verify-report): la red de carrera de `ck_element_not_own_parent`
-      // (D3, `uml-errors.ts`) llega como `P2039`, no `P2002` —
-      // `handleUniqueViolation` sola nunca la reconocía (`resolveUniqueViolation`
-      // solo mira `P2002`) y la CHECK quedaba muerta, relanzando como `500`
-      // en el caso (raro, pero real) de que dos `PATCH /parent` concurrentes
-      // pasaran las dos comprobaciones. `handleCheckViolation` es `never` —
-      // si `err` es `P2039` SIEMPRE termina acá (mapeado a `409
-      // containment_cycle`, o relanzado tal cual si no lo reconoce);
-      // `handleUniqueViolation` de abajo queda para el resto (`P2002` de
-      // `element_name_taken`, y cualquier otro error, que relanza igual).
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2039') {
-        handleCheckViolation(err);
-      }
-      handleUniqueViolation(err, moved.name);
-    }
   }
 
   async setElementParentIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementParentDto, moved?: { name: string }): Promise<UmlElementView> {
@@ -245,15 +156,6 @@ export class ElementsService {
     return toElementView(updated);
   }
 
-  /**
-   * `uml-validation` fase 1 (design.md D10; tasks.md 1.7). `normalizeStereotype`
-   * es la MISMA función pura que usa `setRelationshipStereotype` — ninguna
-   * de las dos reimplementa la normalización.
-   */
-  async setElementStereotype(diagramId: string, elementId: string, dto: SetElementStereotypeDto): Promise<UmlElementView> {
-    return this.prisma.$transaction((tx) => this.setElementStereotypeIn(tx, diagramId, elementId, dto));
-  }
-
   async setElementStereotypeIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementStereotypeDto): Promise<UmlElementView> {
     await assertElementInDiagram(tx, elementId, diagramId);
 
@@ -271,16 +173,6 @@ export class ElementsService {
     return toElementView(updated);
   }
 
-  /**
-   * `uml-validation` fase 1 (spec "Package como contenedor — tres
-   * mutaciones"; tasks.md 1.7). Un cuerpo en una clase no es un comentario
-   * UML — `409`, no `400`: depende del `kind` persistido, no de la forma
-   * del cuerpo (mismo criterio que `invalid_parent_kind`).
-   */
-  async setElementBody(diagramId: string, elementId: string, dto: SetElementBodyDto): Promise<UmlElementView> {
-    return this.prisma.$transaction((tx) => this.setElementBodyIn(tx, diagramId, elementId, dto));
-  }
-
   async setElementBodyIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementBodyDto): Promise<UmlElementView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const element = await tx.umlElement.findUniqueOrThrow({ where: { id: elementId }, select: { kind: true } });
@@ -292,18 +184,10 @@ export class ElementsService {
     return toElementView(updated);
   }
 
-  async moveElement(diagramId: string, elementId: string, dto: MoveElementDto): Promise<ElementLayoutView> {
-    return this.prisma.$transaction((tx) => this.moveElementIn(tx, diagramId, elementId, dto));
-  }
-
   async moveElementIn(tx: Tx, diagramId: string, elementId: string, dto: MoveElementDto): Promise<ElementLayoutView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const layout = await tx.elementLayout.update({ where: { elementId }, data: { x: dto.x, y: dto.y } });
     return toLayoutView(layout);
-  }
-
-  async resizeElement(diagramId: string, elementId: string, dto: ResizeElementDto): Promise<ElementLayoutView> {
-    return this.prisma.$transaction((tx) => this.resizeElementIn(tx, diagramId, elementId, dto));
   }
 
   async resizeElementIn(tx: Tx, diagramId: string, elementId: string, dto: ResizeElementDto): Promise<ElementLayoutView> {
@@ -313,71 +197,6 @@ export class ElementsService {
       data: { width: dto.width, height: dto.height },
     });
     return toLayoutView(layout);
-  }
-
-  /**
-   * `onDelete: Cascade` en `schema.prisma` se encarga de layout, features,
-   * parámetros, literales e hijos. Pero `sourceElement`/`targetElement` de
-   * `uml_relationships` y `element` de `uml_relationship_ends` son
-   * `Restrict` (FR-C07, comentario de `schema.prisma:450-454`): borrar una
-   * clase con relaciones incidentes revienta `P2003` sin comprobación previa
-   * (design.md D6, tasks.md 3.1).
-   *
-   * Comprobación previa AUTORITATIVA, dentro de la misma transacción que el
-   * `delete()`: si hay ≥1 relación incidente **en el elemento o en
-   * cualquiera de sus descendientes por `parent_id`**, `409 { code, count,
-   * relationships }` sin borrar nada. **Nunca una cascada manual** — el
-   * bloque de `DATA-MODEL.md:895-906` arranca con "the service has already
-   * verified in-memory locks": es M4 bajo FR-C07, no esta unidad (design.md
-   * D6 lo rechaza explícitamente).
-   *
-   * **Corrección de `uml-validation` (Hallazgo 1, design.md D2, tasks.md
-   * 0.2)** — la bomba: la comprobación previa miraba SOLO el elemento
-   * suelto. `parent_id` es `CASCADE`; las FK de relación son `RESTRICT`.
-   * Borrar un `PACKAGE` que contiene una clase con relaciones: el
-   * pre-chequeo del elemento suelto encontraba cero incidencias → `DELETE`
-   * → Postgres cascadeaba a los hijos → `RESTRICT` → `23503` → la red de
-   * `P2003` relistaba incidencias **del paquete**, volvía vacía, y
-   * relanzaba → `500`. Ahora la comprobación (y su red de `P2003`) recorren
-   * `collectSubtreeIds(tx, elementId)` — el elemento y TODO su subárbol.
-   *
-   * El `catch` de `P2003` de abajo es solo red de CARRERA (no la fuente del
-   * `409`): si entre la comprobación previa y el `DELETE` alguien más crea
-   * una relación incidente, la base rechaza el borrado igual, se reconsulta
-   * una vez **sobre el mismo subárbol**, y se responde `409` si ahora sí
-   * aparece algo. Si la relectura sigue vacía, se relanza el error tal cual
-   * — un `P2003` sin incidentes visibles es un bug real, no algo para
-   * disfrazar de `409` genérico.
-   */
-  async deleteElement(diagramId: string, elementId: string): Promise<void> {
-    try {
-      await this.prisma.$transaction((tx) => this.deleteElementIn(tx, diagramId, elementId));
-    } catch (err) {
-      if (err instanceof ConflictException) throw err;
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003') {
-        const subtreeIds = await collectSubtreeIds(this.prisma, elementId, diagramId);
-        const incidents = await this.findIncidentRelationships(this.prisma, subtreeIds);
-        if (incidents.length > 0) {
-          throw new ConflictException({
-            code: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
-            count: incidents.length,
-            relationships: incidents,
-          });
-        }
-        // FR-B10 (`association-class`, D4, AC-B16): la relectura vino vacía
-        // por carrera — alguien ligó la clase COMO clase asociación entre la
-        // comprobación previa y el `DELETE`. `resolveForeignKeyViolation`
-        // reconoce `uml_relationships_association_class_id_fkey` (la única FK
-        // de este archivo con un resolvedor propio, design.md D3) y responde
-        // `409`, nunca `500` — sin lista de incidentes porque la relectura no
-        // encontró ninguno que enumerar.
-        const fkCode = resolveForeignKeyViolation(err);
-        if (fkCode) {
-          throw new ConflictException({ code: fkCode, count: 0, relationships: [] });
-        }
-      }
-      throw err;
-    }
   }
 
   async deleteElementIn(tx: Tx, diagramId: string, elementId: string): Promise<void> {

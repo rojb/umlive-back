@@ -23,7 +23,6 @@ import type { SetEndRoleNameDto } from './dto/set-end-role-name.dto';
 import type { SetRelationshipAnchorsDto } from './dto/set-relationship-anchors.dto';
 import type { SetRelationshipStereotypeDto } from './dto/set-relationship-stereotype.dto';
 import type { SetRelationshipWaypointsDto } from './dto/set-relationship-waypoints.dto';
-import { handleCheckViolation, resolveUniqueViolation } from './uml-errors';
 import { toRelationshipEndView, toRelationshipLayoutView, toRelationshipView } from './uml-mappers';
 
 /**
@@ -53,13 +52,20 @@ export function assertEndsMatchKind(kind: RelationshipKind, ends: CreateRelation
 }
 
 /**
- * Las trece mutaciones de relación (design.md §1-§4 de `uml-relationships`;
- * tasks.md fase 2; `uml-validation`/`association-class` agregan
- * `setRelationshipStereotype`/`setAssociationClass`).
+ * Cuerpos transaccionales de las trece mutaciones de relación.
+ * **Nota fechada 2026-09-18 (`frontend-cutover`, tarea 4.4).** Los envoltorios
+ * públicos (`createRelationship`, `deleteRelationship`, `renameRelationship`,
+ * `setRelationshipStereotype`, `setAssociationClass`, los dos `reroute*`, las
+ * cuatro `setEnd*`, `setRelationshipWaypoints`, `setRelationshipAnchors`) se
+ * retiraron con las rutas HTTP que los llamaban. Lo que queda son los cuerpos
+ * `…In(tx)` que invoca `OperationDispatcher`, más el helper privado
+ * `rerouteEnd` (que se retiró también: era el envoltorio de los dos reroutes)
+ * y la guarda pura exportada `assertEndsMatchKind`.
+ *
  * `writeEndpoint` es el único escritor del par duplicado
  * `uml_relationships.{source|target}_element_id` /
- * `uml_relationship_ends.element_id` (D3) — `createRelationship` y los dos
- * reroutes son sus únicos llamadores.
+ * `uml_relationship_ends.element_id` (D3) — `createRelationshipIn` y
+ * `rerouteEndIn` son sus únicos llamadores.
  */
 @Injectable()
 export class RelationshipsService {
@@ -72,19 +78,6 @@ export class RelationshipsService {
    * backend (D4) — los otros cuatro tipos quedan completamente descritos
    * por `sourceElementId`/`targetElementId` + `kind`, sin fila de extremo.
    */
-  async createRelationship(diagramId: string, dto: CreateRelationshipDto): Promise<RelationshipMutationResult> {
-    // Sin código de dominio propio a propósito (design.md D4, §6: "cuatro
-    // códigos nuevos, no cinco") — ninguna CHECK puede expresar esta regla,
-    // es una petición malformada para el `kind` declarado.
-    assertEndsMatchKind(dto.kind, dto.ends);
-
-    try {
-      return await this.prisma.$transaction((tx) => this.createRelationshipIn(tx, diagramId, dto));
-    } catch (err) {
-      handleCheckViolation(err);
-    }
-  }
-
   async createRelationshipIn(tx: Tx, diagramId: string, dto: CreateRelationshipDto): Promise<RelationshipMutationResult> {
     // `in: [s, t]` deduplica en la base cuando `s === t` — un
     // `findMany` siempre trae como máximo tantas filas como IDs
@@ -150,17 +143,9 @@ export class RelationshipsService {
     };
   }
 
-  async deleteRelationship(diagramId: string, relationshipId: string): Promise<void> {
-    await this.prisma.$transaction((tx) => this.deleteRelationshipIn(tx, diagramId, relationshipId));
-  }
-
   async deleteRelationshipIn(tx: Tx, diagramId: string, relationshipId: string): Promise<void> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
     await tx.umlRelationship.delete({ where: { id: relationshipId } });
-  }
-
-  async renameRelationship(diagramId: string, relationshipId: string, dto: RenameRelationshipDto): Promise<UmlRelationshipView> {
-    return this.prisma.$transaction((tx) => this.renameRelationshipIn(tx, diagramId, relationshipId, dto));
   }
 
   async renameRelationshipIn(tx: Tx, diagramId: string, relationshipId: string, dto: RenameRelationshipDto): Promise<UmlRelationshipView> {
@@ -175,10 +160,6 @@ export class RelationshipsService {
    * MISMA función pura que usa `ElementsService.setElementStereotype` —
    * ninguna de las dos reimplementa la normalización.
    */
-  async setRelationshipStereotype(diagramId: string, relationshipId: string, dto: SetRelationshipStereotypeDto): Promise<UmlRelationshipView> {
-    return this.prisma.$transaction((tx) => this.setRelationshipStereotypeIn(tx, diagramId, relationshipId, dto));
-  }
-
   async setRelationshipStereotypeIn(tx: Tx, diagramId: string, relationshipId: string, dto: SetRelationshipStereotypeDto): Promise<UmlRelationshipView> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
 
@@ -218,40 +199,6 @@ export class RelationshipsService {
    * "vuelve a nacer sin identidad XMI" es automático — no requiere otro
    * `UPDATE`.
    */
-  async setAssociationClass(diagramId: string, relationshipId: string, dto: SetAssociationClassDto): Promise<UmlRelationshipView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.setAssociationClassIn(tx, diagramId, relationshipId, dto));
-    } catch (err) {
-      if (err instanceof ConflictException || err instanceof NotFoundException) throw err;
-      // W-1 (verify-report): carrera del lado del ligado — la clase se borra
-      // ENTRE `loadLinkableClass` (la ve) y el `UPDATE xmi_id: null` de acá
-      // arriba, que queda bloqueado por el lock de fila del `DELETE`
-      // concurrente. `design.md` D2 asumía que esa carrera salía como
-      // `P2003` (FK `Restrict`, igual que en `deleteElement`), pero el
-      // `UPDATE` (no un `INSERT`/otro `UPDATE` que sí dispare la FK) sobre
-      // una fila que ya no existe nunca llega a evaluar la constraint:
-      // Prisma reporta `P2025` ("Record to update not found") ANTES. Mismo
-      // criterio 404 que `loadLinkableClass`/AC-B09 — para cuando la
-      // transacción termina, la clase elegida ya no existe, ni distinto de
-      // pedir una de otro diagrama: un recurso ajeno es un oráculo, nunca un
-      // `409`/`500`. Forzado real: `psql` retiene el `DELETE` de la clase sin
-      // commit, el `PATCH` de ligado queda bloqueado en el `UPDATE`, el
-      // commit del `DELETE` lo libera con `P2025`.
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
-        throw new NotFoundException();
-      }
-      // D3: dos formas de Prisma en juego acá — `P2002` (índice único, ya
-      // ligada a otra asociación) y `P2039` (los dos `CHECK` nuevos). Ninguna
-      // de las dos pasa por `handleUniqueViolation`/`handleCheckViolation`
-      // solas: la primera espera un `conflictingName` que este endpoint no
-      // tiene (el cuerpo del 409 no lo lleva, spec AC-B05); la segunda ya es
-      // exactamente lo que necesitamos para P2039.
-      const uniqueCode = resolveUniqueViolation(err);
-      if (uniqueCode) throw new ConflictException({ code: uniqueCode });
-      handleCheckViolation(err);
-    }
-  }
-
   async setAssociationClassIn(tx: Tx, diagramId: string, relationshipId: string, dto: SetAssociationClassDto): Promise<UmlRelationshipView> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
 
@@ -294,34 +241,6 @@ export class RelationshipsService {
     return toRelationshipView(updated);
   }
 
-  /** El `id` de la relación nunca se regenera (FR-B06) — solo se reescribe el extremo `source`. */
-  async rerouteRelationshipSource(diagramId: string, relationshipId: string, dto: RerouteRelationshipEndDto): Promise<RelationshipMutationResult> {
-    return this.rerouteEnd(diagramId, relationshipId, 0, dto);
-  }
-
-  async rerouteRelationshipTarget(diagramId: string, relationshipId: string, dto: RerouteRelationshipEndDto): Promise<RelationshipMutationResult> {
-    return this.rerouteEnd(diagramId, relationshipId, 1, dto);
-  }
-
-  private async rerouteEnd(
-    diagramId: string,
-    relationshipId: string,
-    endIndex: 0 | 1,
-    dto: RerouteRelationshipEndDto,
-  ): Promise<RelationshipMutationResult> {
-    try {
-      return await this.prisma.$transaction((tx) => this.rerouteEndIn(tx, diagramId, relationshipId, endIndex, dto));
-    } catch (err) {
-      handleCheckViolation(err);
-    }
-  }
-
-  /**
-   * Cuerpo transaccional mudado. Cubre `rerouteRelationshipSource`
-   * (`endIndex: 0`) Y `rerouteRelationshipTarget` (`endIndex: 1`) — es el
-   * único cuerpo de los 12 sitios `$transaction` de este archivo que
-   * corresponde a DOS funciones públicas (design.md D1).
-   */
   async rerouteEndIn(tx: Tx, diagramId: string, relationshipId: string, endIndex: 0 | 1, dto: RerouteRelationshipEndDto): Promise<RelationshipMutationResult> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
     await assertElementInDiagram(tx, dto.elementId, diagramId);
@@ -394,15 +313,6 @@ export class RelationshipsService {
     return row;
   }
 
-  async setEndRoleName(
-    diagramId: string,
-    relationshipId: string,
-    endIndex: number,
-    dto: SetEndRoleNameDto,
-  ): Promise<UmlRelationshipEndView> {
-    return this.prisma.$transaction((tx) => this.setEndRoleNameIn(tx, diagramId, relationshipId, endIndex, dto));
-  }
-
   async setEndRoleNameIn(tx: Tx, diagramId: string, relationshipId: string, endIndex: number, dto: SetEndRoleNameDto): Promise<UmlRelationshipEndView> {
     const end = await this.loadEnd(tx, diagramId, relationshipId, endIndex);
     const updated = await tx.umlRelationshipEnd.update({ where: { id: end.id }, data: { roleName: dto.roleName } });
@@ -410,19 +320,6 @@ export class RelationshipsService {
   }
 
   /** `upperBound` normaliza "sin definir" → `null`, mismo criterio que `createRelationship` (D2). */
-  async setEndMultiplicity(
-    diagramId: string,
-    relationshipId: string,
-    endIndex: number,
-    dto: SetEndMultiplicityDto,
-  ): Promise<UmlRelationshipEndView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.setEndMultiplicityIn(tx, diagramId, relationshipId, endIndex, dto));
-    } catch (err) {
-      handleCheckViolation(err);
-    }
-  }
-
   async setEndMultiplicityIn(tx: Tx, diagramId: string, relationshipId: string, endIndex: number, dto: SetEndMultiplicityDto): Promise<UmlRelationshipEndView> {
     const end = await this.loadEnd(tx, diagramId, relationshipId, endIndex);
     const updated = await tx.umlRelationshipEnd.update({
@@ -432,15 +329,6 @@ export class RelationshipsService {
     return toRelationshipEndView(updated);
   }
 
-  async setEndNavigability(
-    diagramId: string,
-    relationshipId: string,
-    endIndex: number,
-    dto: SetEndNavigabilityDto,
-  ): Promise<UmlRelationshipEndView> {
-    return this.prisma.$transaction((tx) => this.setEndNavigabilityIn(tx, diagramId, relationshipId, endIndex, dto));
-  }
-
   async setEndNavigabilityIn(tx: Tx, diagramId: string, relationshipId: string, endIndex: number, dto: SetEndNavigabilityDto): Promise<UmlRelationshipEndView> {
     const end = await this.loadEnd(tx, diagramId, relationshipId, endIndex);
     const updated = await tx.umlRelationshipEnd.update({ where: { id: end.id }, data: { isNavigable: dto.isNavigable } });
@@ -448,19 +336,6 @@ export class RelationshipsService {
   }
 
   /** Sin `upperBound` en el DTO (D2) — la CHECK es el único punto de aplicación de SC-B09. */
-  async setEndAggregation(
-    diagramId: string,
-    relationshipId: string,
-    endIndex: number,
-    dto: SetEndAggregationDto,
-  ): Promise<UmlRelationshipEndView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.setEndAggregationIn(tx, diagramId, relationshipId, endIndex, dto));
-    } catch (err) {
-      handleCheckViolation(err);
-    }
-  }
-
   async setEndAggregationIn(tx: Tx, diagramId: string, relationshipId: string, endIndex: number, dto: SetEndAggregationDto): Promise<UmlRelationshipEndView> {
     const end = await this.loadEnd(tx, diagramId, relationshipId, endIndex);
     const updated = await tx.umlRelationshipEnd.update({ where: { id: end.id }, data: { aggregation: dto.aggregation } });
@@ -468,14 +343,6 @@ export class RelationshipsService {
   }
 
   /** `ck_waypoints_array` solo exige un arreglo — la forma `{x, y}` ya la garantizó el DTO (D7). */
-  async setRelationshipWaypoints(
-    diagramId: string,
-    relationshipId: string,
-    dto: SetRelationshipWaypointsDto,
-  ): Promise<RelationshipLayoutView> {
-    return this.prisma.$transaction((tx) => this.setRelationshipWaypointsIn(tx, diagramId, relationshipId, dto));
-  }
-
   async setRelationshipWaypointsIn(tx: Tx, diagramId: string, relationshipId: string, dto: SetRelationshipWaypointsDto): Promise<RelationshipLayoutView> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
     const updated = await tx.relationshipLayout.update({
@@ -490,14 +357,6 @@ export class RelationshipsService {
   }
 
   /** Texto libre sin interpretar (D7) — el servidor nunca lee ni valida el formato del ancla. */
-  async setRelationshipAnchors(
-    diagramId: string,
-    relationshipId: string,
-    dto: SetRelationshipAnchorsDto,
-  ): Promise<RelationshipLayoutView> {
-    return this.prisma.$transaction((tx) => this.setRelationshipAnchorsIn(tx, diagramId, relationshipId, dto));
-  }
-
   async setRelationshipAnchorsIn(tx: Tx, diagramId: string, relationshipId: string, dto: SetRelationshipAnchorsDto): Promise<RelationshipLayoutView> {
     await assertRelationshipInDiagram(tx, relationshipId, diagramId);
     const updated = await tx.relationshipLayout.update({

@@ -9,20 +9,19 @@ import type { AddParameterDto } from './dto/add-parameter.dto';
 import type { ReorderEnumLiteralsDto } from './dto/reorder-enum-literals.dto';
 import type { ReorderParametersDto } from './dto/reorder-parameters.dto';
 import type { UpdateParameterDto } from './dto/update-parameter.dto';
-import { handleUniqueViolation } from './uml-errors';
 import { toLiteralView, toParameterView } from './uml-mappers';
 
 /**
- * Parámetros y literales de enum, incluido `reorderParameters` (design.md
- * §5, §12; tasks.md 4.2, 4.3).
+ * Cuerpos transaccionales de parámetros y literales de enum.
+ * **Nota fechada 2026-09-18 (`frontend-cutover`, tarea 4.4).** Los envoltorios
+ * públicos (`addParameter`, `updateParameter`, `removeParameter`,
+ * `reorderParameters`, `addEnumLiteral`, `removeEnumLiteral`,
+ * `reorderEnumLiterals`) se retiraron con las rutas HTTP que los llamaban; lo
+ * que queda son los cuerpos `…In(tx)` que invoca `OperationDispatcher`.
  */
 @Injectable()
 export class ParametersService {
   constructor(private readonly prisma: PrismaService) {}
-
-  async addParameter(diagramId: string, operationId: string, dto: AddParameterDto): Promise<UmlParameterView> {
-    return this.prisma.$transaction((tx) => this.addParameterIn(tx, diagramId, operationId, dto));
-  }
 
   async addParameterIn(tx: Tx, diagramId: string, operationId: string, dto: AddParameterDto): Promise<UmlParameterView> {
     await assertFeatureInDiagram(tx, operationId, diagramId);
@@ -42,10 +41,6 @@ export class ParametersService {
     return toParameterView(created);
   }
 
-  async updateParameter(diagramId: string, parameterId: string, dto: UpdateParameterDto): Promise<UmlParameterView> {
-    return this.prisma.$transaction((tx) => this.updateParameterIn(tx, diagramId, parameterId, dto));
-  }
-
   async updateParameterIn(tx: Tx, diagramId: string, parameterId: string, dto: UpdateParameterDto): Promise<UmlParameterView> {
     await assertParameterInDiagram(tx, parameterId, diagramId);
     const updated = await tx.umlParameter.update({
@@ -59,10 +54,6 @@ export class ParametersService {
       },
     });
     return toParameterView(updated);
-  }
-
-  async removeParameter(diagramId: string, parameterId: string): Promise<void> {
-    await this.prisma.$transaction((tx) => this.removeParameterIn(tx, diagramId, parameterId));
   }
 
   async removeParameterIn(tx: Tx, diagramId: string, parameterId: string): Promise<void> {
@@ -81,14 +72,6 @@ export class ParametersService {
    * Sin esta guarda, una lista incompleta deja filas varadas en `+K` de
    * forma permanente y el daño es silencioso y acumulativo (design.md §5).
    */
-  async reorderParameters(
-    diagramId: string,
-    operationId: string,
-    dto: ReorderParametersDto,
-  ): Promise<UmlParameterView[]> {
-    return this.prisma.$transaction((tx) => this.reorderParameterIn(tx, diagramId, operationId, dto));
-  }
-
   async reorderParameterIn(tx: Tx, diagramId: string, operationId: string, dto: ReorderParametersDto): Promise<UmlParameterView[]> {
     await assertFeatureInDiagram(tx, operationId, diagramId);
 
@@ -137,14 +120,6 @@ export class ParametersService {
     return rows.map((r) => toParameterView(r));
   }
 
-  async addEnumLiteral(diagramId: string, enumId: string, dto: AddEnumLiteralDto): Promise<UmlEnumLiteralView> {
-    try {
-      return await this.prisma.$transaction((tx) => this.addLiteralIn(tx, diagramId, enumId, dto));
-    } catch (err) {
-      handleUniqueViolation(err, dto.name);
-    }
-  }
-
   async addLiteralIn(tx: Tx, diagramId: string, enumId: string, dto: AddEnumLiteralDto): Promise<UmlEnumLiteralView> {
     await assertElementInDiagram(tx, enumId, diagramId);
     const agg = await tx.umlEnumLiteral.aggregate({ where: { enumerationId: enumId }, _max: { position: true } });
@@ -155,24 +130,12 @@ export class ParametersService {
     return toLiteralView(created);
   }
 
-  async removeEnumLiteral(diagramId: string, literalId: string): Promise<void> {
-    await this.prisma.$transaction((tx) => this.removeLiteralIn(tx, diagramId, literalId));
-  }
-
   async removeLiteralIn(tx: Tx, diagramId: string, literalId: string): Promise<void> {
     await assertLiteralInDiagram(tx, literalId, diagramId);
     await tx.umlEnumLiteral.delete({ where: { id: literalId } });
   }
 
   /** Una sola sentencia `VALUES`, sin guarda de conjunto: `@@unique([enumerationId, name])` es por nombre, no por posición (design.md §5). */
-  async reorderEnumLiterals(
-    diagramId: string,
-    enumId: string,
-    dto: ReorderEnumLiteralsDto,
-  ): Promise<UmlEnumLiteralView[]> {
-    return this.prisma.$transaction((tx) => this.reorderLiteralIn(tx, diagramId, enumId, dto));
-  }
-
   async reorderLiteralIn(tx: Tx, diagramId: string, enumId: string, dto: ReorderEnumLiteralsDto): Promise<UmlEnumLiteralView[]> {
     await assertElementInDiagram(tx, enumId, diagramId);
     if (dto.orderedLiteralIds.length > 0) {

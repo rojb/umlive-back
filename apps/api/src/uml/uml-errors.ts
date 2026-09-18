@@ -1,4 +1,13 @@
-import { ConflictException } from '@nestjs/common';
+// **Nota fechada 2026-09-18 (`frontend-cutover`, tarea 4.6, D2).** Este
+// archivo dejó de importar la excepción de conflicto HTTP de `@nestjs/common`:
+// los tres envoltorios que la lanzaban (`handleUniqueViolation`,
+// `handleCheckViolation`, `handleForeignKeyViolation`) se retiraron junto con
+// las rutas que los llamaban. **Lo que vive es la mitad que no parece**: los
+// resolvedores PUROS (`resolveUniqueViolation`, `resolveCheckViolation`,
+// `resolveForeignKeyViolation`) y sus tablas, que el pipeline del socket
+// consume en `apps/api/src/collaboration/operation-rejection.ts` dentro del
+// `catch` de la transacción. No re-agregar los envoltorios: el camino HTTP de
+// mutación ya no existe (INV-1).
 import { Prisma } from '../generated/prisma/client';
 import { UML_ERROR, type UmlErrorCode } from '@umlive/contracts';
 
@@ -155,27 +164,10 @@ function extractAdapterIndexName(meta: Record<string, unknown> | undefined): str
   return typeof index === 'string' ? index : undefined;
 }
 
-/**
- * Extensión de fase 3/4 (tasks.md 3.2, 3.3, 4.2): envoltorio único que las
- * 17 mutaciones usan para no repetir el mapeo `UmlErrorCode → HTTP` en cada
- * servicio. NO relee `err.meta` por su cuenta — delega entero en
- * `resolveUniqueViolation` de arriba, como exige la corrección de fase 1.
- *
- * `parameter_position_conflict` es la única excepción deliberada (design.md
- * §6): el usuario no puede provocarlo — las posiciones las asigna el
- * servidor — así que aunque el resolvedor lo reconozca, esta función lo
- * RELANZA sin envolver, para que explote como `500` y no como `409`.
- * Cualquier otro código reconocido se envuelve en `409 { code,
- * conflictingName }` (SC-B06/B07). Un `P2002` no reconocido también se
- * relanza tal cual — el llamador (Nest) lo convierte en `500`.
- */
-export function handleUniqueViolation(err: unknown, conflictingName: string): never {
-  const code = resolveUniqueViolation(err);
-  if (code && code !== UML_ERROR.PARAMETER_POSITION_CONFLICT) {
-    throw new ConflictException({ code, conflictingName });
-  }
-  throw err;
-}
+// `handleUniqueViolation` (envoltorio HTTP que traducía el `UmlErrorCode` a
+// `409` y mapeaba `parameter_position_conflict` a `500`) se retiró en
+// `frontend-cutover` Fase 4, tarea 4.6: el pipeline del socket traduce con
+// `resolveUniqueViolation` y `operation-rejection.ts`.
 
 /**
  * Resolvedor de `P2039` (violación de `CHECK`, PostgreSQL `23514`) para
@@ -458,20 +450,7 @@ function extractOriginalMessage(meta: Record<string, unknown> | undefined): stri
   return typeof originalMessage === 'string' ? originalMessage : undefined;
 }
 
-/**
- * Envoltorio único que las mutaciones de `uml-relationships` usan para no
- * repetir el mapeo `UmlErrorCode → HTTP` (mismo patrón que
- * `handleUniqueViolation`). Un `P2039` reconocido se envuelve en `409 {
- * code }`; uno no reconocido, o cualquier otro error, se relanza tal cual —
- * nunca un `409` genérico que esconda un bug (design.md D1).
- */
-export function handleCheckViolation(err: unknown): never {
-  const code = resolveCheckViolation(err);
-  if (code) {
-    throw new ConflictException({ code });
-  }
-  throw err;
-}
+// (envoltorio HTTP retirado en `frontend-cutover` Fase 4, tarea 4.6)
 
 /**
  * Resolvedor de `P2003` (violación de FK, PostgreSQL `23503`) — el primero
@@ -542,19 +521,4 @@ export function resolveForeignKeyViolation(err: unknown): UmlErrorCode | null {
     if (resolved) return resolved;
   }
   return null;
-}
-
-/**
- * Envoltorio único, mismo patrón que `handleUniqueViolation`/
- * `handleCheckViolation`. Uso previsto (D4, fase 2): red de carrera de
- * `deleteElement` — la comprobación previa autoritativa ya produjo el `409`
- * en el caso normal; este envoltorio existe para el caso raro en que alguien
- * liga la clase entre la relectura y el `DELETE`.
- */
-export function handleForeignKeyViolation(err: unknown): never {
-  const code = resolveForeignKeyViolation(err);
-  if (code) {
-    throw new ConflictException({ code });
-  }
-  throw err;
 }
