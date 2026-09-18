@@ -13,6 +13,7 @@ import {
   PROJECT_ERROR,
   presenceColor,
   type ClientEvents,
+  type LockAllResult,
   type LockHolder,
   type OperationRejected,
   type OperationRequest,
@@ -61,6 +62,14 @@ interface SocketData {
 /** Constantes de módulo (design.md §6) — una sola forma correcta, no configuración. */
 const CURSOR_MIN_INTERVAL_MS = 20;
 const MAX_ID_BATCH = 200;
+/**
+ * Tope de `lock:requestAll` (`hierarchical-delete` D3): un cierre de borrado
+ * puede ser grande (un paquete con sus descendientes y sus relaciones), pero
+ * no arbitrario. Por encima de esto el payload se descarta sin adquirir ni
+ * difundir nada — mismo criterio que `MAX_ID_BATCH`, con el tope propio de un
+ * cierre.
+ */
+const MAX_LOCK_ALL_BATCH = 1000;
 /**
  * Límite de tasa OBLIGATORIO del re-sync (`frontend-cutover/design.md` §D3,
  * `frontend-cutover-backend/spec.md`). Un hueco de versión dispara un re-sync
@@ -307,6 +316,58 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       return;
     }
     this.locks.release(client.data.diagramId, payload.elementId, client.data.user.id, 'released');
+  }
+
+  /**
+   * `lock:requestAll` (`hierarchical-delete` D3, SC-C14/SC-C17). **SIN `async`**
+   * y sin un solo punto de suspensión: `acquireAll` es de dos fases y atómico
+   * en el modelo de un solo hilo de Node, y el acuse sale en el MISMO tick.
+   *
+   * Responde por RETORNO (el acuse de Socket.IO) y no con eventos sueltos: si
+   * el cliente recibiera `lock:granted` sueltos no podría distinguir los de
+   * **su** petición de los de otra. Con el acuse sabe si ESTA petición salió
+   * bien o mal, y con qué elemento y dueño se denegó.
+   *
+   * Si el acuse es `ok`, difunde `lock:granted` por cada id (la sala entera
+   * necesita saber qué quedó tomado). Si deniega, **no difunde nada** — igual
+   * que `lock:denied`. Ese "nada" es load-bearing: los locks de un cierre
+   * denegado no se tomaron, así que anunciarlos mentiría a las otras ventanas.
+   *
+   * `socket.data.diagramId` es la autoridad exclusiva; el `diagramId` del
+   * payload NUNCA se lee (D7 de `reconnect-and-presence`). Un payload
+   * malformado (no-arreglo de strings, o más de `MAX_LOCK_ALL_BATCH` ids) se
+   * descarta sin adquirir ni difundir nada: no hay acuse que dar, y el
+   * cliente lo resuelve por su propia cota de espera.
+   */
+  @SubscribeMessage('lock:requestAll')
+  onLockRequestAll(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementIds: string[] }): LockAllResult | undefined {
+    if (
+      !Array.isArray(payload?.elementIds) ||
+      payload.elementIds.length > MAX_LOCK_ALL_BATCH ||
+      !payload.elementIds.every((id) => typeof id === 'string' && isUUID(id))
+    ) {
+      this.logger.warn(`lock:requestAll malformado o por encima del tope de ${client.id}`);
+      return undefined;
+    }
+
+    const diagramId = client.data.diagramId;
+    const holder: LockHolder = {
+      userId: client.data.user.id,
+      displayName: client.data.user.displayName,
+      color: client.data.color ?? '',
+    };
+    // Deduplicado: un cierre puede traer el mismo id dos veces (raíz repetida,
+    // o una asociación reflexiva que satisface dos términos de la consulta).
+    const ids = [...new Set(payload.elementIds)];
+
+    const outcome = this.locks.acquireAll(diagramId, ids, holder);
+    if (!outcome.ok) {
+      return { ok: false, denied: { elementId: outcome.elementId, holder: outcome.holder } };
+    }
+
+    const expiresAt = new Date(outcome.expiresAt).toISOString();
+    for (const elementId of ids) this.emitTo(diagramId, 'lock:granted', { elementId, holder, expiresAt });
+    return { ok: true, expiresAt };
   }
 
   /** `lock:heartbeat` — mismo patrón síncrono. Sin acuse a propósito (design.md §D10): compensado por `lock:released` del barrido/relevo. */

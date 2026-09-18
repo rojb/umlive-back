@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import type { ActorKind, OperationCommitted, OperationRejected, OperationRequest, OperationType, PayloadFor } from '@umlive/contracts';
+import type { ActorKind, DeleteClosure, OperationCommitted, OperationRejected, OperationRequest, OperationType, PayloadFor } from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Tx } from '../prisma/tx.type';
@@ -21,6 +21,19 @@ export type OperationOutcome =
   | { route: 'room'; event: 'op:committed'; payload: OperationCommitted }
   | { route: 'sender'; event: 'op:committed'; payload: OperationCommitted }
   | { route: 'sender'; event: 'op:rejected'; payload: OperationRejected };
+
+/**
+ * Lo que devuelve la transacción (`hierarchical-delete` D2): su salida para el
+ * gateway MÁS el cierre de borrado que hay que liberar. `release` viaja
+ * SEPARADO del `OperationOutcome` a propósito — el `OperationOutcome` ya existe
+ * antes del `COMMIT` (INV-3), y soltar locks sin confirmar sería soltar locks de
+ * una operación que revirtió.
+ */
+interface SubmittedTransaction {
+  outcome: OperationOutcome;
+  /** Presente SOLO en el camino que escribió un `element.delete`. El eco idempotente no lo trae. */
+  release?: DeleteClosure;
+}
 
 /** `@IsUUID('4')` a mano — el camino del socket no tiene la capa de `class-validator` (D11). */
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -128,7 +141,7 @@ export class OperationsService {
     const validatedReq: OperationRequest = { ...req, payload: validated.value as PayloadFor<OperationType> };
 
     try {
-      return await this.prisma.$transaction((tx) => this.submitIn(tx, diagramId, actorId, validatedReq), {
+      const submitted = await this.prisma.$transaction((tx) => this.submitIn(tx, diagramId, actorId, validatedReq), {
         // Valores por defecto de Prisma, escritos explícitos para que sean un
         // número revisable y no una suposición (design.md D7). El `FOR
         // UPDATE` espera ADENTRO de la transacción, así que `timeout` cubre
@@ -138,6 +151,23 @@ export class OperationsService {
         timeout: 5000,
         maxWait: 2000,
       });
+      // 7. Liberación DESPUÉS del `COMMIT` (`hierarchical-delete` D2, SC-C17).
+      // Que `$transaction` haya resuelto significa que el `COMMIT` ocurrió; el
+      // `catch` de abajo se lleva cualquier reversión, así que acá NO se llega
+      // con una transacción caída y nunca se suelta por un borrado que no pasó.
+      //
+      // `release` solo está en el camino que de verdad escribió (`element.delete`
+      // sin eco): el eco idempotente ya soltó todo la primera vez, y volver a
+      // soltar emitiría un segundo `lock:released` que V8 (cero `lock:released`
+      // extra) prohíbe. **Se suelta el cierre ENTERO** — subárbol Y relaciones,
+      // sin filtrar por dueño: el lock de una relación que tenía Diego también
+      // se va, porque la fila ya no existe (D2). Soltar solo los elementos
+      // dejaría el lock de la relación colgado hasta el TTL y Diego nunca
+      // recibiría su `lock:released{cause:'deleted'}` (V6).
+      if (submitted.release) {
+        this.locks.releaseElements(diagramId, [...submitted.release.ids, ...submitted.release.relationshipIds], 'deleted');
+      }
+      return submitted.outcome;
     } catch (err) {
       const currentVersion = await this.readCurrentVersion(diagramId);
       // `validatedReq.payload`, no `req.payload`: si el rechazo necesita
@@ -148,7 +178,7 @@ export class OperationsService {
     }
   }
 
-  private async submitIn(tx: Tx, diagramId: string, actorId: string, req: OperationRequest): Promise<OperationOutcome> {
+  private async submitIn(tx: Tx, diagramId: string, actorId: string, req: OperationRequest): Promise<SubmittedTransaction> {
     // 1. Lock puro — una sola cosa por consulta (D7). `::uuid` no es
     // cosmético: sin el cast el driver adapter manda el parámetro como
     // `text` y Postgres responde 42804.
@@ -177,18 +207,20 @@ export class OperationsService {
       if (prev.actorId !== actorId || prev.type !== req.type) {
         const currentVersion = Number((await tx.diagram.findUniqueOrThrow({ where: { id: diagramId }, select: { currentVersion: true } })).currentVersion);
         return {
-          route: 'sender',
-          event: 'op:rejected',
-          payload: {
-            opId: req.opId,
-            diagramId,
-            reason: 'MALFORMED',
-            message: 'Ese identificador de operación ya fue usado por otra operación distinta.',
-            currentVersion,
+          outcome: {
+            route: 'sender',
+            event: 'op:rejected',
+            payload: {
+              opId: req.opId,
+              diagramId,
+              reason: 'MALFORMED',
+              message: 'Ese identificador de operación ya fue usado por otra operación distinta.',
+              currentVersion,
+            },
           },
         };
       }
-      return { route: 'sender', event: 'op:committed', payload: toCommitted(prev) };
+      return { outcome: { route: 'sender', event: 'op:committed', payload: toCommitted(prev) } };
     }
 
     // 3. Versión + `lockState` — API tipada, bigint (D7). Dos consultas a
@@ -223,7 +255,6 @@ export class OperationsService {
     // propósito: resolver fuera de la transacción leería un snapshot distinto
     // del que muta.
     const lockTargets = await resolveLockTargets(tx, diagramId, req.type, req.payload);
-
     // 3-quater. LA EXIGENCIA (SC-C08). `canWrite()` es SÍNCRONO a propósito —
     // consulta un `Map` en memoria, sin un solo `await` adentro — y va acá, LO
     // ÚLTIMO antes de mutar, no apenas se tomó el `FOR UPDATE` (D3). El
@@ -242,15 +273,21 @@ export class OperationsService {
     // milisegundos. QUIEN "ARREGLE" ESTO ACOPLANDO LOCKS A LA BASE ROMPE SC-C06.
     //
     // Cero `await` entre este retorno y el `dispatch` de abajo (D3, V10).
-    const lock = this.locks.canWrite(diagramId, lockTargets, actorId);
-    if (!lock.ok) throw new ElementLockedError(lock.holder);
+    const lock = this.locks.canWrite(diagramId, lockTargets.ids, actorId);
+    // `lock.holder` Y `lock.elementId`: el rechazo tiene que poder nombrar a la
+    // persona Y al elemento (D6, SC-C17).
+    if (!lock.ok) throw new ElementLockedError(lock.holder, lock.elementId);
 
     const next = diagram.currentVersion + 1n;
 
     // 4. Mutación — el despachador solo conoce las variantes `…In(tx)`
     // (design.md D5). El payload que vuelve es el AUTORITATIVO: lo que
     // realmente ocurrió, no lo que llegó.
-    const authoritativePayload = await this.dispatcher.dispatch(tx, diagramId, req.type, req.payload);
+    //
+    // `lockTargets` viaja ENTERO como 4.º parámetro (`hierarchical-delete` D5):
+    // es lo que le da al handler de `element.delete` el cierre recalculado
+    // desde la base para borrar por esa lista exacta.
+    const authoritativePayload = await this.dispatcher.dispatch(tx, diagramId, req.type, req.payload, lockTargets);
 
     // 5. Versión + log, dentro del mismo lock (D7, D9: `bigint` adentro,
     // `number` afuera — recién en `toCommitted`, más abajo).
@@ -267,12 +304,19 @@ export class OperationsService {
       },
     });
 
-    // 6. El `OperationOutcome` recién existe ACÁ — después de que las cinco
-    // consultas de arriba resolvieron dentro de la MISMA transacción que
-    // todavía no confirmó. `$transaction` hace el `COMMIT` al volver de esta
-    // función; INV-3 se sostiene porque este archivo no tiene con qué
-    // emitir antes de eso (D3).
-    return { route: 'room', event: 'op:committed', payload: toCommitted(row) };
+    // 6. La salida recién existe ACÁ — después de que las cinco consultas de
+    // arriba resolvieron dentro de la MISMA transacción que todavía no
+    // confirmó. `$transaction` hace el `COMMIT` al volver de esta función;
+    // INV-3 se sostiene porque este archivo no tiene con qué emitir ni con qué
+    // liberar locks antes de eso (D3).
+    //
+    // `release` sale de `lockTargets.deleteClosure`: existe SOLO para
+    // `element.delete` y SOLO en este camino (el eco retornó arriba), que es
+    // exactamente el "solo en el camino que commitea" de la spec.
+    return {
+      outcome: { route: 'room', event: 'op:committed', payload: toCommitted(row) },
+      release: lockTargets.deleteClosure ?? undefined,
+    };
   }
 
   /** Lectura plana, fuera de transacción — para los dos casos de rechazo que no abren (o ya cerraron) el lock. */

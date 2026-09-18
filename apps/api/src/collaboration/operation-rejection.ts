@@ -27,9 +27,14 @@ export class DiagramFrozenError extends Error {
  * Clase PLANA por el mismo motivo que `DiagramFrozenError`. El `holder` viaja
  * en la instancia porque `canWrite()` ya lo devuelve: `submit()` solo recibe
  * el `userId`, pero el rechazo necesita el nombre.
+ *
+ * `elementId` (`hierarchical-delete` D6): `LockAllOutcome` deniega CON el
+ * elemento que falló, y SC-C17 exige nombrarlo — sin esto el `409` solo podría
+ * decir a quién pertenece el lock, no a qué. El nombre del elemento lo resuelve
+ * el cliente desde su store.
  */
 export class ElementLockedError extends Error {
-  constructor(readonly holder: LockHolder) {
+  constructor(readonly holder: LockHolder, readonly elementId: string) {
     super('ELEMENT_LOCKED');
     this.name = 'ElementLockedError';
   }
@@ -91,7 +96,16 @@ export function translateRejection(
   }
   if (err instanceof ElementLockedError) {
     const { displayName } = err.holder;
-    return rejected(opId, diagramId, 'ELEMENT_LOCKED', `${displayName} está editando este elemento. Esperá a que termine o pedile que suelte el bloqueo.`, currentVersion, undefined, err.holder);
+    return rejected(
+      opId,
+      diagramId,
+      'ELEMENT_LOCKED',
+      `${displayName} está editando este elemento. Esperá a que termine o pedile que suelte el bloqueo.`,
+      currentVersion,
+      undefined,
+      err.holder,
+      err.elementId,
+    );
   }
 
   // 1. Excepciones de dominio lanzadas desde el cuerpo mudado o la guarda.
@@ -172,8 +186,9 @@ function rejected(
   currentVersion: number,
   umlError?: UmlErrorDetail,
   holder?: LockHolder,
+  lockedElementId?: string,
 ): OperationRejected {
-  return { opId, diagramId, reason, message, currentVersion, umlError, holder };
+  return { opId, diagramId, reason, message, currentVersion, umlError, holder, lockedElementId };
 }
 
 function humanMessage(reason: RejectionReason): string {

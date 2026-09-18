@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { LockHolder, LockReleased } from '@umlive/contracts';
+import type { LockAllOutcome, LockHolder, LockReleased } from '@umlive/contracts';
 
 /**
  * Registro de bloqueos de elemento — en memoria, a propósito.
@@ -72,9 +72,9 @@ export class LocksService implements OnModuleDestroy {
    * SC-C01 / SC-C02 / SC-C03.
    *
    * Node corre una sola tarea por vez, así que este método es atómico respecto
-   * de otras llamadas: no hay await adentro. Eso resuelve la carrera de SC-C03
+   * de otras llamadas: no hay `await` adentro. Eso resuelve la carrera de SC-C03
    * sin sincronización explícita — y es la razón por la que NO debe volverse
-   * async sin repensarlo.
+   * `async` sin repensarlo.
    */
   acquire(diagramId: string, elementId: string, holder: LockHolder): LockOutcome {
     const locks = this.locksOf(diagramId);
@@ -111,20 +111,48 @@ export class LocksService implements OnModuleDestroy {
   }
 
   /**
-   * Adquisición atómica de varios (SC-C14: borrar exige clase + relaciones).
-   * Si falla uno, no queda tomado ninguno — nada de estados a medias.
+   * Adquisición atómica de varios (SC-C14: borrar exige el cierre ENTERO —
+   * la raíz, sus descendientes y cada relación incidente). De dos fases, sin un
+   * solo `await` adentro (D1 de `hierarchical-delete`):
+   *
+   *   fase 1 — recorre los ids SIN TOCAR NADA y devuelve el primer dueño ajeno
+   *            vigente, con el `elementId` que falló (SC-C17 exige nombrarlo);
+   *   fase 2 — corre solo si la fase 1 NO denegó, y llama `acquire` por cada id.
+   *
+   * Si se deniega, no se tomó nada y no se difundió nada: la atomicidad es
+   * POR CONSTRUCCIÓN, no por deshacer. El diseño anterior tomaba de a uno y
+   * hacía rollback de lo tomado — y ese rollback le soltaba al usuario locks
+   * que YA TENÍA antes de pedir, además de una ventana donde `acquire` podía
+   * haber avisado a la sala que un lock venció. Sin un punto de suspensión
+   * entre las dos fases, nada cambia entre el chequeo y la toma.
+   *
+   * Nota sobre el chequeo de higiene de la tarea 4.7: mide LÍNEAS DE CÓDIGO, no
+   * prosa. La primera pasada lo satisfizo reescribiendo estos comentarios para
+   * que no apareciera la palabra; se revirtió el 2026-09-18 porque un comentario
+   * que dice `await` es MÁS claro, no menos, y porque un grep que se conforma
+   * con que nadie escriba la palabra no verifica nada. Lo que se verifica es que
+   * no haya `await` en el cuerpo, y eso se lee.
    */
-  acquireAll(diagramId: string, elementIds: string[], holder: LockHolder): LockOutcome {
-    const taken: string[] = [];
+  acquireAll(diagramId: string, elementIds: readonly string[], holder: LockHolder): LockAllOutcome {
+    const locks = this.byDiagram.get(diagramId);
+    const now = Date.now();
+
+    for (const id of elementIds) {
+      const lock = locks?.get(id);
+      if (lock && lock.expiresAt > now && lock.holder.userId !== holder.userId) {
+        return { ok: false, elementId: id, holder: lock.holder };
+      }
+    }
+
+    let expiresAt = now + this.ttlMs;
     for (const id of elementIds) {
       const r = this.acquire(diagramId, id, holder);
-      if (!r.ok) {
-        for (const t of taken) this.release(diagramId, t, holder.userId, 'released');
-        return r;
-      }
-      taken.push(id);
+      // Imposible con el modelo de un solo hilo: entre la fase 1 y la fase 2 no
+      // hay ningún punto de suspensión. Es una aserción, no una rama viva.
+      if (!r.ok) throw new Error('acquireAll: invariante de dos fases rota');
+      expiresAt = r.expiresAt;
     }
-    return { ok: true, expiresAt: Date.now() + this.ttlMs };
+    return { ok: true, expiresAt };
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -149,22 +177,24 @@ export class LocksService implements OnModuleDestroy {
    * un reintento de una operación ya confirmada no escribe nada, y rechazarlo
    * revertiría estado autoritativo (SC-C10).
    *
-   * SÍNCRONO a propósito: lee un `Map` en memoria y no tiene un solo `await`
-   * adentro. Eso y su ubicación tardía son las dos únicas mitigaciones posibles
-   * de esa carrera sin acoplar los locks a PostgreSQL (D8). La carrera sigue
-   * existiendo y sigue siendo un límite ACEPTADO.
+   * SÍNCRONO a propósito: lee un `Map` en memoria y no tiene un solo punto de
+   * suspensión adentro. Eso y su ubicación tardía son las dos
+   * únicas mitigaciones posibles de esa carrera sin acoplar los locks a
+   * PostgreSQL (D8). La carrera sigue existiendo y sigue siendo un límite
+   * ACEPTADO.
    *
    * Un elemento libre se considera escribible: pedir el lock es
    * responsabilidad del cliente, pero no tenerlo no habilita a otro a pisarlo
    * — porque si otro lo tuviera, este chequeo fallaría.
    *
    * Es CONSULTA PURA (D6): no adquiere nada, así que `atomic` no participa acá
-   * — no hay estado parcial que revertir y se devuelve al primer dueño ajeno.
+   * — no hay estado parcial que revertir y se devuelve al primer dueño ajeno,
+   * CON el `elementId` que lo tiene (`hierarchical-delete` D1/D6).
    */
-  canWrite(diagramId: string, elementIds: string[], userId: string): LockOutcome {
+  canWrite(diagramId: string, elementIds: readonly string[], userId: string): LockAllOutcome {
     for (const id of elementIds) {
       const holder = this.holderOf(diagramId, id);
-      if (holder && holder.userId !== userId) return { ok: false, holder };
+      if (holder && holder.userId !== userId) return { ok: false, elementId: id, holder };
     }
     // `expiresAt` NO significa nada en este retorno: `canWrite` no adquiere
     // nada, así que no hay TTL que devolver. Es un centinela que miente a
@@ -203,6 +233,39 @@ export class LocksService implements OnModuleDestroy {
     this.deindex(userId, diagramId, elementId);
     this.onRelease?.(diagramId, elementId, cause);
     return true;
+  }
+
+  /**
+   * Suelta los locks de TODO un cierre de borrado, sin filtrar por dueño
+   * (`hierarchical-delete` D2). Lo llama `OperationsService` **después del
+   * COMMIT** y solo en el camino que confirma: el eco idempotente no vuelve a
+   * soltar.
+   *
+   * Suelta aunque el lock esté vencido y el barrido todavía no lo haya
+   * limpiado: después de esto el barrido ya no lo ve, y `'deleted'` informa
+   * mejor que `'expired'`.
+   *
+   * `deindex` se hace con el `userId` del DUEÑO del lock, nunca con el del que
+   * borra — si no, la clave `${diagramId}:${elementId}` queda stale en `byUser`
+   * del dueño y su desconexión borraría un lock VIVO de otro.
+   *
+   * ⚠️ Reusa `this.onRelease`, el MISMO oyente que registra el gateway una vez
+   * en `afterInit`. **No se registra un segundo `setReleaseListener`**: es un
+   * setter de un solo slot (`this.onRelease = fn`), así que el segundo
+   * REEMPLAZA al primero en silencio y las liberaciones dejan de llegar a la
+   * sala. La higiene del repo lo verifica con `rg "setReleaseListener\("` → una
+   * sola ocurrencia.
+   */
+  releaseElements(diagramId: string, ids: readonly string[], cause: LockReleased['cause']): void {
+    const locks = this.byDiagram.get(diagramId);
+    if (!locks) return;
+    for (const id of ids) {
+      const lock = locks.get(id);
+      if (!lock) continue;
+      locks.delete(id);
+      this.deindex(lock.holder.userId, diagramId, id);
+      this.onRelease?.(diagramId, id, cause);
+    }
   }
 
   /**

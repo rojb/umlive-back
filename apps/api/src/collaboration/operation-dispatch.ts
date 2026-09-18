@@ -5,6 +5,7 @@ import { ElementsService, resolveElementCreateStereotype, validateElementCreateP
 import { FeaturesService } from '../uml/features.service';
 import { ParametersService } from '../uml/parameters.service';
 import { assertEndsMatchKind, RelationshipsService } from '../uml/relationships.service';
+import type { ResolvedLockTargets } from './lock-targets';
 
 /**
  * Mapa exhaustivo `OperationType → handler` (design.md D5). Un `OperationType`
@@ -30,9 +31,16 @@ import { assertEndsMatchKind, RelationshipsService } from '../uml/relationships.
  * `relationship.reroute` apunta a un elemento YA EXISTENTE
  * (`payload.elementId`, validado por `assertElementInDiagram`) — no hay
  * ningún id inventado por el cliente que corregir.
+ *
+ * **4.º parámetro `resolved` (`hierarchical-delete` D5).** El pipeline le pasa
+ * el resultado de `resolveLockTargets` (los ids a exigir MÁS, para
+ * `element.delete`, el cierre de borrado recalculado desde la base). El
+ * mapped type lo exige en la FIRMA de los 32, pero **los otros 31 handlers no
+ * cambian una línea**: en TypeScript una función con menos parámetros sigue
+ * siendo asignable al tipo. Solo `element.delete` lo USA.
  */
 type OperationHandlers = {
-  [T in OperationType]: (tx: Tx, diagramId: string, payload: PayloadFor<T>) => Promise<PayloadFor<T>>;
+  [T in OperationType]: (tx: Tx, diagramId: string, payload: PayloadFor<T>, resolved: ResolvedLockTargets) => Promise<PayloadFor<T>>;
 };
 
 @Injectable()
@@ -59,9 +67,15 @@ export class OperationDispatcher {
     Object.setPrototypeOf(this.handlers, null);
   }
 
-  async dispatch<T extends OperationType>(tx: Tx, diagramId: string, type: T, payload: PayloadFor<T>): Promise<PayloadFor<T>> {
-    const handler = this.handlers[type] as (tx: Tx, diagramId: string, payload: PayloadFor<T>) => Promise<PayloadFor<T>>;
-    return handler(tx, diagramId, payload);
+  async dispatch<T extends OperationType>(
+    tx: Tx,
+    diagramId: string,
+    type: T,
+    payload: PayloadFor<T>,
+    resolved: ResolvedLockTargets,
+  ): Promise<PayloadFor<T>> {
+    const handler = this.handlers[type] as (tx: Tx, diagramId: string, payload: PayloadFor<T>, resolved: ResolvedLockTargets) => Promise<PayloadFor<T>>;
+    return handler(tx, diagramId, payload, resolved);
   }
 
   /**
@@ -134,9 +148,19 @@ export class OperationDispatcher {
       return payload;
     },
 
-    'element.delete': async (tx, diagramId, payload) => {
-      await this.elements.deleteElementIn(tx, diagramId, payload.id);
-      return payload;
+    'element.delete': async (tx, diagramId, payload, resolved) => {
+      // El cierre es el 4.º parámetro (D5). Ausente = bug del pipeline, no una
+      // carrera: `LOCK_REQUIREMENTS['element.delete']` SIEMPRE trae la fila
+      // `deleteClosure`, así que `resolveLockTargets` siempre lo llena. Si
+      // faltara, borrar sin cierre significaría borrar por un predicado y
+      // llevarse la relación que no se verificó → `INTERNAL` (el único motivo
+      // que obliga a `Logger.error`, D8 de `operations-pipeline`).
+      const closure = resolved.deleteClosure;
+      if (!closure) throw new Error('element.delete sin cierre resuelto: `resolveLockTargets` no llenó `deleteClosure`');
+      const deleted = await this.elements.deleteElementIn(tx, diagramId, payload.id, closure);
+      // Payload AUTORITATIVO: `deleted` es el cierre que REALMENTE se borró, lo
+      // que el cliente aplica en `applyCommitted` (D5).
+      return { ...payload, deleted };
     },
 
     'feature.create': async (tx, diagramId, payload) => {

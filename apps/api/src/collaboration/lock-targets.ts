@@ -1,6 +1,7 @@
 import { Logger, NotFoundException } from '@nestjs/common';
-import { LOCK_REQUIREMENTS, type LockTarget, type OperationType, type PayloadFor } from '@umlive/contracts';
+import { LOCK_REQUIREMENTS, type DeleteClosure, type LockTarget, type OperationType, type PayloadFor } from '@umlive/contracts';
 import type { Tx } from '../prisma/tx.type';
+import { collectSubtreeIds } from '../uml/element-subtree';
 
 /**
  * Traductor TOTAL de `LOCK_REQUIREMENTS` a ids reales de elemento
@@ -47,9 +48,23 @@ export class LockTargetTableError extends Error {
 }
 
 /**
+ * El resultado de resolver la tabla: los `elementId` a exigir **y**, cuando la
+ * operación es un `element.delete`, el cierre de borrado completo
+ * (`hierarchical-delete` D5). El pipeline le pasa el objeto ENTERO al
+ * despachador como 4.º parámetro: el handler de `element.delete` necesita el
+ * cierre (no solo los ids de lock) para borrar por la lista exacta.
+ */
+export interface ResolvedLockTargets {
+  /** Los `elementId` que `canWrite()` consulta. Para `element.delete` es el cierre entero. */
+  ids: string[];
+  /** Solo para `element.delete`; `null` para los otros 31 tipos. */
+  deleteClosure: DeleteClosure | null;
+}
+
+/**
  * Objetivos de lock de una operación, resueltos DENTRO de la transacción del
  * `op:submit` (D3, D4). Deduplicado: una `ASSOCIATION` reflexiva satisface las
- * tres ramas del `OR` de `incidentRelationships` para el mismo id, y un
+ * tres ramas del `OR` de `deleteClosure` para el mismo id, y un
  * `relationship.create` con `source === target` produce el mismo id dos veces.
  * `canWrite` sobreviviría igual con duplicados, pero vuelven ilegible cualquier
  * log.
@@ -64,16 +79,17 @@ export async function resolveLockTargets<T extends OperationType>(
   diagramId: string,
   type: T,
   payload: PayloadFor<T>,
-): Promise<string[]> {
+): Promise<ResolvedLockTargets> {
   const targets = new Set<string>();
+  let deleteClosure: DeleteClosure | null = null;
 
   for (const target of LOCK_REQUIREMENTS[type].targets) {
-    for (const id of await resolveOne(tx, diagramId, type, payload, target)) {
-      targets.add(id);
-    }
+    const resolved = await resolveOne(tx, diagramId, type, payload, target);
+    for (const id of resolved.ids) targets.add(id);
+    if (resolved.deleteClosure) deleteClosure = resolved.deleteClosure;
   }
 
-  return [...targets];
+  return { ids: [...targets], deleteClosure };
 }
 
 /**
@@ -88,7 +104,7 @@ async function resolveOne<T extends OperationType>(
   type: T,
   payload: PayloadFor<T>,
   t: LockTarget<T>,
-): Promise<string[]> {
+): Promise<{ ids: string[]; deleteClosure: DeleteClosure | null }> {
   switch (t.from) {
     case 'payload': {
       // No hay consulta: el id ya viene en el payload. Un campo ausente o de
@@ -99,7 +115,7 @@ async function resolveOne<T extends OperationType>(
         log.error(`LOCK_REQUIREMENTS mal derivada — ${detail}`);
         throw new LockTargetTableError(detail);
       }
-      return [value];
+      return { ids: [value], deleteClosure: null };
     }
 
     case 'featureOwner': {
@@ -109,7 +125,7 @@ async function resolveOne<T extends OperationType>(
         select: { ownerId: true },
       });
       if (!row) throw new NotFoundException();
-      return [row.ownerId];
+      return { ids: [row.ownerId], deleteClosure: null };
     }
 
     case 'parameterOwner': {
@@ -121,7 +137,7 @@ async function resolveOne<T extends OperationType>(
         select: { operation: { select: { ownerId: true } } },
       });
       if (!row) throw new NotFoundException();
-      return [row.operation.ownerId];
+      return { ids: [row.operation.ownerId], deleteClosure: null };
     }
 
     case 'literalOwner': {
@@ -133,26 +149,47 @@ async function resolveOne<T extends OperationType>(
         select: { enumerationId: true },
       });
       if (!row) throw new NotFoundException();
-      return [row.enumerationId];
+      return { ids: [row.enumerationId], deleteClosure: null };
     }
 
-    case 'incidentRelationships': {
-      // 0..n. **Vacío es legítimo**: una clase sin relaciones no tiene nada
-      // que bloquear de más. `select: { id: true }` a propósito — los joins
-      // de presentación de `IncidentRelationshipView` no van dentro del lock
-      // (D4, D7).
+    case 'deleteClosure': {
+      // El cierre de borrado (`hierarchical-delete` D1/D5), RECALCULADO desde
+      // la base: nunca se confía en la lista que mandó el cliente. Reusa
+      // `collectSubtreeIds` (de `uml-validation`, ya probada contra la base) —
+      // subárbol por `parent_id` con la raíz incluida — y suma las relaciones
+      // con rol `ENDPOINT` sobre CUALQUIER nodo del subárbol.
+      //
+      // El término `associationClassId` NO está acá a propósito: una clase
+      // asociación no es un extremo (`ck_assoc_class_not_endpoint`), así que la
+      // relación que la liga entra al cierre solo si uno de sus extremos cae
+      // dentro — que es exactamente el caso en el que sobrevivir no es un
+      // problema (`D7.3`). Si la liga desde afuera, la asociación NO entra al
+      // cierre y `deleteElementIn` responde `409`.
+      const rootId = requirementField(payload, t.field, type);
+      const elementIds = await collectSubtreeIds(tx, rootId, diagramId);
       const rows = await tx.umlRelationship.findMany({
         where: {
           diagramId,
           OR: [
-            { sourceElementId: requirementField(payload, t.field, type) },
-            { targetElementId: requirementField(payload, t.field, type) },
-            { ends: { some: { elementId: requirementField(payload, t.field, type) } } },
+            { sourceElementId: { in: elementIds } },
+            { targetElementId: { in: elementIds } },
+            { ends: { some: { elementId: { in: elementIds } } } },
           ],
         },
         select: { id: true },
       });
-      return rows.map((row) => row.id);
+      const relationshipIds = [...new Set(rows.map((row) => row.id))];
+      // Los OBJETIVOS DE LOCK son el cierre ENTERO — subárbol **y** relaciones
+      // (SC-C14: «lock sobre el clasificador Y sobre cada relación incidente»).
+      // Si acá solo viajaran los elementos, `canWrite()` no vería la asociación
+      // que tiene Diego y el `element.delete` por devtools pasaría sin ser
+      // denegado (V2 de la spec). `deleteClosure` conserva la separación
+      // elementos/relaciones porque el borrado y la interfaz las necesitan
+      // distintas.
+      return {
+        ids: [...new Set([...elementIds, ...relationshipIds])],
+        deleteClosure: { ids: elementIds, relationshipIds },
+      };
     }
 
     default: {

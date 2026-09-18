@@ -5,7 +5,7 @@
  */
 
 import type {
-  LockDenied, LockGranted, LockReleased,
+  LockAllResult, LockDenied, LockGranted, LockReleased,
   OperationCommitted, OperationRejected, OperationRequest,
 } from './operations';
 import type { DiagramContent } from './uml';
@@ -31,6 +31,14 @@ export interface ClientEvents {
   'diagram:leave': (p: { diagramId: string }) => void;
   'op:submit': (p: OperationRequest) => void;
   'lock:request': (p: { diagramId: string; elementId: string }) => void;
+  /**
+   * Adquisición atómica de todo un cierre de borrado (`hierarchical-delete`
+   * D3). Responde por ACUSE, no por `lock:granted` sueltos: el cliente necesita
+   * saber si **esa** petición concreta salió bien o mal, y los `lock:granted`
+   * que difunde el servidor son de la sala — no distinguen quién los pidió.
+   * Una denegación NO difunde nada.
+   */
+  'lock:requestAll': (p: { elementIds: string[] }, ack: (r: LockAllResult) => void) => void;
   'lock:release': (p: { diagramId: string; elementId: string }) => void;
   /** Cada 5 s mientras haya locks tomados. Renueva el TTL (SC-C04). */
   'lock:heartbeat': (p: { diagramId: string; elementIds: string[] }) => void;

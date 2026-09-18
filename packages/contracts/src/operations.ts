@@ -170,6 +170,13 @@ export interface OperationRejected {
   message: string;
   /** Presente en ELEMENT_LOCKED: quién lo tiene. Denegar sin decir quién es el bug que FR-C04 evita. */
   holder?: LockHolder;
+  /**
+   * Presente en ELEMENT_LOCKED: QUÉ elemento se denegó (SC-C17). Sin esto, el
+   * `409` por devtools no podría nombrar «esa clase» y el cliente solo podría
+   * decir el nombre de la persona. El nombre del elemento lo resuelve el
+   * cliente desde su store.
+   */
+  lockedElementId?: string;
   /** Presente en INVALID_MODEL: qué regla se rompió y dónde. */
   violations?: ModelViolation[];
   /** CONSTRAINT_VIOLATION (y algunos MALFORMED): qué regla de dominio se rompió, con el cuerpo rico del 409 HTTP. */
@@ -234,8 +241,30 @@ export interface LockReleased {
    * §D1). No lleva `userId` a propósito: hay UN lock por `elementId`, así
    * que el cliente borra por clave (design.md §D12).
    */
-  cause: 'released' | 'expired' | 'disconnected' | 'frozen' | 'forced' | 'removed_from_project';
+  cause: 'released' | 'expired' | 'disconnected' | 'frozen' | 'forced' | 'removed_from_project' | 'deleted';
 }
+
+/**
+ * Adquisición atómica de todo un cierre de borrado (`hierarchical-delete` D1).
+ * Discriminada y CON el id que falló: SC-C17 exige nombrar el elemento ajeno,
+ * no solo a su dueño.
+ */
+export type LockAllOutcome =
+  | { ok: true; expiresAt: number }
+  | { ok: false; elementId: string; holder: LockHolder };
+
+/**
+ * Acuse de `lock:requestAll` (`hierarchical-delete` D3). Es la forma de
+ * CONTRATO (fechas ISO); `LockAllOutcome` es la del servicio (epoch ms).
+ *
+ * El acuse existe para que el cliente sepa si **esa** petición concreta salió
+ * bien o mal: si el servidor difundiera `lock:granted` sueltos, el cliente no
+ * podría distinguir los de su propia petición de los de otra. Cuando deniega,
+ * NO difunde nada — igual que `lock:denied`.
+ */
+export type LockAllResult =
+  | { ok: true; expiresAt: string }
+  | { ok: false; denied: LockDenied };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos de operación — 32, uno por CUERPO de transacción (ver nota de cabecera)
@@ -341,14 +370,38 @@ export interface ElementResize {
 }
 
 /**
- * Borrar un clasificador exige lock sobre él Y sobre cada relación incidente,
+ * Cierre de borrado (`hierarchical-delete` D1, SC-C17): el subárbol completo
+ * por `parent_id`, incluida la raíz, más toda relación con rol `ENDPOINT`
+ * (`source`, `target` o `ends.elementId`) sobre cualquiera de sus nodos, sin
+ * duplicados.
+ *
+ * Es la unidad atómica de SC-C14: o se toman los locks de TODO el cierre, o no
+ * se toma ninguno. El servidor lo recalcula desde la base dentro de la
+ * transacción (`lock-targets.ts`); el cliente lo calcula desde su store para
+ * pedir los locks y para listar lo que se va a borrar.
+ */
+export interface DeleteClosure {
+  /** Ids del subárbol por `parent_id`, con la raíz incluida. */
+  ids: string[];
+  /** Relaciones con rol `ENDPOINT` sobre cualquier nodo del subárbol. */
+  relationshipIds: string[];
+}
+
+/**
+ * Borrar un clasificador exige lock sobre él Y sobre todo su cierre de borrado,
  * atómicamente (SC-C14, SC-C15). El cliente manda las relaciones que cree que
- * hay; el servidor NO confía en esa lista: la recalcula. El campo existe para
- * que el cliente pueda pedir los locks antes de intentar.
+ * hay; el servidor NO confía en esa lista: la recalcula. Los dos campos existen
+ * para que el cliente pueda pedir los locks antes de intentar.
+ *
+ * `deleted` es del payload AUTORITATIVO: lo escribe el servidor al confirmar
+ * (`ElementDelete.deleted?`) y el cliente lo aplica en `applyCommitted`. Un
+ * cliente NUNCA lo manda; viaja opcional a propósito.
  */
 export interface ElementDelete {
   id: string;
   expectedIncidentRelationshipIds: string[];
+  /** Autoritativo, solo de ida (servidor → cliente): el cierre que realmente se borró. */
+  deleted?: DeleteClosure;
 }
 
 export interface FeatureCreate {
@@ -579,7 +632,7 @@ export type LockTarget<T extends OperationType> =
   | { from: 'featureOwner'; field: StringKeys<PayloadFor<T>> } // feature   → elemento
   | { from: 'parameterOwner'; field: StringKeys<PayloadFor<T>> } // parámetro → feature → elemento
   | { from: 'literalOwner'; field: StringKeys<PayloadFor<T>> } // literal   → enumeración
-  | { from: 'incidentRelationships'; field: StringKeys<PayloadFor<T>> }; // elemento  → relaciones (0..n)
+  | { from: 'deleteClosure'; field: StringKeys<PayloadFor<T>> }; // elemento  → cierre de borrado (subárbol + relaciones, 0..n)
 
 type StringKeys<P> = { [K in keyof P]-?: P[K] extends string ? K : never }[keyof P];
 
@@ -609,9 +662,12 @@ export const LOCK_REQUIREMENTS: { [T in OperationType]: LockRequirement<T> } = {
   'element.setBody': { targets: [{ from: 'payload', field: 'id' }] },
   'element.move': { targets: [{ from: 'payload', field: 'id' }], note: 'Las relaciones se re-rutean solas (SC-C16)' },
   'element.resize': { targets: [{ from: 'payload', field: 'id' }] },
-  // Atómico: si falta uno, se rechaza todo (SC-C14).
+  // Atómico: si falta uno, se rechaza todo (SC-C14). `deleteClosure` reemplaza
+  // a `incidentRelationships` (`hierarchical-delete` D5): el objetivo ya no es
+  // «las relaciones incidentes» sino el cierre completo — subárbol + toda
+  // relación `ENDPOINT` sobre cualquiera de sus nodos.
   'element.delete': {
-    targets: [{ from: 'payload', field: 'id' }, { from: 'incidentRelationships', field: 'id' }],
+    targets: [{ from: 'payload', field: 'id' }, { from: 'deleteClosure', field: 'id' }],
     atomic: true,
   },
 
