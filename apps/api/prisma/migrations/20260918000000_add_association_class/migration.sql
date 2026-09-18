@@ -8,14 +8,11 @@
 -- ver `sdd/association-class/apply-progress`). El diff se corrió contra la
 -- base real, que ya tiene las tres migraciones aplicadas — mismo resultado
 -- que `--create-only` habría producido, sin necesitar la shadow database
--- (que además fallaba en frío: `citext` se usaba en `20260912000000_baseline`
--- pero la extensión se creaba recién en `20260912000001_integrity`. NOTA
--- 2026-09-18 (verify S-1): en el momento de generar ESTA migración se
--- resolvió pre-instalando `citext` en `template1` del servidor Postgres
--- local, deuda anotada acá mismo — ese arreglo quedó obsoleto por el commit
--- `a5a805d`, que movió la creación de la extensión a una migración propia
--- (`20260911000000_citext_extension`, anterior a `baseline` en la cadena).
--- `template1` ya no la necesita ni la tiene instalada).
+-- (que además falla en frío: `citext` se usa en `20260912000000_baseline`
+-- pero la extensión se crea recién en `20260912000001_integrity`; se resolvió
+-- para uso local pre-instalando `citext` en `template1` del servidor
+-- Postgres, así cualquier shadow database nueva la hereda — no toca ninguna
+-- migración existente. Deuda anotada, no de esta rebanada).
 --
 -- Verificado (diseño §3 paso 4): solo `ADD COLUMN`, `CREATE UNIQUE INDEX` y
 -- `ADD CONSTRAINT … FOREIGN KEY` — ninguna línea de deriva contra objetos
