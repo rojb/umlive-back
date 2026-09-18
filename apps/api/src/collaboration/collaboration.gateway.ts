@@ -11,6 +11,7 @@ import {
 import {
   PROJECT_ERROR,
   type ClientEvents,
+  type OperationRequest,
   type ProjectRole,
   type ServerEvents,
   type SocketHandshakeAuth,
@@ -21,6 +22,7 @@ import type { CurrentUserPayload } from '../auth/current-user.decorator';
 import { SocketAuthService } from '../auth/socket-auth.service';
 import { ProjectAccessResolver, type ProjectAccessResult } from '../projects/project-access.resolver';
 import { DiagramContentService } from '../uml/diagram-content.service';
+import { OperationsService } from './operations.service';
 
 /**
  * Lo que el middleware de handshake deja en `socket.data` (design.md §D6).
@@ -63,6 +65,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     private readonly socketAuth: SocketAuthService,
     private readonly accessResolver: ProjectAccessResolver,
     private readonly diagramContent: DiagramContentService,
+    private readonly operations: OperationsService,
   ) {}
 
   /**
@@ -211,6 +214,29 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     }
 
     client.data.tokenExp = verified.exp;
+  }
+
+  /**
+   * Handler `op:submit` (`operations-pipeline/design.md` D3). Una línea sin
+   * rama que pueda errarse: `diagramId`/`actorId` AUTORITATIVOS son los de
+   * `socket.data` (del handshake), NUNCA los que pudiera traer el payload —
+   * el pipeline no valida eso porque el gateway ya se lo garantiza. El
+   * despacho por `out.route` no es una decisión de este archivo: la trae el
+   * propio `OperationOutcome`, fijada por quien conoce el motivo
+   * (`OperationsService`). `emitToSocket` es la misma puerta por-socket que
+   * ya usan `diagram:sync`/`access:revoked` (§D8 corregido 2026-09-18) — el
+   * eco de SC-C10 y el rechazo de SC-C11 la reusan en vez de sumar un método
+   * hermano.
+   */
+  @SubscribeMessage('op:submit')
+  async onOperationSubmit(@ConnectedSocket() client: CollabSocket, @MessageBody() req: OperationRequest): Promise<void> {
+    const out = await this.operations.submit(client.data.diagramId, client.data.user.id, req);
+    // `as never`: el precio honesto de que TypeScript no correlaciona `event`
+    // con `payload` en un índice dinámico — un solo `as`, en el sitio de
+    // despacho, cero en las 32 entradas del mapa (design.md D3).
+    out.route === 'room'
+      ? this.emitTo(client.data.diagramId, out.event, out.payload as never)
+      : this.emitToSocket(client, out.event, out.payload as never);
   }
 
   /**
