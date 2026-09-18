@@ -343,7 +343,69 @@ const CHECK_CONSTRAINT_TO_UML_ERROR: Record<string, UmlErrorCode> = {
    */
   ck_assoc_class_not_endpoint: UML_ERROR.ASSOCIATION_CLASS_IS_ENDPOINT,
   ck_assoc_class_only_on_association: UML_ERROR.ASSOCIATION_CLASS_KIND_NOT_ASSOCIATION,
+
+  /**
+   * Diez filas agregadas por `operations-pipeline` (design.md D11; tasks.md
+   * 1.5). Las 48 rutas HTTP ya atajan estas diez con `class-validator` antes
+   * de tocar la base (`@Min(1)`, `@MinLength(1)`, etc.) — el camino del
+   * socket NO tiene esa capa (D11), así que sin esta ampliación un
+   * `element.resize {width:0}` llegaba a `ck_layout_size` → `P2039` →
+   * `resolveCheckViolation` no lo conocía → `null` → `INTERNAL`: un error de
+   * CLIENTE reportado como fallo del SERVIDOR. Resuelven por el MISMO plan A
+   * (regex sobre `cause.originalMessage`, nunca `cause.detail`) que ya
+   * escribió `uml-validation` más abajo (W-4) — sin resolvedor nuevo, sin
+   * segunda lectura de `err.meta` (D11-bis).
+   *
+   * Alcanzable desde el socket vía las operaciones anotadas; `ck_element_named`
+   * queda APARTE de `NAME_REQUIRED` porque su rama `COMMENT` significa "falta
+   * el CUERPO", no "falta el nombre".
+   */
+  /** `element.create`, `element.resize`. */
+  ck_layout_size: UML_ERROR.LAYOUT_SIZE_INVALID,
+  /** `element.create`, `element.rename`. */
+  ck_element_named: UML_ERROR.ELEMENT_NAME_OR_BODY_REQUIRED,
+  /** `feature.create`, `feature.update`. */
+  ck_feature_name: UML_ERROR.NAME_REQUIRED,
+  /** `parameter.add`, `parameter.update`. */
+  ck_parameter_name: UML_ERROR.NAME_REQUIRED,
+  /** `literal.add`. */
+  ck_literal_name: UML_ERROR.NAME_REQUIRED,
+  /** `feature.create`, `feature.update`. */
+  ck_feature_multiplicity: UML_ERROR.FEATURE_MULTIPLICITY_INVALID,
+  /** `feature.create`, `feature.update`. */
+  ck_feature_operation_flags: UML_ERROR.FEATURE_FLAGS_INVALID,
+  /** `feature.create`, `feature.update`. */
+  ck_feature_attribute_flags: UML_ERROR.FEATURE_FLAGS_INVALID,
+  /** `layout.waypoints`. */
+  ck_waypoints_array: UML_ERROR.WAYPOINTS_NOT_ARRAY,
+  /**
+   * `element.setAbstract`. `createElement` también la guarda con un
+   * `BadRequestException` propio ANTES de tocar la base (`dto.isAbstract &&
+   * kind !== 'CLASS'/'INTERFACE'`), pero `setElementAbstract` NO tiene esa
+   * guarda — llega directo a la CHECK. Fila real, no solo red de carrera.
+   */
+  ck_element_abstract: UML_ERROR.ELEMENT_ABSTRACT_NOT_ALLOWED,
 };
+
+/**
+ * Las CUATRO CHECK que se quedan FUERA de la tabla de arriba, y por qué
+ * (design.md D11). Una entrada por una CHECK inalcanzable es ruido que hace
+ * creer que hay cobertura donde no la hay.
+ *
+ * - `ck_end_index`: `loadEnd` hace `findFirst({relationshipId, endIndex})` —
+ *   un `endIndex` fuera de `{0,1}` no encuentra fila y sale por `404`, nunca
+ *   llega a la CHECK.
+ * - `ck_parameter_position_nonneg`: las posiciones las asigna el servidor.
+ *   Mismo criterio que `PARAMETER_POSITION_CONFLICT` — si aparece, es un bug
+ *   y tiene que explotar, no convertirse en un `409`.
+ * - `ck_op_version_positive`, `ck_diagrams_*`: `current_version` arranca en 0
+ *   y solo se incrementa; `lock_state` no se toca en M3.
+ *
+ * `ck_element_not_own_parent` YA NO está en esta lista de exclusión —
+ * `uml-validation` la agregó a la tabla de arriba (`CONTAINMENT_CYCLE`)
+ * porque `setElementParent` SÍ muta `parentId`, y esa mutación ahora tiene su
+ * propio `OperationType` (`element.setParent`, corrección 2026-09-18).
+ */
 
 const KNOWN_CHECK_NAMES = Object.keys(CHECK_CONSTRAINT_TO_UML_ERROR);
 

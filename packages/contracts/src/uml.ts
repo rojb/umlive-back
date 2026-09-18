@@ -614,6 +614,25 @@ export const UML_ERROR = {
   ASSOCIATION_CLASS_IS_ENDPOINT: 'association_class_is_endpoint',
   /** `P2039` sobre `ck_assoc_class_only_on_association`: la relación no es `kind: 'ASSOCIATION'`. */
   ASSOCIATION_CLASS_KIND_NOT_ASSOCIATION: 'association_class_kind_not_association',
+
+  // ── Agregados por `operations-pipeline` (design.md D11) ───────────────────
+  // Las 10 CHECK alcanzables desde el socket que el camino HTTP ya ataja con
+  // `class-validator` y que el camino del socket no tiene (D11). Aditivo:
+  // ningún código existente cambia de valor ni desaparece.
+  /** `ck_layout_size`. Sobre HTTP lo ataja `@Min(1)`; el socket no tiene DTO. */
+  LAYOUT_SIZE_INVALID: 'layout_size_invalid',
+  /** `ck_element_named`. Aparte de NAME_REQUIRED: para un COMMENT significa que falta el CUERPO. */
+  ELEMENT_NAME_OR_BODY_REQUIRED: 'element_name_or_body_required',
+  /** `ck_element_abstract`: solo CLASS e INTERFACE pueden ser abstractas. */
+  ELEMENT_ABSTRACT_NOT_ALLOWED: 'element_abstract_not_allowed',
+  /** `ck_feature_name`, `ck_parameter_name`, `ck_literal_name` — tres CHECK, un solo código. */
+  NAME_REQUIRED: 'name_required',
+  /** `ck_feature_multiplicity`: `lower >= 0` y `upper >= lower`. */
+  FEATURE_MULTIPLICITY_INVALID: 'feature_multiplicity_invalid',
+  /** `ck_feature_operation_flags` + `ck_feature_attribute_flags`: un flag que no aplica a ese tipo de miembro. */
+  FEATURE_FLAGS_INVALID: 'feature_flags_invalid',
+  /** `ck_waypoints_array`: `jsonb_typeof(waypoints) = 'array'`. */
+  WAYPOINTS_NOT_ARRAY: 'waypoints_not_array',
 } as const;
 
 export type UmlErrorCode = (typeof UML_ERROR)[keyof typeof UML_ERROR];
