@@ -179,14 +179,24 @@ export class ElementsService {
    * nueva, no un caso distinto.
    */
   async setElementParent(diagramId: string, elementId: string, dto: SetElementParentDto): Promise<UmlElementView> {
+    // Nota fechada 2026-09-18 (verify-report W-5). Antes de la extracción de
+    // `operations-pipeline` (`14fd124`), `movedName` era una variable de
+    // CIERRE (`let movedName = ''` en este mismo scope, asignada dentro del
+    // callback de `$transaction`, leída acá en el `catch` — las dos partes
+    // compartían función). La extracción D2 separa el cuerpo en
+    // `setElementParentIn(tx, …)`: ese callback ya NO es un closure de este
+    // método, así que `movedName` no puede seguir siendo una variable local
+    // de acá. La solución NO es la relectura post-rollback que hubo entre
+    // `14fd124` y esta corrección (una consulta extra en TODO camino de
+    // error, con riesgo de enmascarar el error original si esa relectura
+    // fallara) — es pasar un receptor mutable que `setElementParentIn`
+    // rellena en el mismo punto donde el cuerpo original hacía la
+    // asignación. El cuerpo de la transacción queda así, de nuevo, línea por
+    // línea idéntico a `14fd124~1` salvo esa única asignación condicional.
+    const moved = { name: '' };
     try {
-      return await this.prisma.$transaction((tx) => this.setElementParentIn(tx, diagramId, elementId, dto));
+      return await this.prisma.$transaction((tx) => this.setElementParentIn(tx, diagramId, elementId, dto, moved));
     } catch (err) {
-      // El nombre para `handleUniqueViolation` se relee DESPUÉS del rollback
-      // (mismo patrón que `deleteElement`, más abajo): la transacción revirtió,
-      // así que el nombre persistido es el mismo que tenía el elemento MOVIDO
-      // antes del intento — no hace falta capturarlo dentro de la transacción.
-      const movedName = (await this.prisma.umlElement.findUnique({ where: { id: elementId }, select: { name: true } }))?.name ?? '';
       if (err instanceof ConflictException) throw err;
       // W-3 (verify-report): la red de carrera de `ck_element_not_own_parent`
       // (D3, `uml-errors.ts`) llega como `P2039`, no `P2002` —
@@ -201,13 +211,14 @@ export class ElementsService {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2039') {
         handleCheckViolation(err);
       }
-      handleUniqueViolation(err, movedName);
+      handleUniqueViolation(err, moved.name);
     }
   }
 
-  async setElementParentIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementParentDto): Promise<UmlElementView> {
+  async setElementParentIn(tx: Tx, diagramId: string, elementId: string, dto: SetElementParentDto, moved?: { name: string }): Promise<UmlElementView> {
     await assertElementInDiagram(tx, elementId, diagramId);
     const child = await tx.umlElement.findUniqueOrThrow({ where: { id: elementId }, select: { kind: true, name: true } });
+    if (moved) moved.name = child.name ?? '';
 
     if (dto.parentId !== null) {
       await assertElementInDiagram(tx, dto.parentId, diagramId);
