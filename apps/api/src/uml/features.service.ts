@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import type { UmlFeatureView } from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import type { Tx } from '../prisma/tx.type';
 import { assertElementInDiagram, assertFeatureInDiagram } from './diagram-scope';
 import type { AddFeatureDto } from './dto/add-feature.dto';
 import type { ReorderFeaturesDto } from './dto/reorder-features.dto';
@@ -25,69 +26,75 @@ export class FeaturesService {
    */
   async addFeature(diagramId: string, elementId: string, dto: AddFeatureDto): Promise<UmlFeatureView> {
     try {
-      return await this.prisma.$transaction(async (tx) => {
-        await assertElementInDiagram(tx, elementId, diagramId);
-        const agg = await tx.umlFeature.aggregate({ where: { ownerId: elementId }, _max: { position: true } });
-        const position = (agg._max.position ?? -1) + 1;
-        const created = await tx.umlFeature.create({
-          data: {
-            ownerId: elementId,
-            kind: dto.kind,
-            name: dto.name,
-            visibility: dto.visibility,
-            typeElementId: dto.typeElementId ?? null,
-            typeName: dto.typeName ?? null,
-            lowerBound: dto.lowerBound ?? 1,
-            upperBound: dto.upperBound === undefined ? 1 : dto.upperBound,
-            isStatic: dto.isStatic ?? false,
-            isReadonly: dto.isReadonly ?? false,
-            isDerived: dto.isDerived ?? false,
-            isAbstract: dto.isAbstract ?? false,
-            isQuery: dto.isQuery ?? false,
-            defaultValue: dto.defaultValue ?? null,
-            position,
-          },
-        });
-        return toFeatureView(created);
-      });
+      return await this.prisma.$transaction((tx) => this.addFeatureIn(tx, diagramId, elementId, dto));
     } catch (err) {
       handleUniqueViolation(err, dto.name);
     }
   }
 
+  async addFeatureIn(tx: Tx, diagramId: string, elementId: string, dto: AddFeatureDto): Promise<UmlFeatureView> {
+    await assertElementInDiagram(tx, elementId, diagramId);
+    const agg = await tx.umlFeature.aggregate({ where: { ownerId: elementId }, _max: { position: true } });
+    const position = (agg._max.position ?? -1) + 1;
+    const created = await tx.umlFeature.create({
+      data: {
+        ownerId: elementId,
+        kind: dto.kind,
+        name: dto.name,
+        visibility: dto.visibility,
+        typeElementId: dto.typeElementId ?? null,
+        typeName: dto.typeName ?? null,
+        lowerBound: dto.lowerBound ?? 1,
+        upperBound: dto.upperBound === undefined ? 1 : dto.upperBound,
+        isStatic: dto.isStatic ?? false,
+        isReadonly: dto.isReadonly ?? false,
+        isDerived: dto.isDerived ?? false,
+        isAbstract: dto.isAbstract ?? false,
+        isQuery: dto.isQuery ?? false,
+        defaultValue: dto.defaultValue ?? null,
+        position,
+      },
+    });
+    return toFeatureView(created);
+  }
+
   async updateFeature(diagramId: string, featureId: string, dto: UpdateFeatureDto): Promise<UmlFeatureView> {
     try {
-      return await this.prisma.$transaction(async (tx) => {
-        await assertFeatureInDiagram(tx, featureId, diagramId);
-        const updated = await tx.umlFeature.update({
-          where: { id: featureId },
-          data: {
-            name: dto.name,
-            visibility: dto.visibility,
-            typeElementId: dto.typeElementId,
-            typeName: dto.typeName,
-            lowerBound: dto.lowerBound,
-            upperBound: dto.upperBound,
-            isStatic: dto.isStatic,
-            isReadonly: dto.isReadonly,
-            isDerived: dto.isDerived,
-            isAbstract: dto.isAbstract,
-            isQuery: dto.isQuery,
-            defaultValue: dto.defaultValue,
-          },
-        });
-        return toFeatureView(updated);
-      });
+      return await this.prisma.$transaction((tx) => this.updateFeatureIn(tx, diagramId, featureId, dto));
     } catch (err) {
       handleUniqueViolation(err, dto.name ?? '');
     }
   }
 
-  async removeFeature(diagramId: string, featureId: string): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      await assertFeatureInDiagram(tx, featureId, diagramId);
-      await tx.umlFeature.delete({ where: { id: featureId } });
+  async updateFeatureIn(tx: Tx, diagramId: string, featureId: string, dto: UpdateFeatureDto): Promise<UmlFeatureView> {
+    await assertFeatureInDiagram(tx, featureId, diagramId);
+    const updated = await tx.umlFeature.update({
+      where: { id: featureId },
+      data: {
+        name: dto.name,
+        visibility: dto.visibility,
+        typeElementId: dto.typeElementId,
+        typeName: dto.typeName,
+        lowerBound: dto.lowerBound,
+        upperBound: dto.upperBound,
+        isStatic: dto.isStatic,
+        isReadonly: dto.isReadonly,
+        isDerived: dto.isDerived,
+        isAbstract: dto.isAbstract,
+        isQuery: dto.isQuery,
+        defaultValue: dto.defaultValue,
+      },
     });
+    return toFeatureView(updated);
+  }
+
+  async removeFeature(diagramId: string, featureId: string): Promise<void> {
+    await this.prisma.$transaction((tx) => this.removeFeatureIn(tx, diagramId, featureId));
+  }
+
+  async removeFeatureIn(tx: Tx, diagramId: string, featureId: string): Promise<void> {
+    await assertFeatureInDiagram(tx, featureId, diagramId);
+    await tx.umlFeature.delete({ where: { id: featureId } });
   }
 
   /**
@@ -99,25 +106,27 @@ export class FeaturesService {
    * que sí necesita `reorderParameters`.
    */
   async reorderFeatures(diagramId: string, elementId: string, dto: ReorderFeaturesDto): Promise<UmlFeatureView[]> {
-    return this.prisma.$transaction(async (tx) => {
-      await assertElementInDiagram(tx, elementId, diagramId);
-      if (dto.orderedFeatureIds.length > 0) {
-        // `::int` explícito en `idx`: forzado contra la base real (hallazgo
-        // de esta unidad de trabajo, ver `ParametersService.reorderParameters`)
-        // — sin el cast, `@prisma/adapter-pg` manda el parámetro como `text`
-        // y Postgres rechaza el `UPDATE` con 42804 antes de tocar una fila.
-        const values = dto.orderedFeatureIds.map((id, idx) => Prisma.sql`(${id}::uuid, ${idx}::int)`);
-        await tx.$executeRaw`
-          UPDATE uml_features f SET position = v.pos
-          FROM (VALUES ${Prisma.join(values)}) AS v(id, pos)
-          WHERE f.id = v.id AND f.owner_id = ${elementId}::uuid
-        `;
-      }
-      const rows = await tx.umlFeature.findMany({
-        where: { ownerId: elementId },
-        orderBy: [{ kind: 'asc' }, { position: 'asc' }],
-      });
-      return rows.map((r) => toFeatureView(r));
+    return this.prisma.$transaction((tx) => this.reorderFeatureIn(tx, diagramId, elementId, dto));
+  }
+
+  async reorderFeatureIn(tx: Tx, diagramId: string, elementId: string, dto: ReorderFeaturesDto): Promise<UmlFeatureView[]> {
+    await assertElementInDiagram(tx, elementId, diagramId);
+    if (dto.orderedFeatureIds.length > 0) {
+      // `::int` explícito en `idx`: forzado contra la base real (hallazgo
+      // de esta unidad de trabajo, ver `ParametersService.reorderParameters`)
+      // — sin el cast, `@prisma/adapter-pg` manda el parámetro como `text`
+      // y Postgres rechaza el `UPDATE` con 42804 antes de tocar una fila.
+      const values = dto.orderedFeatureIds.map((id, idx) => Prisma.sql`(${id}::uuid, ${idx}::int)`);
+      await tx.$executeRaw`
+        UPDATE uml_features f SET position = v.pos
+        FROM (VALUES ${Prisma.join(values)}) AS v(id, pos)
+        WHERE f.id = v.id AND f.owner_id = ${elementId}::uuid
+      `;
+    }
+    const rows = await tx.umlFeature.findMany({
+      where: { ownerId: elementId },
+      orderBy: [{ kind: 'asc' }, { position: 'asc' }],
     });
+    return rows.map((r) => toFeatureView(r));
   }
 }
