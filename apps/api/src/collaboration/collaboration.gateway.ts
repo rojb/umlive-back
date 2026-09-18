@@ -9,10 +9,14 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import {
+  PRESENCE_COLORS,
   PROJECT_ERROR,
+  presenceColor,
   type ClientEvents,
+  type LockHolder,
   type OperationRejected,
   type OperationRequest,
+  type PresenceUser,
   type ProjectRole,
   type ServerEvents,
   type SocketHandshakeAuth,
@@ -23,13 +27,16 @@ import type { Server, Socket } from 'socket.io';
 import type { CurrentUserPayload } from '../auth/current-user.decorator';
 import { SocketAuthService } from '../auth/socket-auth.service';
 import { ProjectAccessResolver, type ProjectAccessResult } from '../projects/project-access.resolver';
+import { LocksService } from './locks.service';
 import { OperationsService } from './operations.service';
+import { buildRoster, pickColor } from './presence';
 import { ReconnectService } from './reconnect.service';
 
 /**
- * Lo que el middleware de handshake deja en `socket.data` (design.md §D6).
- * **Ninguna** estructura propia de conteo por `userId` acá ni en ningún otro
- * punto del archivo — la sala ES la room de Socket.IO, poblada por socket.
+ * Lo que el middleware de handshake deja en `socket.data` (design.md §D6) más
+ * lo que esta rebanada agrega (`reconnect-and-presence/design.md` §6) —
+ * ningún `Map` nuevo por-usuario: `color`/`presence`/`lastCursorAt` viven y
+ * mueren con el socket.
  */
 interface SocketData {
   user: CurrentUserPayload;
@@ -37,7 +44,17 @@ interface SocketData {
   diagramId: string;
   /** Segundos epoch — del JWT (`exp`), no de `Date.now()`. */
   tokenExp: number;
+  /** Asignado por sala en `diagram:join` (design.md §D7) — la FUENTE del color, nunca `presenceColor(userId)` salvo último recurso. */
+  color?: string;
+  /** Marca "entró a la sala" — `teardown` lo lee y lo borra (design.md §D2). Ausente hasta que `diagram:join` complete (Fase 4). */
+  presence?: PresenceUser;
+  /** Piso de 20ms por socket para `presence:cursor` (design.md §D10). */
+  lastCursorAt?: number;
 }
+
+/** Constantes de módulo (design.md §6) — una sola forma correcta, no configuración. */
+const CURSOR_MIN_INTERVAL_MS = 20;
+const MAX_ID_BATCH = 200;
 
 type CollabSocket = Socket<ClientEvents, ServerEvents, Record<string, never>, SocketData>;
 type CollabServer = Server<ClientEvents, ServerEvents, Record<string, never>, SocketData>;
@@ -51,11 +68,12 @@ const SOCKET_AUTH_SWEEP_INTERVAL_MS = 10_000;
  * Transporte WebSocket de M3. Middleware de handshake (`collaboration-gateway`
  * D1/D3), gate de membresía a `diagram:join` (D3), renovación de sesión sin
  * reconectar (D5), contabilidad de sala por socket (D6). `diagram:sync` honra
- * `lastVersion` vía `ReconnectService` — delta o estado completo según el
- * hueco (`reconnect-and-presence/design.md` §D3-D6, rebanada 3 de 4). **Sin**
- * `LocksService` todavía (D7 de la rebanada 1) — el protocolo `lock:*`/
- * `presence:*` y `teardown` bajo INV-WS-1 se cablean en la Fase 3 de esta
- * misma rebanada.
+ * `lastVersion` vía `ReconnectService` (`reconnect-and-presence/design.md`
+ * §D3-D6). `LocksService` cablea el protocolo `lock:*` SIN exigencia (D7 —
+ * `canWrite()` es M4) y `teardown` libera bajo INV-WS-1 en `handleDisconnect`
+ * y `diagram:leave` (§D2). Color por sala y `presence:roster`/`joined` se
+ * agregan en `diagram:join` (§D7-D8) junto con `presence:cursor`/`select` vía
+ * `emitToOthers` (§D9-D10).
  */
 @WebSocketGateway()
 export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGatewayDisconnect<CollabSocket> {
@@ -95,6 +113,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     private readonly accessResolver: ProjectAccessResolver,
     private readonly operations: OperationsService,
     private readonly reconnect: ReconnectService,
+    private readonly locks: LocksService,
   ) {}
 
   /**
@@ -146,17 +165,28 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     this.sweeper = setInterval(() => this.sweepExpired(), SOCKET_AUTH_SWEEP_INTERVAL_MS);
     // No debe mantener vivo el proceso (mismo patrón que `locks.service.ts`).
     this.sweeper.unref?.();
+
+    // `setReleaseListener` es un SETTER de un solo slot (`locks.service.ts:63`
+    // — `this.onRelease = fn`), no un acumulador. Se registra UNA SOLA VEZ,
+    // acá en `afterInit`. Nota fechada 2026-09-18 (reconnect-and-presence/
+    // design.md §D10): si M4 necesita un segundo oyente, tiene que COMPONER
+    // — un segundo `setReleaseListener` reemplaza a este en silencio y las
+    // liberaciones dejan de llegar a la sala.
+    this.locks.setReleaseListener((diagramId, elementId, cause) => {
+      this.emitTo(diagramId, 'lock:released', { elementId, cause });
+    });
   }
 
   /**
-   * `handleDisconnect` NO llama a `LocksService` (design.md §D7): no hay
-   * handler `lock:request` todavía, así que el registro de locks está
-   * siempre vacío, y el alcance GLOBAL de `releaseAllForUser` soltaría locks
-   * vivos de otras ventanas del mismo usuario si alguna vez tuviera efecto —
-   * el defecto de contabilidad por usuario (D6) entrando por la puerta de
-   * atrás. Cablearlo es tarea de la rebanada 3, junto con INV-WS-1 y el
-   * protocolo `lock:*` completo. Lo único que SÍ limpia acá (verify-report
-   * W-3, `operations-pipeline`) es la cola por-socket de `op:submit`.
+   * `teardown` cablea `LocksService` (reconnect-and-presence/design.md §D2):
+   * único, compartido por `handleDisconnect` y `diagram:leave`. Cuenta
+   * sockets del MISMO `userId` en la sala vía `fetchSockets()` — INV-WS-1,
+   * nunca un contador propio — y solo libera/anuncia si este socket era el
+   * ÚLTIMO de ese usuario en esa sala. `releaseAllForUser` (alcance GLOBAL)
+   * fue ELIMINADO de `locks.service.ts`: bajo D3 (un socket = un diagrama)
+   * + D6 (contabilidad por socket) de `collaboration-gateway`, cerrar una
+   * de cuatro ventanas del mismo usuario habría soltado los locks de las
+   * otras tres y los de todos los diagramas de todos sus proyectos.
    */
   handleDisconnect(client: CollabSocket): void {
     // W-3: soltar la cola de este socket. Sin esto, `socketQueues` crece sin
@@ -165,6 +195,142 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     this.socketQueues.delete(client.id);
     // RS-4: mismo motivo, para el contador de profundidad.
     this.socketQueueDepth.delete(client.id);
+
+    void this.teardown(client);
+  }
+
+  /**
+   * Salir por la puerta, en vez de caerse. Sin esto, `diagram:leave`
+   * (`events.ts:15`, en el contrato desde la rebanada 1 sin comportamiento
+   * asignado) dejaría los locks tomados hasta el TTL y al usuario colgado
+   * en el roster de los otros tres — el mismo defecto que INV-WS-1 evita en
+   * la desconexión, por la otra puerta.
+   */
+  @SubscribeMessage('diagram:leave')
+  async handleLeave(@ConnectedSocket() client: CollabSocket): Promise<void> {
+    await this.teardown(client);
+    await client.leave(this.roomOf(client.data.diagramId));
+  }
+
+  /**
+   * Único, compartido por `handleDisconnect` y `diagram:leave` (design.md
+   * §D2). Tres detalles que no son cosméticos:
+   *
+   * 1. 🔴 El filtro `s.id !== socket.id` es OBLIGATORIO, no defensivo. En
+   *    Socket.IO el socket abandona sus salas entre `disconnecting` y
+   *    `disconnect`, así que en teoría `fetchSockets()` ya no lo incluye —
+   *    pero el momento exacto en que corre `handleDisconnect` de Nest
+   *    respecto de ese vaciado no es algo sobre lo que convenga apostar la
+   *    demo, y `diagram:leave` corre con el socket TODAVÍA adentro de la
+   *    sala. Sin el filtro, `diagram:leave` NUNCA soltaría nada: el usuario
+   *    siempre se encontraría a sí mismo.
+   * 2. El orden importa: primero se sueltan los locks (cada uno emite su
+   *    propio `lock:released` a la sala, vía `setReleaseListener`),
+   *    DESPUÉS `presence:left`. Al revés, los otros clientes borrarían al
+   *    usuario del roster y recién después recibirían liberaciones de
+   *    alguien que ya no existe para ellos — bordes huérfanos.
+   * 3. Idempotente: `socket.data.presence = undefined` antes de decidir,
+   *    así que `diagram:leave` seguido de `disconnect` (o viceversa) no
+   *    duplica el trabajo.
+   */
+  private async teardown(socket: CollabSocket): Promise<void> {
+    const presence = socket.data.presence;
+    const diagramId = socket.data.diagramId;
+    if (!presence || !diagramId) return; // nunca entró a la sala (diagram:join): nada que soltar
+
+    socket.data.presence = undefined;
+
+    const peers = await this.server.in(this.roomOf(diagramId)).fetchSockets();
+    const otro = peers.some((s) => s.id !== socket.id && s.data?.user?.id === presence.userId);
+    if (otro) return; // INV-WS-1: no era el último socket de este usuario en esta sala
+
+    // `cause: 'disconnected'` para los dos llamadores — `diagram:leave` no
+    // es un motivo distinto en el contrato (`LockReleased['cause']`): desde
+    // la perspectiva de los locks, salir por la puerta y caerse producen el
+    // mismo efecto observable.
+    this.locks.releaseAllForUserInDiagrams(presence.userId, [diagramId], 'disconnected');
+    this.emitTo(diagramId, 'presence:left', { userId: presence.userId });
+  }
+
+  /**
+   * `lock:request` (design.md §D7). SIN `async`: `socket.data.diagramId` y
+   * `socket.data.color` ya están resueltos desde `diagram:join`, así que
+   * todo el handler es síncrono — es la razón por la que el color se
+   * calcula AL UNIRSE y no acá (un `await fetchSockets()` en este camino
+   * destruiría la atomicidad de `acquire` que resuelve SC-C03).
+   * `socket.data.diagramId` es la autoridad exclusiva: el `diagramId` del
+   * payload NUNCA se lee.
+   */
+  @SubscribeMessage('lock:request')
+  onLockRequest(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementId: string }): void {
+    if (typeof payload?.elementId !== 'string' || !isUUID(payload.elementId)) {
+      this.logger.warn(`lock:request con elementId malformado de ${client.id}`);
+      return;
+    }
+    const diagramId = client.data.diagramId;
+    const holder: LockHolder = {
+      userId: client.data.user.id,
+      displayName: client.data.user.displayName,
+      color: client.data.color ?? '',
+    };
+    const outcome = this.locks.acquire(diagramId, payload.elementId, holder);
+    if (outcome.ok) {
+      this.emitTo(diagramId, 'lock:granted', {
+        elementId: payload.elementId,
+        holder,
+        expiresAt: new Date(outcome.expiresAt).toISOString(),
+      });
+    } else {
+      this.emitToSocket(client, 'lock:denied', { elementId: payload.elementId, holder: outcome.holder });
+    }
+  }
+
+  /** `lock:release` — mismo patrón síncrono, misma autoridad exclusiva de `socket.data.diagramId`. */
+  @SubscribeMessage('lock:release')
+  onLockRelease(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementId: string }): void {
+    if (typeof payload?.elementId !== 'string' || !isUUID(payload.elementId)) {
+      this.logger.warn(`lock:release con elementId malformado de ${client.id}`);
+      return;
+    }
+    this.locks.release(client.data.diagramId, payload.elementId, client.data.user.id, 'released');
+  }
+
+  /** `lock:heartbeat` — mismo patrón síncrono. Sin acuse a propósito (design.md §D10): compensado por `lock:released` del barrido/relevo. */
+  @SubscribeMessage('lock:heartbeat')
+  onLockHeartbeat(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementIds: string[] }): void {
+    if (!Array.isArray(payload?.elementIds) || payload.elementIds.length > MAX_ID_BATCH || !payload.elementIds.every((id) => typeof id === 'string' && isUUID(id))) {
+      this.logger.warn(`lock:heartbeat malformado o por encima del tope de ${client.id}`);
+      return;
+    }
+    this.locks.heartbeat(client.data.diagramId, payload.elementIds, client.data.user.id);
+  }
+
+  /**
+   * `presence:cursor` — solo `emitToOthers` (design.md §D9), `volatile` y
+   * con piso de 20ms por socket (§D10) independiente del estrangulado del
+   * cliente. `NaN`/`Infinity` en `x`/`y` se descartan sin emitir.
+   */
+  @SubscribeMessage('presence:cursor')
+  onPresenceCursor(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { x: number; y: number }): void {
+    if (typeof payload?.x !== 'number' || typeof payload?.y !== 'number' || !Number.isFinite(payload.x) || !Number.isFinite(payload.y)) {
+      this.logger.warn(`presence:cursor malformado de ${client.id}`);
+      return;
+    }
+    const now = Date.now();
+    const last = client.data.lastCursorAt ?? 0;
+    if (now - last < CURSOR_MIN_INTERVAL_MS) return;
+    client.data.lastCursorAt = now;
+    this.emitToOthers(client, 'presence:cursor', { userId: client.data.user.id, x: payload.x, y: payload.y }, { volatile: true });
+  }
+
+  /** `presence:select` — `emitToOthers`, NUNCA volátil: dispara por gesto, no por movimiento (design.md §D9). */
+  @SubscribeMessage('presence:select')
+  onPresenceSelect(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementIds: string[] }): void {
+    if (!Array.isArray(payload?.elementIds) || payload.elementIds.length > MAX_ID_BATCH || !payload.elementIds.every((id) => typeof id === 'string' && isUUID(id))) {
+      this.logger.warn(`presence:select malformado o por encima del tope de ${client.id}`);
+      return;
+    }
+    this.emitToOthers(client, 'presence:select', { userId: client.data.user.id, elementIds: payload.elementIds });
   }
 
   /**
@@ -201,6 +367,39 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // deja de ser completo y nada falla ruidosamente.
     await client.join(this.roomOf(client.data.diagramId));
 
+    const diagramId = client.data.diagramId;
+    const userId = client.data.user.id;
+
+    // Color por sala + roster (design.md §D7-D8). `fetchSockets()` YA
+    // incluye a este socket (recién se unió arriba). Se filtra a sí mismo
+    // para decidir "¿ya tenía otra ventana acá?" y para armar la lista de
+    // colores tomados por OTROS.
+    const peers = await this.server.in(this.roomOf(diagramId)).fetchSockets();
+    const others = peers.filter((s) => s.id !== client.id);
+    const ownPeer = others.find((s) => s.data?.user?.id === userId);
+    const takenColors = others.map((s) => s.data?.color).filter((c): c is string => Boolean(c));
+    const color = pickColor(ownPeer?.data.color, takenColors, PRESENCE_COLORS, () => presenceColor(userId));
+    client.data.color = color;
+
+    const heldElementIds = this.locks.heldBy(userId, diagramId);
+    client.data.presence = { userId, displayName: client.data.user.displayName, color, heldElementIds };
+
+    // Roster completo, dirigido SOLO a quien se une, deduplicado por
+    // `userId` — la primera aparición (este socket, o su ventana anterior
+    // si `ownPeer` existe) gana el color de referencia.
+    const entries = [{ userId, displayName: client.data.user.displayName, color }, ...others.map((s) => ({ userId: s.data.user.id, displayName: s.data.user.displayName, color: s.data.color ?? presenceColor(s.data.user.id) }))];
+    const roster = buildRoster(entries, (uid) => this.locks.heldBy(uid, diagramId));
+    this.emitToSocket(client, 'presence:roster', roster);
+
+    // `presence:joined` SOLO si este socket es el primero de ese `userId`
+    // en la sala — mismo gate INV-WS-1 que `presence:left` (design.md §D8):
+    // la propuesta solo declaraba la mitad simétrica (`left`). Sin esto,
+    // abrir la segunda ventana de un usuario dispara un "llegó" falso en
+    // las pantallas de los demás para alguien que ya estaba.
+    if (!ownPeer) {
+      this.emitTo(diagramId, 'presence:joined', { userId, displayName: client.data.user.displayName, color, heldElementIds });
+    }
+
     // `lastVersion` ahora se HONRA (design.md §D4/§D9 — ya no se descarta):
     // `ReconnectService.sync` decide delta vs. estado completo por el hueco.
     //
@@ -209,7 +408,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // sync completo a los demás miembros en cada join — costo innecesario y
     // la vía por la que W-2 encontró que un expulsado seguía recibiendo
     // contenido.
-    const sync = await this.reconnect.sync(client.data.diagramId, payload.lastVersion);
+    const sync = await this.reconnect.sync(diagramId, payload.lastVersion);
     this.emitToSocket(client, 'diagram:sync', sync);
   }
 
@@ -440,6 +639,24 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   /** Puerta de salida por SOCKET individual — ver la nota de `emitTo` de arriba. */
   private emitToSocket<E extends keyof ServerEvents>(client: CollabSocket, event: E, ...payload: Parameters<ServerEvents[E]>): void {
     client.emit(event, ...payload);
+  }
+
+  /**
+   * Puerta de salida por SALA MENOS EL REMITENTE (reconnect-and-presence/
+   * design.md §D9) — TERCERA ruta, no un bypass de `emitTo`. La sala sale de
+   * `client.data.diagramId`, NUNCA del payload que el cliente pudo mandar.
+   * Solo `presence:cursor`/`presence:select` usan esta puerta; escribir un
+   * `socket.to(room).emit(...)` crudo en cualquier otro punto del archivo
+   * sería el primer agujero en esta invariante.
+   */
+  private emitToOthers<E extends keyof ServerEvents>(
+    client: CollabSocket,
+    event: E,
+    payload: Parameters<ServerEvents[E]>[0],
+    opts?: { volatile?: boolean },
+  ): void {
+    const channel = client.to(this.roomOf(client.data.diagramId));
+    (opts?.volatile ? channel.volatile : channel).emit(event, ...([payload] as Parameters<ServerEvents[E]>));
   }
 
   /**
