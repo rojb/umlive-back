@@ -439,6 +439,76 @@ export interface SetRelationshipAnchorsRequest {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// AMPLIADO por `uml-validation` (M2, rebanada 3 de 3 — fase 1)
+// ─────────────────────────────────────────────────────────────────────────────
+// Se AGREGA sobre lo existente, mismo criterio que `uml-relationships` arriba.
+// Diseño: `openspec/changes/uml-validation/design.md` §3, §6, D10.
+// Especificación: `.../specs/uml-validation-backend/spec.md`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface SetElementParentRequest {
+  parentId: string | null;
+}
+
+export interface SetElementStereotypeRequest {
+  stereotype: string | null;
+}
+
+export interface SetElementBodyRequest {
+  body: string;
+}
+
+/** Cuerpo idéntico al de elemento — misma normalización en las dos rutas (D10). */
+export interface SetRelationshipStereotypeRequest {
+  stereotype: string | null;
+}
+
+/** Tope tras normalizar (design.md D10, spec "Estereotipo de texto libre"). */
+export const MAX_STEREOTYPE_LENGTH = 64;
+
+/**
+ * Lanzada por `normalizeStereotype()` cuando el valor normalizado supera
+ * `MAX_STEREOTYPE_LENGTH`. Clase propia, sin depender de ningún framework
+ * (`packages/contracts` es "solo tipos y constantes, sin dependencias de
+ * ejecución" — D5): el servidor la atrapa y la traduce a
+ * `409 { code: 'stereotype_invalid' }`; M5 (importación XMI), que llama a
+ * esta misma función fuera de los DTOs de esta rebanada, decide su propio
+ * manejo.
+ */
+export class StereotypeTooLongError extends Error {
+  constructor(public readonly normalizedLength: number) {
+    super(`stereotype excede ${MAX_STEREOTYPE_LENGTH} caracteres tras normalizar (largo: ${normalizedLength})`);
+    this.name = 'StereotypeTooLongError';
+  }
+}
+
+/**
+ * `trim` → quitar **un** par envolvente `«…»` → `trim` otra vez → `null` si
+ * queda vacío → lanza `StereotypeTooLongError` si supera
+ * `MAX_STEREOTYPE_LENGTH` tras normalizar (design.md D10). Los `«»` son
+ * NOTACIÓN — el lienzo los agrega al dibujar; guardarlos haría de `entity` y
+ * `«entity»` dos estereotipos distintos y filtraría presentación al XMI de
+ * M5. Sin lista blanca ni normalización de mayúsculas (PRD §599).
+ *
+ * PURA, sin dependencias: el servidor la llama en `setElementStereotype`/
+ * `setRelationshipStereotype` (mismas dos rutas), y M5 la llama otra vez al
+ * escribir esta columna al importar XMI, fuera de estos DTOs.
+ */
+export function normalizeStereotype(raw: string | null): string | null {
+  if (raw === null) return null;
+
+  let value = raw.trim();
+  if (value.length >= 2 && value.startsWith('«') && value.endsWith('»')) {
+    value = value.slice(1, -1).trim();
+  }
+  if (value.length === 0) return null;
+  if (value.length > MAX_STEREOTYPE_LENGTH) {
+    throw new StereotypeTooLongError(value.length);
+  }
+  return value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Errores propios de esta rebanada (design.md §6)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -478,6 +548,26 @@ export const UML_ERROR = {
    * `{ code, count, relationships: IncidentRelationshipView[] }`.
    */
   ELEMENT_HAS_RELATIONSHIPS: 'element_has_relationships',
+
+  // ── Agregados por `uml-validation` (design.md §3, D3, D4, D10) ────────────
+  /**
+   * `setElementParent`: el `parentId` propuesto está dentro del subárbol de
+   * descendientes del elemento (incluido `parentId === elementId`), o
+   * `ck_element_not_own_parent` alcanzado por una carrera (D3, `uml-errors.ts`).
+   */
+  CONTAINMENT_CYCLE: 'containment_cycle',
+  /**
+   * `setElementParent`: el `kind` del padre propuesto no admite al hijo por
+   * su `kind` (D4). Cuerpo: `{ code, parentKind }`.
+   */
+  INVALID_PARENT_KIND: 'invalid_parent_kind',
+  /** `setElementBody` sobre un elemento que no es `kind: 'COMMENT'` (§3). */
+  BODY_REQUIRES_COMMENT: 'body_requires_comment',
+  /**
+   * `setElementStereotype`/`setRelationshipStereotype`: el valor supera
+   * `MAX_STEREOTYPE_LENGTH` tras `normalizeStereotype()` (D10).
+   */
+  STEREOTYPE_INVALID: 'stereotype_invalid',
 } as const;
 
 export type UmlErrorCode = (typeof UML_ERROR)[keyof typeof UML_ERROR];

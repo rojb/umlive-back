@@ -9,6 +9,7 @@ import { SetEndMultiplicityDto } from './dto/set-end-multiplicity.dto';
 import { SetEndNavigabilityDto } from './dto/set-end-navigability.dto';
 import { SetEndRoleNameDto } from './dto/set-end-role-name.dto';
 import { SetRelationshipAnchorsDto } from './dto/set-relationship-anchors.dto';
+import { SetRelationshipStereotypeDto } from './dto/set-relationship-stereotype.dto';
 import { SetRelationshipWaypointsDto } from './dto/set-relationship-waypoints.dto';
 import { RelationshipsService, type RelationshipMutationResult } from './relationships.service';
 
@@ -55,6 +56,17 @@ export class RelationshipsController {
     @Body() dto: RenameRelationshipDto,
   ): Promise<UmlRelationshipView> {
     return this.relationships.renameRelationship(diagramId, relationshipId, dto);
+  }
+
+  /** `uml-validation` fase 1 (design.md D10, Hallazgo "la propuesta se olvidó de una ruta"; tasks.md 1.8). */
+  @Patch(':relationshipId/stereotype')
+  @RequiresProjectAction('diagram.edit')
+  setStereotype(
+    @Param('diagramId', ParseUUIDPipe) diagramId: string,
+    @Param('relationshipId', ParseUUIDPipe) relationshipId: string,
+    @Body() dto: SetRelationshipStereotypeDto,
+  ): Promise<UmlRelationshipView> {
+    return this.relationships.setRelationshipStereotype(diagramId, relationshipId, dto);
   }
 
   @Patch(':relationshipId/source')

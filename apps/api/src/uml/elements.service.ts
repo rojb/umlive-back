@@ -1,5 +1,12 @@
 import { ConflictException, Injectable } from '@nestjs/common';
-import { UML_ERROR, type ElementLayoutView, type IncidentRelationshipView, type UmlElementView } from '@umlive/contracts';
+import {
+  normalizeStereotype,
+  StereotypeTooLongError,
+  UML_ERROR,
+  type ElementLayoutView,
+  type IncidentRelationshipView,
+  type UmlElementView,
+} from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { assertElementInDiagram } from './diagram-scope';
@@ -9,6 +16,9 @@ import type { MoveElementDto } from './dto/move-element.dto';
 import type { RenameElementDto } from './dto/rename-element.dto';
 import type { ResizeElementDto } from './dto/resize-element.dto';
 import type { SetElementAbstractDto } from './dto/set-element-abstract.dto';
+import type { SetElementBodyDto } from './dto/set-element-body.dto';
+import type { SetElementParentDto } from './dto/set-element-parent.dto';
+import type { SetElementStereotypeDto } from './dto/set-element-stereotype.dto';
 import { toElementView, toLayoutView } from './uml-mappers';
 import { handleUniqueViolation } from './uml-errors';
 
@@ -72,6 +82,99 @@ export class ElementsService {
     return this.prisma.$transaction(async (tx) => {
       await assertElementInDiagram(tx, elementId, diagramId);
       const updated = await tx.umlElement.update({ where: { id: elementId }, data: { isAbstract: dto.isAbstract } });
+      return toElementView(updated);
+    });
+  }
+
+  /**
+   * `uml-validation` fase 1 (design.md D1, D3, D4; tasks.md 1.6). Orden fijo
+   * DENTRO de la misma transacción que el `UPDATE`, nunca antes de abrirla
+   * (spec "Package como contenedor"): pertenencia al diagrama (elemento y
+   * padre propuesto) → regla de padre por `kind` DEL HIJO (D4, no del padre)
+   * → `409 invalid_parent_kind` si falla → guarda de ciclo de contención
+   * (`collectSubtreeIds`, D1) → `409 containment_cycle` → `UPDATE`,
+   * envuelto en `handleUniqueViolation` con el nombre del elemento MOVIDO
+   * (no el del contenedor destino) — mover `Order` a un paquete que ya
+   * tiene un `Order` es el `element_name_taken` de siempre por una ruta
+   * nueva, no un caso distinto.
+   */
+  async setElementParent(diagramId: string, elementId: string, dto: SetElementParentDto): Promise<UmlElementView> {
+    let movedName = '';
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        await assertElementInDiagram(tx, elementId, diagramId);
+        const child = await tx.umlElement.findUniqueOrThrow({ where: { id: elementId }, select: { kind: true, name: true } });
+        movedName = child.name ?? '';
+
+        if (dto.parentId !== null) {
+          await assertElementInDiagram(tx, dto.parentId, diagramId);
+          const parent = await tx.umlElement.findUniqueOrThrow({ where: { id: dto.parentId }, select: { kind: true } });
+
+          // D4: la regla se decide por el `kind` del HIJO, no del padre.
+          // `COMMENT` admite cualquier no-`COMMENT` (o `null`); los otros
+          // seis admiten solo `PACKAGE` (o `null`).
+          const parentAllowed = child.kind === 'COMMENT' ? parent.kind !== 'COMMENT' : parent.kind === 'PACKAGE';
+          if (!parentAllowed) {
+            throw new ConflictException({ code: UML_ERROR.INVALID_PARENT_KIND, parentKind: parent.kind });
+          }
+
+          // El root (`elementId`) se incluye en `collectSubtreeIds` (D1) —
+          // cubre el autolazo (`parentId === elementId`) con el mismo
+          // rechazo que un ciclo más largo.
+          const subtreeIds = await collectSubtreeIds(tx, elementId);
+          if (subtreeIds.includes(dto.parentId)) {
+            throw new ConflictException({ code: UML_ERROR.CONTAINMENT_CYCLE });
+          }
+        }
+
+        const updated = await tx.umlElement.update({ where: { id: elementId }, data: { parentId: dto.parentId } });
+        return toElementView(updated);
+      });
+    } catch (err) {
+      if (err instanceof ConflictException) throw err;
+      handleUniqueViolation(err, movedName);
+    }
+  }
+
+  /**
+   * `uml-validation` fase 1 (design.md D10; tasks.md 1.7). `normalizeStereotype`
+   * es la MISMA función pura que usa `setRelationshipStereotype` — ninguna
+   * de las dos reimplementa la normalización.
+   */
+  async setElementStereotype(diagramId: string, elementId: string, dto: SetElementStereotypeDto): Promise<UmlElementView> {
+    return this.prisma.$transaction(async (tx) => {
+      await assertElementInDiagram(tx, elementId, diagramId);
+
+      let stereotype: string | null;
+      try {
+        stereotype = normalizeStereotype(dto.stereotype);
+      } catch (err) {
+        if (err instanceof StereotypeTooLongError) {
+          throw new ConflictException({ code: UML_ERROR.STEREOTYPE_INVALID });
+        }
+        throw err;
+      }
+
+      const updated = await tx.umlElement.update({ where: { id: elementId }, data: { stereotype } });
+      return toElementView(updated);
+    });
+  }
+
+  /**
+   * `uml-validation` fase 1 (spec "Package como contenedor — tres
+   * mutaciones"; tasks.md 1.7). Un cuerpo en una clase no es un comentario
+   * UML — `409`, no `400`: depende del `kind` persistido, no de la forma
+   * del cuerpo (mismo criterio que `invalid_parent_kind`).
+   */
+  async setElementBody(diagramId: string, elementId: string, dto: SetElementBodyDto): Promise<UmlElementView> {
+    return this.prisma.$transaction(async (tx) => {
+      await assertElementInDiagram(tx, elementId, diagramId);
+      const element = await tx.umlElement.findUniqueOrThrow({ where: { id: elementId }, select: { kind: true } });
+      if (element.kind !== 'COMMENT') {
+        throw new ConflictException({ code: UML_ERROR.BODY_REQUIRES_COMMENT });
+      }
+
+      const updated = await tx.umlElement.update({ where: { id: elementId }, data: { body: dto.body } });
       return toElementView(updated);
     });
   }

@@ -6,6 +6,9 @@ import { MoveElementDto } from './dto/move-element.dto';
 import { RenameElementDto } from './dto/rename-element.dto';
 import { ResizeElementDto } from './dto/resize-element.dto';
 import { SetElementAbstractDto } from './dto/set-element-abstract.dto';
+import { SetElementBodyDto } from './dto/set-element-body.dto';
+import { SetElementParentDto } from './dto/set-element-parent.dto';
+import { SetElementStereotypeDto } from './dto/set-element-stereotype.dto';
 import { ElementsService } from './elements.service';
 
 /**
@@ -44,6 +47,39 @@ export class ElementsController {
     @Body() dto: SetElementAbstractDto,
   ): Promise<UmlElementView> {
     return this.elements.setElementAbstract(diagramId, elementId, dto);
+  }
+
+  /** `uml-validation` fase 1 (design.md §3, D1, D3, D4; tasks.md 1.9). */
+  @Patch(':elementId/parent')
+  @RequiresProjectAction('diagram.edit')
+  setParent(
+    @Param('diagramId', ParseUUIDPipe) diagramId: string,
+    @Param('elementId', ParseUUIDPipe) elementId: string,
+    @Body() dto: SetElementParentDto,
+  ): Promise<UmlElementView> {
+    return this.elements.setElementParent(diagramId, elementId, dto);
+  }
+
+  /** `uml-validation` fase 1 (design.md §3, D10; tasks.md 1.9). */
+  @Patch(':elementId/stereotype')
+  @RequiresProjectAction('diagram.edit')
+  setStereotype(
+    @Param('diagramId', ParseUUIDPipe) diagramId: string,
+    @Param('elementId', ParseUUIDPipe) elementId: string,
+    @Body() dto: SetElementStereotypeDto,
+  ): Promise<UmlElementView> {
+    return this.elements.setElementStereotype(diagramId, elementId, dto);
+  }
+
+  /** `uml-validation` fase 1 (design.md §3; tasks.md 1.9). Solo `kind: 'COMMENT'` — ver `409 body_requires_comment`. */
+  @Patch(':elementId/body')
+  @RequiresProjectAction('diagram.edit')
+  setBody(
+    @Param('diagramId', ParseUUIDPipe) diagramId: string,
+    @Param('elementId', ParseUUIDPipe) elementId: string,
+    @Body() dto: SetElementBodyDto,
+  ): Promise<UmlElementView> {
+    return this.elements.setElementBody(diagramId, elementId, dto);
   }
 
   @Patch(':elementId/position')

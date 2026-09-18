@@ -220,10 +220,49 @@ export function handleUniqueViolation(err: unknown, conflictingName: string): ne
  * textualmente en el mensaje de PostgreSQL para su propia violación — no hay
  * caso en que el resolvedor no pueda distinguir cuál de las tres fue.
  */
+/**
+ * Fila agregada por `uml-validation` (design.md D3; tasks.md 1.3, bloqueante
+ * para 1.4). Forzado real, mismo criterio que el bloque de arriba: `Prisma`
+ * directo (no la ruta HTTP, para saltar el guard de aplicación que ya
+ * rechaza el autolazo antes de llegar a la base) contra PostgreSQL 17
+ * (puerto 5434), actualizando `parentId = id` sobre un `PACKAGE` recién
+ * creado.
+ *
+ * Forma observada — MISMA que `ck_relationship_not_self_generalization`
+ * (ningún campo estructurado, el nombre solo aparece en texto libre):
+ *
+ *   err.code = 'P2039'
+ *   err.meta = {
+ *     modelName: 'UmlElement',
+ *     driverAdapterError: { name: 'DriverAdapterError', cause: {
+ *       originalCode: '23514',
+ *       kind: 'postgres',
+ *       originalMessage: 'new row for relation "uml_elements" violates ' +
+ *         'check constraint "ck_element_not_own_parent"',
+ *       message: '<mismo texto que originalMessage>',
+ *       severity: 'ERROR',
+ *       detail: 'Failing row contains (...).',
+ *     } },
+ *   }
+ *
+ * Confirma la predicción del plan C ya escrito para `P2039` arriba: no hace
+ * falta ningún resolvedor nuevo, la tabla `CHECK_CONSTRAINT_TO_UML_ERROR` ya
+ * cubre esta constraint con solo agregar la fila — `resolveCheckViolation`
+ * no cambia.
+ */
 const CHECK_CONSTRAINT_TO_UML_ERROR: Record<string, UmlErrorCode> = {
   ck_relationship_not_self_generalization: UML_ERROR.RELATIONSHIP_SELF_GENERALIZATION,
   ck_composite_multiplicity: UML_ERROR.COMPOSITE_MULTIPLICITY_INVALID,
   ck_end_multiplicity: UML_ERROR.END_MULTIPLICITY_INVALID,
+  /**
+   * Red de carrera para la guarda de ciclo de contención de
+   * `setElementParent` (D3, Hallazgo 5): `collectSubtreeIds` hace el ciclo
+   * *raro*, no *imposible* — dos `PATCH /parent` concurrentes bajo
+   * `READ COMMITTED` pueden pasar las dos comprobaciones. Si eso ocurre, la
+   * base rechaza igual y este mapeo produce el mismo `409
+   * containment_cycle` que la comprobación autoritativa, nunca un `500`.
+   */
+  ck_element_not_own_parent: UML_ERROR.CONTAINMENT_CYCLE,
 };
 
 const KNOWN_CHECK_NAMES = Object.keys(CHECK_CONSTRAINT_TO_UML_ERROR);

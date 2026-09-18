@@ -1,5 +1,12 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import type { RelationshipLayoutView, UmlRelationshipEndView, UmlRelationshipView } from '@umlive/contracts';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  normalizeStereotype,
+  StereotypeTooLongError,
+  UML_ERROR,
+  type RelationshipLayoutView,
+  type UmlRelationshipEndView,
+  type UmlRelationshipView,
+} from '@umlive/contracts';
 import type { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { assertElementInDiagram, assertRelationshipInDiagram } from './diagram-scope';
@@ -11,6 +18,7 @@ import type { SetEndMultiplicityDto } from './dto/set-end-multiplicity.dto';
 import type { SetEndNavigabilityDto } from './dto/set-end-navigability.dto';
 import type { SetEndRoleNameDto } from './dto/set-end-role-name.dto';
 import type { SetRelationshipAnchorsDto } from './dto/set-relationship-anchors.dto';
+import type { SetRelationshipStereotypeDto } from './dto/set-relationship-stereotype.dto';
 import type { SetRelationshipWaypointsDto } from './dto/set-relationship-waypoints.dto';
 import { handleCheckViolation } from './uml-errors';
 import { toRelationshipEndView, toRelationshipLayoutView, toRelationshipView } from './uml-mappers';
@@ -134,6 +142,31 @@ export class RelationshipsService {
     return this.prisma.$transaction(async (tx) => {
       await assertRelationshipInDiagram(tx, relationshipId, diagramId);
       const updated = await tx.umlRelationship.update({ where: { id: relationshipId }, data: { name: dto.name } });
+      return toRelationshipView(updated);
+    });
+  }
+
+  /**
+   * `uml-validation` fase 1 (design.md D10, "Hallazgo nuevo — la propuesta
+   * se olvidó de una ruta"; tasks.md 1.8). `normalizeStereotype` es la
+   * MISMA función pura que usa `ElementsService.setElementStereotype` —
+   * ninguna de las dos reimplementa la normalización.
+   */
+  async setRelationshipStereotype(diagramId: string, relationshipId: string, dto: SetRelationshipStereotypeDto): Promise<UmlRelationshipView> {
+    return this.prisma.$transaction(async (tx) => {
+      await assertRelationshipInDiagram(tx, relationshipId, diagramId);
+
+      let stereotype: string | null;
+      try {
+        stereotype = normalizeStereotype(dto.stereotype);
+      } catch (err) {
+        if (err instanceof StereotypeTooLongError) {
+          throw new ConflictException({ code: UML_ERROR.STEREOTYPE_INVALID });
+        }
+        throw err;
+      }
+
+      const updated = await tx.umlRelationship.update({ where: { id: relationshipId }, data: { stereotype } });
       return toRelationshipView(updated);
     });
   }
