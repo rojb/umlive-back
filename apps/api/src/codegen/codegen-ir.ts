@@ -133,6 +133,18 @@ export interface IrEnum {
 export interface CodegenIr {
   /** `artifactId` Maven del proyecto emitido, derivado del nombre del diagrama (D11). */
   artifactId: string;
+  /**
+   * Id del diagrama. Es el `_postman_id` de la colección (D11): derivado del
+   * diagrama y NO aleatorio, porque un UUID al azar rompería SC-F11.
+   */
+  diagramId: string;
+  /**
+   * Nombre del diagrama, tal como lo escribió el usuario. Es el único texto
+   * libre que llega al proyecto emitido: el título del `README.md` (D11).
+   * Cierra el desvío declarado en la corrida de la Fase 2, cuando la IR todavía
+   * no lo llevaba y el README titulaba con el `artifactId`.
+   */
+  diagramName: string;
   entities: IrEntity[];
   enums: IrEnum[];
   blockers: CodegenFinding[];

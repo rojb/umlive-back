@@ -24,9 +24,11 @@
  * una máquina sin Docker, justo lo que SC-F02 prohíbe. La suite del proyecto
  * generado es la colección Postman.
  *
- * **La `V1__init.sql` NO se emite acá.** Es la tarea 3.1 (emisor Flyway), fuera
- * de esta corrida: el esqueleto compila igual y el `validate` contra la base
- * queda pendiente de esa tarea.
+ * **La `V1__init.sql` se emite en `flyway.ts`** (tarea 3.1) y los dos archivos de
+ * Postman en `postman.ts` (tarea 3.2); este módulo los agrega al mismo arreglo
+ * de archivos. Hasta la corrida de la Fase 2 el ZIP traía las entidades JPA con
+ * `ddl-auto=validate` y ninguna migración: `mvnw -q verify` pasaba, pero el
+ * arranque contra PostgreSQL 17 habría fallado en `validate`.
  */
 
 import { BASE_PACKAGE } from '../build-ir';
@@ -34,7 +36,9 @@ import { APPLICATION_TYPE_NAME } from '../java-names';
 import type { CodegenIr, IrEntity } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
 import { JAVA_SOURCE_ROOT, emitEntityFiles } from './entity';
+import { emitFlywayFile } from './flyway';
 import { emitEnumFile } from './layers';
+import { emitPostmanFiles } from './postman';
 import { emitWrapperFiles } from './wrapper';
 
 /** Spring Boot fijo: 4.1.0 es la BOM que el golden verificó (D8, Fase 0). */
@@ -238,9 +242,13 @@ function endpointRows(entities: readonly IrEntity[]): string {
 
 /** `README.md`: cómo arrancar el proyecto y qué límites tiene lo generado (D11). */
 function emitReadme(ir: CodegenIr): string {
-  return `# ${ir.artifactId}
+  // El título es el nombre del diagrama: es el único texto libre del usuario
+  // que D11 deja llegar al proyecto emitido. Si el diagrama no tuviera nombre,
+  // se cae al `artifactId` para no emitir un título vacío.
+  const title = ir.diagramName.trim() === '' ? ir.artifactId : ir.diagramName;
+  return `# ${title}
 
-Proyecto Spring Boot ${SPRING_BOOT_VERSION} generado por UMLive a partir de un diagrama de clases.
+Proyecto Spring Boot ${SPRING_BOOT_VERSION} generado por UMLive a partir del diagrama «${title}» (artefacto \`${ir.artifactId}\`).
 
 ## Cómo arrancarlo
 
@@ -272,10 +280,15 @@ ${endpointRows(ir.entities)}
 }
 
 /**
- * Todos los archivos del proyecto: andamiaje, las ocho piezas por entidad, los
- * `enum` y los tres archivos del wrapper. **No** incluye las piezas de la tarea
- * 3.1 (`V1__init.sql`) ni las de la 3.2 (Postman), que son de corridas
- * posteriores.
+ * Todos los archivos del proyecto: andamiaje, la migración Flyway, los dos de
+ * Postman, las ocho piezas por entidad, los `enum` y los tres archivos del
+ * wrapper.
+ *
+ * La migración `V1__init.sql` (tarea 3.1) cierra el hueco que la corrida de la
+ * Fase 2 declaró: sin ella el ZIP traía entidades con `ddl-auto=validate` y
+ * ninguna tabla, así que el proyecto arrancaba en verde solo mientras nadie lo
+ * levantara contra PostgreSQL 17. La colección Postman (tarea 3.2) es la suite
+ * ejecutable del proyecto generado, que no trae tests.
  */
 export function emitProject(ir: CodegenIr): GeneratedFile[] {
   const files: GeneratedFile[] = [
@@ -288,6 +301,8 @@ export function emitProject(ir: CodegenIr): GeneratedFile[] {
     { path: '.gitattributes', content: emitGitattributes() },
   ];
 
+  files.push(emitFlywayFile(ir));
+  files.push(...emitPostmanFiles(ir));
   for (const irEnum of ir.enums) files.push(emitEnumFile(irEnum));
   for (const entity of ir.entities) files.push(...emitEntityFiles(entity));
 

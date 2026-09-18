@@ -559,6 +559,11 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
 
   return {
     artifactId: artifactIdFor(content),
+    // El id y el nombre del diagrama viajan en la IR para que la colección
+    // Postman use el id como `_postman_id` y el README titule con el nombre
+    // (D11). No son azar ni reloj: salen del mismo snapshot que el modelo.
+    diagramId: content.diagram.id,
+    diagramName: content.diagram.name,
     entities,
     enums,
     blockers: [...blocking, ...generatorBlockers],
