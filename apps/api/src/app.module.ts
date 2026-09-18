@@ -4,6 +4,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { join } from 'node:path';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
+import { CodegenModule } from './codegen/codegen.module';
 import { CollaborationModule } from './collaboration/collaboration.module';
 import { InteropModule } from './interop/interop.module';
 import { JoinCodesModule } from './join-codes/join-codes.module';
@@ -47,7 +48,10 @@ const envFilePath = join(__dirname, '..', '.env');
     // contratos + esqueleto + las dos rutas de export. La extensión EA, los
     // XSD y el validador llegan en la Unidad 3.
     InteropModule,
-    // M5  CodegenModule
+    // M5 — generación de código (`codegen-core`, rebanada 3 de 4, tarea 2.10):
+    // `POST /projects/:id/diagrams/:id/codegen` con `export.run`. El ZIP se
+    // arma en memoria; el generador no escribe filas ni archivos.
+    CodegenModule,
     // M6  AiModule
   ],
   providers: [
