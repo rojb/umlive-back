@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { LockAllOutcome, LockHolder, LockReleased } from '@umlive/contracts';
+import type { DiagramFreezeInfo, LockAllOutcome, LockHolder, LockReleased } from '@umlive/contracts';
 
 /**
  * Registro de bloqueos de elemento — en memoria, a propósito.
@@ -29,12 +29,36 @@ export type LockOutcome =
   | { ok: true; expiresAt: number }
   | { ok: false; holder: LockHolder };
 
+/**
+ * La compuerta del diagrama está cerrada (`diagram-freeze` D4). Variante propia
+ * y NO `holder` opcional: un diagrama congelado no tiene tenedor, y por eso
+ * `r.holder` después de `!r.ok` deja de compilar en los dos handlers del
+ * gateway — cada uno tiene que decidir qué responder (D4-bis).
+ */
+export type LockFrozen = { ok: false; frozen: true };
+
+/** Constante de módulo: la misma referencia en cada denegación por congelado. */
+const FROZEN: LockFrozen = { ok: false, frozen: true };
+
 @Injectable()
 export class LocksService implements OnModuleDestroy {
   private readonly log = new Logger(LocksService.name);
 
   /** diagramId → (elementId → Lock) */
   private readonly byDiagram = new Map<string, Map<string, Lock>>();
+
+  /**
+   * Compuerta de congelado (`diagram-freeze` D4): diagramId → quién y cuándo.
+   * Es la fuente del estado que recibe quien se une (D7) y la que consultan
+   * `acquire`/`acquireAll`. NO es autoridad de escritura — eso es la rama `423`
+   * de la base —: es autoridad de ADQUISICIÓN de locks, y existe porque
+   * soltar todo sin prohibir volver a tomar deja la puerta abierta.
+   *
+   * Un `Map` en memoria alcanza porque hay UNA sola instancia de backend
+   * (PRD §12 Q5). Se hidrata una vez al arrancar (`DiagramFreezeService.
+   * onModuleInit`, D6) y después solo la mueven `freeze`/`unfreeze`.
+   */
+  private readonly frozen = new Map<string, DiagramFreezeInfo>();
 
   /** Índice inverso userId → Set<`${diagramId}:${elementId}`>, para soltar en O(k) al desconectar. */
   private readonly byUser = new Map<string, Set<string>>();
@@ -76,7 +100,11 @@ export class LocksService implements OnModuleDestroy {
    * sin sincronización explícita — y es la razón por la que NO debe volverse
    * `async` sin repensarlo.
    */
-  acquire(diagramId: string, elementId: string, holder: LockHolder): LockOutcome {
+  acquire(diagramId: string, elementId: string, holder: LockHolder): LockOutcome | LockFrozen {
+    // Compuerta PRIMERO y sin `await` (`diagram-freeze` D4): esta y `acquireAll`
+    // son los dos únicos caminos de adquisición, así que cubren `lock:request`
+    // y `lock:requestAll` por construcción.
+    if (this.frozen.has(diagramId)) return FROZEN;
     const locks = this.locksOf(diagramId);
     const now = Date.now();
     const existing = locks.get(elementId);
@@ -133,7 +161,10 @@ export class LocksService implements OnModuleDestroy {
    * con que nadie escriba la palabra no verifica nada. Lo que se verifica es que
    * no haya `await` en el cuerpo, y eso se lee.
    */
-  acquireAll(diagramId: string, elementIds: readonly string[], holder: LockHolder): LockAllOutcome {
+  acquireAll(diagramId: string, elementIds: readonly string[], holder: LockHolder): LockAllOutcome | LockFrozen {
+    // Misma compuerta que `acquire`, ANTES de la fase 1 (D4).
+    if (this.frozen.has(diagramId)) return FROZEN;
+
     const locks = this.byDiagram.get(diagramId);
     const now = Date.now();
 
@@ -301,9 +332,14 @@ export class LocksService implements OnModuleDestroy {
 
   /**
    * SC-C18. Congelar suelta TODO lo del diagrama, de todos los usuarios.
-   * Se llama antes de difundir `diagram:frozen`.
+   *
+   * PRIVADO desde `diagram-freeze` (D4): soltar todo sin cerrar la compuerta es
+   * justo el defecto que la propuesta encontró, así que no debe quedar ningún
+   * camino que lo haga. El único llamador legítimo es `freeze()`, que marca y
+   * suelta en el MISMO paso — no queda ni un tick entre «soltar todo» y
+   * «prohibir tomar».
    */
-  releaseAllInDiagram(diagramId: string, cause: LockReleased['cause'] = 'frozen'): void {
+  private releaseAllInDiagram(diagramId: string, cause: LockReleased['cause'] = 'frozen'): void {
     const locks = this.byDiagram.get(diagramId);
     if (!locks) return;
     for (const [elementId, lock] of locks) {
@@ -311,6 +347,64 @@ export class LocksService implements OnModuleDestroy {
       this.onRelease?.(diagramId, elementId, cause);
     }
     locks.clear();
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Congelado (`diagram-freeze` D4)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Cierra la compuerta y suelta todos los locks del diagrama, en un único
+   * paso SÍNCRONO (D4). Sin `await` a propósito: es el mismo criterio que
+   * `acquire`/`acquireAll` — no puede haber un punto de suspensión entre
+   * marcar y soltar.
+   */
+  freeze(diagramId: string, info: DiagramFreezeInfo): void {
+    this.frozen.set(diagramId, info);
+    this.releaseAllInDiagram(diagramId, 'frozen');
+  }
+
+  /**
+   * Abre la compuerta (D3). Se llama ANTES de difundir `diagram:unfrozen`: un
+   * cliente que responde a ese evento con un `lock:request` inmediato tiene que
+   * recibir el lock.
+   */
+  unfreeze(diagramId: string): void {
+    this.frozen.delete(diagramId);
+  }
+
+  /** El estado que se le manda a quien se une o re-sincroniza (D7). `undefined` = compuerta abierta. */
+  frozenInfo(diagramId: string): DiagramFreezeInfo | undefined {
+    return this.frozen.get(diagramId);
+  }
+
+  /**
+   * Borra TODO el rastro en memoria de un diagrama que se acaba de borrar
+   * (`concurrency-ux` D9): sus locks y su entrada de la compuerta de congelado.
+   *
+   * SÍNCRONO y **sin emitir nada**, a diferencia de los otros métodos de
+   * liberación: lo llama `DiagramDeletionController` inmediatamente después de
+   * desalojar la sala, así que ya no queda nadie a quien avisarle. Emitir acá
+   * sería hablarle a una sala vacía; el `lock:released` de la expulsión (D8)
+   * sí se emite, porque ahí la sala sobrevive al desalojado.
+   *
+   * La entrada de la compuerta se borra por la misma razón por la que se
+   * liberan los locks: el diagrama dejó de existir. Sin esto, la entrada
+   * huérfana que D1 de `diagram-freeze` aceptó se quedaría en memoria hasta el
+   * reinicio del proceso — fuga en un servidor de larga vida y estado que
+   * afirma algo de un diagrama que ya no está. Es exactamente la deuda que D9
+   * de `concurrency-ux` vino a cerrar.
+   */
+  forgetDiagram(diagramId: string): void {
+    const locks = this.byDiagram.get(diagramId);
+    if (locks) {
+      // Deindexar SIEMPRE por el dueño del lock, nunca por el que borra: si no,
+      // la clave `${diagramId}:${elementId}` queda stale en `byUser` y la
+      // desconexión de ese dueño borraría un lock VIVO de otro.
+      for (const [elementId, lock] of locks) this.deindex(lock.holder.userId, diagramId, elementId);
+      this.byDiagram.delete(diagramId);
+    }
+    this.frozen.delete(diagramId);
   }
 
   // ───────────────────────────────────────────────────────────────────────────

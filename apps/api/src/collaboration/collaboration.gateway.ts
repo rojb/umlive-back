@@ -12,7 +12,10 @@ import {
   PRESENCE_COLORS,
   PROJECT_ERROR,
   presenceColor,
+  type AccessRevokedReason,
   type ClientEvents,
+  type DiagramFreezeInfo,
+  type DiagramSync,
   type LockAllResult,
   type LockHolder,
   type OperationRejected,
@@ -97,6 +100,19 @@ const SOCKET_AUTH_SWEEP_INTERVAL_MS = 10_000;
  * y `diagram:leave` (§D2). Color por sala y `presence:roster`/`joined` se
  * agregan en `diagram:join` (§D7-D8) junto con `presence:cursor`/`select` vía
  * `emitToOthers` (§D9-D10).
+ *
+ * **Ampliado por `diagram-freeze` (rebanada 3 de M4):** `emitFreezeState` es la
+ * única puerta de salida del congelado, y `emitSync` garantiza que todo
+ * `diagram:sync` — el del join Y el del re-sync — vaya seguido de
+ * `diagram:frozen` si la compuerta del diagrama está cerrada (D7), en el mismo
+ * bloque síncrono. Las ramas `frozen` de `lock:request`/`lock:requestAll`
+ * responden una denegación reconocible sin `holder` en vez de quedarse en
+ * silencio (D4-bis).
+ *
+ * **Ampliado por `concurrency-ux` (rebanada 4 de M4):** `evictUserFromProject`
+ * (D8, SC-A12) y `evictDiagram` (D9) desalojan SIN un solo `await` — leen el
+ * `Map` local del namespace, nunca `fetchSockets()` —, con el orden
+ * `lock:released` → `access:revoked` → `disconnect(true)` → `presence:left`.
  */
 @WebSocketGateway()
 export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGatewayDisconnect<CollabSocket> {
@@ -276,6 +292,91 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   }
 
   /**
+   * Desalojo por expulsión del proyecto (`concurrency-ux` D8, SC-A12). Lo llama
+   * `MemberRemovalController` DESPUÉS del `COMMIT` de la transacción que sacó
+   * la membresía, en el MISMO bloque síncrono.
+   *
+   * Todo el cuerpo es síncrono y no hay un `await` en ninguna parte, y ESE es
+   * el requisito, no un detalle de estilo: con `fetchSockets()` (la operación
+   * asíncrona equivalente) el usuario expulsado podría volver a pedir un lock
+   * en el intervalo entre resolver los diagramas y desalojar — `acquire` no
+   * mira la membresía — y ese lock sobreviviría al desalojo hasta el TTL, con
+   * el usuario ya fuera del proyecto. Acá, juntar los sockets, soltar y
+   * desconectar ocurre sin ceder el hilo.
+   *
+   * El filtro es por `access.projectId` (del handshake) y NO por diagrama: un
+   * socket que ya pasó el handshake y todavía no se unió a la sala también es
+   * del proyecto del que se lo echó, y los sockets del mismo usuario en OTROS
+   * proyectos no se tocan (escenario de aislamiento entre proyectos).
+   *
+   * Orden de emisión, load-bearing (mismo criterio que `teardown`): los locks
+   * primero — cada `lock:released` va a la sala y los demás clientes borran el
+   * borde —, después `access:revoked` (D10: el panel terminal del expulsado),
+   * después el cierre, y `presence:left` al final, para que el roster pierda a
+   * alguien que ya no tiene locks ni socket. `disconnect(true)` (server
+   * disconnect) drena el buffer de engine.io antes de cerrar: el aviso de
+   * expulsión llega ANTES que el cierre de la conexión (spec de
+   * `concurrency-ux`).
+   */
+  evictUserFromProject(userId: string, projectId: string, diagramIds: string[]): void {
+    const targets = this.localSockets().filter((s) => s.data.user?.id === userId && s.data.access?.projectId === projectId);
+    this.locks.releaseAllForUserInDiagrams(userId, diagramIds, 'removed_from_project');
+    const rooms = this.evict(targets, 'removed_from_project');
+    for (const diagramId of rooms) this.emitTo(diagramId, 'presence:left', { userId });
+  }
+
+  /**
+   * Desalojo por borrado del diagrama (`concurrency-ux` D9). Lo llama
+   * `DiagramDeletionController` después del soft-delete; la limpieza de la
+   * compuerta de congelado la hace `LocksService.forgetDiagram`, que corre
+   * justo después y en el mismo bloque síncrono.
+   *
+   * Sin `presence:left` por sala: la sala queda VACÍA, así que no hay a quién
+   * avisarle. Sin liberar locks tampoco — `forgetDiagram` los descarta sin
+   * emitir, por la misma razón, y porque la liberación con causa
+   * `'removed_from_project'` de acá mentiría sobre el motivo.
+   */
+  evictDiagram(diagramId: string): void {
+    const targets = this.localSockets().filter((s) => s.data.diagramId === diagramId);
+    this.evict(targets, 'diagram_deleted');
+  }
+
+  /**
+   * El desalojo en sí, compartido por expulsión y borrado (D8/D9). Devuelve las
+   * SALAS de los sockets que estaban presentes, para que el llamador decida si
+   * corresponde anunciar `presence:left` (expulsión) o no (borrado).
+   *
+   * `s.data.presence = undefined` ANTES de emitir y desconectar es lo que hace
+   * que el `teardown` que dispara `disconnect(true)` sea un no-op: sin esto, el
+   * `presence:left` se emitiría dos veces y los locks se soltarían una segunda
+   * vez con causa `'disconnected'`, ensuciando el motivo real del desalojo.
+   */
+  private evict(targets: CollabSocket[], reason: AccessRevokedReason): Set<string> {
+    const rooms = new Set<string>();
+    for (const socket of targets) {
+      if (socket.data.presence) rooms.add(socket.data.diagramId);
+      socket.data.presence = undefined;
+      this.emitToSocket(socket, 'access:revoked', { reason });
+      socket.disconnect(true);
+    }
+    return rooms;
+  }
+
+  /**
+   * Los sockets conectados a ESTE proceso (`concurrency-ux` D8).
+   *
+   * El `Map` del namespace y NO `fetchSockets()`: el segundo es asíncrono y
+   * `evictUserFromProject` no puede permitirse un punto de suspensión. Es
+   * válido porque hay UNA sola instancia de backend (PRD §12 Q5), el mismo
+   * supuesto que ya declara `LocksService`. Es el ÚNICO acceso al `Map` — el
+   * barredor de vencimiento también entra por acá —, así que no hay dos formas
+   * de recorrer los sockets que puedan divergir.
+   */
+  localSockets(): CollabSocket[] {
+    return [...this.server.sockets.sockets.values()] as CollabSocket[];
+  }
+
+  /**
    * `lock:request` (design.md §D7). SIN `async`: `socket.data.diagramId` y
    * `socket.data.color` ya están resueltos desde `diagram:join`, así que
    * todo el handler es síncrono — es la razón por la que el color se
@@ -303,8 +404,17 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
         holder,
         expiresAt: new Date(outcome.expiresAt).toISOString(),
       });
+    } else if ('frozen' in outcome) {
+      // La compuerta está cerrada (`diagram-freeze` D4-bis): la denegación NO
+      // puede nombrar un `holder`, porque no hay ninguno. Se responde igual —
+      // la versión original de D4 no respondía nada y eso dejaba al cliente
+      // esperando un `lock:granted` que nunca iba a llegar, el mismo bug que
+      // el acuse frozen de `lock:requestAll` ya evitaba.
+      this.emitToSocket(client, 'lock:denied', { reason: 'frozen', elementId: payload.elementId });
     } else {
-      this.emitToSocket(client, 'lock:denied', { elementId: payload.elementId, holder: outcome.holder });
+      // `reason: 'held'` — la otra mitad de la unión, y la que SIGUE exigiendo
+      // el `holder` (FR-C04: denegar sin decir quién es el bug que evita).
+      this.emitToSocket(client, 'lock:denied', { reason: 'held', elementId: payload.elementId, holder: outcome.holder });
     }
   }
 
@@ -362,7 +472,13 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
 
     const outcome = this.locks.acquireAll(diagramId, ids, holder);
     if (!outcome.ok) {
-      return { ok: false, denied: { elementId: outcome.elementId, holder: outcome.holder } };
+      // Las DOS denegaciones se reconocen por su forma. `frozen` es la compuerta
+      // cerrada (`diagram-freeze` D4): sin `denied`/`holder` porque no hay
+      // ninguno, y con `ok: false` igual para que el Inspector no quede colgado
+      // esperando un acuse que nunca llega.
+      return 'frozen' in outcome
+        ? { ok: false, frozen: true }
+        : { ok: false, denied: { reason: 'held', elementId: outcome.elementId, holder: outcome.holder } };
     }
 
     const expiresAt = new Date(outcome.expiresAt).toISOString();
@@ -471,7 +587,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       // Y `emitToSocket` (no `emitTo`): el sync es del que lo pidió, como en
       // el join (W-1 del verify 2026-09-18).
       const resync = await this.reconnect.sync(diagramId, payload.lastVersion);
-      this.emitToSocket(client, 'diagram:sync', resync);
+      this.emitSync(client, resync);
       return;
     }
 
@@ -524,7 +640,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // la vía por la que W-2 encontró que un expulsado seguía recibiendo
     // contenido.
     const sync = await this.reconnect.sync(diagramId, payload.lastVersion);
-    this.emitToSocket(client, 'diagram:sync', sync);
+    this.emitSync(client, sync);
   }
 
   /**
@@ -561,7 +677,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       action: 'diagram.view',
     });
     if (!access.ok) {
-      this.emitToSocket(client, 'access:revoked', { reason: this.toRejectionCode(access.reason) });
+      this.emitToSocket(client, 'access:revoked', { reason: this.revokedReason(access.reason) });
       client.disconnect(true);
       return;
     }
@@ -733,6 +849,42 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   }
 
   /**
+   * Difunde el cambio de estado de congelado (`diagram-freeze` D3).
+   *
+   * Público para que `DiagramFreezeService` NO arme su propio `emit`: toda
+   * salida sigue pasando por `emitTo`, y el gateway sigue SIN importar la capa
+   * de base — la barrera de tipos y la de grafo que ya documenta `emitTo`
+   * abajo.
+   */
+  emitFreezeState(diagramId: string, event: 'diagram:frozen' | 'diagram:unfrozen', info: DiagramFreezeInfo): void {
+    this.emitTo(diagramId, event, info);
+  }
+
+  /**
+   * Todo `diagram:sync` va seguido de `diagram:frozen` si la compuerta del
+   * diagrama está cerrada (`diagram-freeze` D7), y **en el mismo bloque
+   * síncrono**: `socket.emit` encola el frame y vuelve, así que no hay ningún
+   * punto de suspensión entre los dos eventos y Socket.IO los entrega en ese
+   * orden.
+   *
+   * Lo usan el UNIRSE **y el RE-SYNC**. Si el re-sync no lo usara, el cliente
+   * se descongelaría solo en cada re-sync: el modo delta no lleva el congelado
+   * y el cliente reinicia `frozen` con cada `diagram:sync`.
+   *
+   * Por qué es correcto con cualquier intercalado: el socket ya está en la sala
+   * antes de leer (INV-RC-1), así que un cambio que ocurra ANTES de este
+   * método llega por la sala antes del sync (el sync lo pisa y este método
+   * vuelve a poner lo que diga la compuerta en ese momento), y uno que ocurra
+   * DESPUÉS llega después. En los dos casos, el último mensaje coincide con la
+   * compuerta.
+   */
+  private emitSync(client: CollabSocket, sync: DiagramSync): void {
+    this.emitToSocket(client, 'diagram:sync', sync);
+    const info = this.locks.frozenInfo(client.data.diagramId);
+    if (info) this.emitToSocket(client, 'diagram:frozen', info);
+  }
+
+  /**
    * Puerta de salida por SALA (design.md §D8). Ningún otro punto de este
    * archivo, ni ningún otro service, llama `this.server.emit`/`.to(...).emit`
    * directo. La barrera de tipos (`ServerEvents`) más la de grafo (este
@@ -784,10 +936,10 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   private sweepExpired(): void {
     const nowSeconds = Date.now() / 1000;
     const graceSeconds = SOCKET_AUTH_GRACE_MS / 1000;
-    for (const client of this.server.sockets.sockets.values()) {
-      const data = (client as CollabSocket).data;
+    for (const client of this.localSockets()) {
+      const data = client.data;
       if (!data || nowSeconds <= data.tokenExp + graceSeconds) continue;
-      this.emitToSocket(client as CollabSocket, 'auth:expired');
+      this.emitToSocket(client, 'auth:expired');
       client.disconnect(true);
     }
   }
@@ -803,6 +955,26 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // contrato de socket no distingue no-miembro de rol insuficiente, igual
     // que HTTP (design.md §D3, SC-A12 respaldo).
     return 'forbidden';
+  }
+
+  /**
+   * Motivo de `access:revoked` para el re-chequeo de `auth:token` (W-2 de
+   * `reconnect-and-presence`) — que NO es el camino de `evict`.
+   *
+   * Antes emitía un `SocketRejectionCode` bajo un `reason: string` libre.
+   * Desde `concurrency-ux` D11 ese payload es `AccessRevokedReason`, y no es
+   * una traducción cosmética: el panel del cliente es TERMINAL y su texto sale
+   * de un `switch` exhaustivo sobre la causa (D10). `'forbidden'` no es una
+   * causa, es un código de rechazo, y dejarlo obligaría al cliente a adivinar
+   * qué mostrar.
+   *
+   * El mapeo por naturaleza del fallo: el diagrama que ya no está es el caso
+   * borrado (D9); todo lo demás — membresía revocada a mitad de sesión, rol
+   * degradado, proyecto borrado — desde la perspectiva de este socket es lo
+   * mismo: ya no pertenece acá.
+   */
+  private revokedReason(reason: Extract<ProjectAccessResult, { ok: false }>['reason']): AccessRevokedReason {
+    return reason === PROJECT_ERROR.DIAGRAM_NOT_FOUND ? 'diagram_deleted' : 'removed_from_project';
   }
 
   private rejection(code: SocketRejectionCode): Error {

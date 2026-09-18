@@ -1,9 +1,16 @@
-import { Body, Controller, Delete, HttpCode, HttpStatus, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
+import { Body, Controller, HttpCode, HttpStatus, Param, ParseUUIDPipe, Patch, Post } from '@nestjs/common';
 import type { DiagramSummary } from '@umlive/contracts';
 import { RenameDiagramDto } from './dto/rename-diagram.dto';
 import { DiagramsService } from './diagrams.service';
 import { RequiresProjectAction } from './guards/requires-project-action.decorator';
 
+/**
+ * Crear y renombrar diagramas. **El `@Delete` se fue** (`concurrency-ux` D9):
+ * borrar exige desalojar a los que están adentro por socket, y esa ruta vive
+ * en `collaboration/diagram-deletion.controller.ts`, con la misma URL y la
+ * misma acción de autorización. Con dos handlers para la misma ruta, el que
+ * Express registró primero gana y el otro queda muerto sin que nada avise.
+ */
 @Controller('projects/:projectId/diagrams')
 export class DiagramsController {
   constructor(private readonly diagrams: DiagramsService) {}
@@ -25,12 +32,5 @@ export class DiagramsController {
     @Body() dto: RenameDiagramDto,
   ): Promise<DiagramSummary> {
     return this.diagrams.rename(diagramId, dto);
-  }
-
-  @Delete(':diagramId')
-  @RequiresProjectAction('diagram.delete')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  remove(@Param('diagramId', ParseUUIDPipe) diagramId: string): Promise<void> {
-    return this.diagrams.softDelete(diagramId);
   }
 }

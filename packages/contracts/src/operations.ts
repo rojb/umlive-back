@@ -225,10 +225,25 @@ export interface LockGranted {
   expiresAt: string;
 }
 
-export interface LockDenied {
-  elementId: string;
-  holder: LockHolder;
-}
+/**
+ * Denegación de `lock:request` (D4-bis de `diagram-freeze`).
+ *
+ * Es una UNIÓN y no un `holder?` opcional, y ahí está todo el punto: el
+ * contrato dice más arriba que «denegar sin decir quién lo tiene es el bug que
+ * FR-C04 evita». Con `holder?: LockHolder`, una denegación por lock ajeno
+ * podría omitir al dueño y compilaría igual — la protección pasaría de
+ * garantizada a depender de que nadie se olvide. Con la unión, la variante
+ * `held` SIGUE exigiendo el `holder`, y la variante `frozen` no lo pide porque
+ * no existe: un diagrama congelado no tiene a quién culpar.
+ *
+ * `frozen` existe para que un pedido de lock sobre un diagrama congelado
+ * produzca una respuesta consumible en vez de silencio: el cliente no puede
+ * quedarse esperando un `lock:granted` que nunca va a llegar (el mismo bug que
+ * el acuse frozen de `lock:requestAll` evita).
+ */
+export type LockDenied =
+  | { reason: 'held'; elementId: string; holder: LockHolder }
+  | { reason: 'frozen'; elementId: string };
 
 export interface LockReleased {
   elementId: string;
@@ -264,7 +279,9 @@ export type LockAllOutcome =
  */
 export type LockAllResult =
   | { ok: true; expiresAt: string }
-  | { ok: false; denied: LockDenied };
+  | { ok: false; denied: LockDenied }
+  /** `diagram-freeze` D4: la compuerta del diagrama está cerrada. Sin `holder`: no hay ninguno. */
+  | { ok: false; frozen: true };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tipos de operación — 32, uno por CUERPO de transacción (ver nota de cabecera)

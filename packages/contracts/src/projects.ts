@@ -9,7 +9,14 @@
  * Especificación: `openspec/changes/projects/specs/projects-backend/spec.md`,
  * `openspec/changes/projects/specs/projects-frontend/spec.md`.
  * Diseño: `openspec/changes/projects/design.md` §2, §7.3.
+ *
+ * El `import type` de `./events` (que trae `DiagramFreezeInfo`) NO rompe la
+ * regla de arriba: se borra al compilar, así que este módulo sigue sin
+ * arrastrar nada en runtime y el sentido del ciclo (events → operations/uml,
+ * projects → events) no existe en el JavaScript emitido.
  */
+
+import type { DiagramFreezeInfo } from './events';
 
 export type ProjectRole = 'HOST' | 'PARTICIPANT';
 
@@ -19,7 +26,7 @@ export type ProjectRole = 'HOST' | 'PARTICIPANT';
  * hoy, pero solo las de `enforcedSince: 'projects'` tienen ruta y controlador
  * en esta rebanada (design.md §2.1).
  */
-export type EnforcedSince = 'projects' | 'join-codes' | 'M2' | 'M4' | 'M5' | 'M6';
+export type EnforcedSince = 'projects' | 'join-codes' | 'M2' | 'M4' | 'M5' | 'M6' | 'diagram-freeze';
 
 export interface ActionRule {
   readonly roles: readonly ProjectRole[];
@@ -85,8 +92,8 @@ export const PROJECT_PERMISSIONS = {
    * es «autenticado + código activo» — ver join-codes/design.md §2.1-§2.2.
    * No es una fila pendiente: FR-A13 no tiene fila para esto.
    */
-  'diagram.lock': { roles: ['HOST'], enforcedSince: 'M4', frA13Row: 'Lock / unlock diagram' },
-  'diagram.unlock': { roles: ['HOST'], enforcedSince: 'M4', frA13Row: 'Lock / unlock diagram' },
+  'diagram.lock': { roles: ['HOST'], enforcedSince: 'diagram-freeze', frA13Row: 'Lock / unlock diagram' },
+  'diagram.unlock': { roles: ['HOST'], enforcedSince: 'diagram-freeze', frA13Row: 'Lock / unlock diagram' },
   'diagram.edit': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M2', frA13Row: 'Edit diagram content (when unlocked)' },
   'xmi.import': { roles: ['HOST'], enforcedSince: 'M5', frA13Row: 'Import XMI into a diagram' },
   'export.run': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M5', frA13Row: 'Export XMI / generate code / export Postman' },
@@ -117,6 +124,21 @@ export interface DiagramSummary {
   currentVersion: number;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Quién congeló y cuándo, o `null` si el diagrama está abierto
+   * (`concurrency-ux` D7, delta de B1).
+   *
+   * UN solo campo, y no `lockedBy` + `lockedAt` separados como pedía la
+   * propuesta: dos campos nulos de forma independiente permiten a nivel de
+   * tipos un estado que `ck_diagrams_lock_coherent` prohíbe en la base; con
+   * uno solo, la coherencia está garantizada por construcción.
+   *
+   * Es EXACTAMENTE `DiagramFreezeInfo`, el mismo cuerpo que trae
+   * `diagram:frozen` — así el cartel del lienzo y la fila de B1 comparten un
+   * solo formateador de hora. El lienzo NO lee este campo: su fuente es
+   * `collaboration.store.frozen`.
+   */
+  freeze: DiagramFreezeInfo | null;
 }
 
 export interface ProjectSummary {

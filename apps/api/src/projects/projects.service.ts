@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { DashboardResponse, ProjectDetail, ProjectRole, ProjectSummary, UserRef } from '@umlive/contracts';
 import { PrismaService } from '../prisma/prisma.service';
+import { DIAGRAM_SUMMARY_SELECT, toDiagramSummary } from './diagram-summary';
 import type { CreateProjectDto } from './dto/create-project.dto';
 
 @Injectable()
@@ -153,14 +154,10 @@ export class ProjectsService {
         },
         diagrams: {
           where: { deletedAt: null },
-          select: {
-            id: true,
-            name: true,
-            lockState: true,
-            currentVersion: true,
-            createdAt: true,
-            updatedAt: true,
-          },
+          // La MISMA proyección y el MISMO mapper que el resto (`concurrency-ux`
+          // D7): antes esta lista armaba el resumen a mano y por eso no podía
+          // traer `freeze` sin una tercera copia de la forma.
+          select: DIAGRAM_SUMMARY_SELECT,
         },
       },
     });
@@ -185,14 +182,7 @@ export class ProjectsService {
         role: m.role,
         joinedAt: m.joinedAt.toISOString(),
       })),
-      diagrams: project.diagrams.map((d) => ({
-        id: d.id,
-        name: d.name,
-        lockState: d.lockState,
-        currentVersion: Number(d.currentVersion),
-        createdAt: d.createdAt.toISOString(),
-        updatedAt: d.updatedAt.toISOString(),
-      })),
+      diagrams: project.diagrams.map((d) => toDiagramSummary(d)),
     };
   }
 

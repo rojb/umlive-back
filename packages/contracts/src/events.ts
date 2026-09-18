@@ -58,8 +58,8 @@ export interface ServerEvents {
   'lock:denied': (p: LockDenied) => void;
   'lock:released': (p: LockReleased) => void;
   /** Difundido al congelar. Todos pasan a solo lectura en <= 1 s (SC-C18). */
-  'diagram:frozen': (p: { by: { userId: string; displayName: string }; at: string }) => void;
-  'diagram:unfrozen': (p: { by: { userId: string; displayName: string }; at: string }) => void;
+  'diagram:frozen': (p: DiagramFreezeInfo) => void;
+  'diagram:unfrozen': (p: DiagramFreezeInfo) => void;
   'presence:joined': (p: PresenceUser) => void;
   'presence:left': (p: { userId: string }) => void;
   'presence:cursor': (p: { userId: string; x: number; y: number }) => void;
@@ -72,8 +72,8 @@ export interface ServerEvents {
    * (SC-C27 sería incumplible). reconnect-and-presence/design.md §D8.
    */
   'presence:roster': (p: PresenceUser[]) => void;
-  /** Expulsión: se quitó al usuario del proyecto (SC-A12). */
-  'access:revoked': (p: { reason: string }) => void;
+  /** Expulsión: se quitó al usuario del proyecto (SC-A12) o se borró el diagrama (`concurrency-ux` D9). */
+  'access:revoked': (p: { reason: AccessRevokedReason }) => void;
   /** Emitido justo antes de desconectar por `exp` vencido — distingue vencimiento de caída de red (design.md §D5). */
   'auth:expired': () => void;
 }
@@ -90,6 +90,37 @@ export interface PresenceUser {
   displayName: string;
   color: string;
   heldElementIds: string[];
+}
+
+/**
+ * Por qué se le revocó el acceso a un socket (`concurrency-ux` D11).
+ *
+ * Reemplaza al `reason: string` suelto que tenía este payload, que era
+ * cualquier cosa que el emisor quisiera mandar: hoy el único emisor además del
+ * desalojo es el re-chequeo de `auth:token` (W-2 de `reconnect-and-presence`),
+ * y un `SocketRejectionCode` ahí obliga al cliente a adivinar el motivo de un
+ * panel que es terminal. Con la unión, el cliente traduce con un `switch`
+ * exhaustivo y el compilador avisa si aparece una causa nueva.
+ *
+ * `'removed_from_project'` es también la causa con la que se sueltan los
+ * locks en el mismo paso (`LockReleased['cause']`, SC-A12): los dos eventos
+ * del desalojo cuentan la misma historia.
+ */
+export type AccessRevokedReason = 'removed_from_project' | 'diagram_deleted';
+
+/**
+ * Estado de congelado de un diagrama — cuerpo de `diagram:frozen` y
+ * `diagram:unfrozen` (`diagram-freeze` D9).
+ *
+ * Hasta ahora viajaba escrito dos veces, una por evento; se nombra para que el
+ * servicio de congelado, el payload de `diagram:sync` y el cliente compartan
+ * UN tipo. El `at` es el MISMO valor que se escribió en `diagrams.locked_at`
+ * (tomado después del `FOR UPDATE`), no una segunda lectura de reloj.
+ */
+export interface DiagramFreezeInfo {
+  by: { userId: string; displayName: string };
+  /** ISO. */
+  at: string;
 }
 
 /**

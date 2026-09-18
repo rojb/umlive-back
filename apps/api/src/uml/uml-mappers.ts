@@ -21,6 +21,7 @@ import type {
   UmlRelationship,
   UmlRelationshipEnd,
 } from '../generated/prisma/client';
+import { toDiagramSummary as toSharedDiagramSummary } from '../projects/diagram-summary';
 
 /**
  * Mapeo Prisma row → vista de contrato (design.md §8, §11), factorizado una
@@ -30,15 +31,29 @@ import type {
  * capa de dominio, es serialización (PRD §9: sin hexagonal).
  */
 
+/**
+ * ADAPTADOR sobre el mapper compartido (`concurrency-ux` D7), no una segunda
+ * implementación: la vista de `DiagramSummary` se arma en UN solo lugar,
+ * `projects/diagram-summary.ts`, y acá solo se completa lo que este llamador
+ * no tiene.
+ *
+ * El único consumidor de esta firma es `diagram-content.service.ts` (el
+ * snapshot del esqueleto), cuya consulta proyecta seis columnas y NO trae
+ * `lockedAt`/`lockedByUser` — dos columnas que el mapper compartido exige.
+ * Ese archivo no está entre las superficies de esta rebanada, así que acá se
+ * pasan `null` explícitos y el snapshot sale con `freeze: null`.
+ *
+ * La consecuencia es acotada y deliberada: `DiagramContent.diagram` es el
+ * esqueleto que el lienzo usa para dibujar, y **ningún** componente lee su
+ * `freeze` (D6 de `concurrency-ux`: el cartel se alimenta solo de
+ * `collaboration.store.frozen`, que viene de `diagram:frozen`). Un diagrama
+ * congelado que se sincronice por el snapshot recibe el cartel por el evento,
+ * en el mismo bloque síncrono que su `diagram:sync`. Cuando esa consulta se
+ * ensanche (fuera de esta rebanada), esta función desaparece y el servicio
+ * importa el mapper compartido directo.
+ */
 export function toDiagramSummary(d: Pick<Diagram, 'id' | 'name' | 'lockState' | 'currentVersion' | 'createdAt' | 'updatedAt'>): DiagramSummary {
-  return {
-    id: d.id,
-    name: d.name,
-    lockState: d.lockState,
-    currentVersion: Number(d.currentVersion),
-    createdAt: d.createdAt.toISOString(),
-    updatedAt: d.updatedAt.toISOString(),
-  };
+  return toSharedDiagramSummary({ ...d, lockedAt: null, lockedByUser: null });
 }
 
 export function toElementView(e: UmlElement): UmlElementView {
