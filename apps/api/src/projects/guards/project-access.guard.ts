@@ -8,11 +8,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { can, type ProjectAction, PROJECT_ERROR } from '@umlive/contracts';
+import { type ProjectAction, PROJECT_ERROR } from '@umlive/contracts';
 import type { Request } from 'express';
 import type { CurrentUserPayload } from '../../auth/current-user.decorator';
 import { IS_PUBLIC_KEY } from '../../auth/public.decorator';
-import { PrismaService } from '../../prisma/prisma.service';
+import { ProjectAccessResolver } from '../project-access.resolver';
 import type { ProjectContext } from './project-context.decorator';
 import { PROJECT_ACTION_KEY } from './requires-project-action.decorator';
 
@@ -21,17 +21,16 @@ interface RequestWithProjectContext extends Request {
   projectContext?: ProjectContext;
 }
 
-/** Forma, no versión: Postgres acepta cualquier UUID válido como `uuid`, y acá solo interesa no llegar a la base con basura. */
-const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
 /**
  * `APP_GUARD` global, registrado SEGUNDO en `app.module.ts` — DESPUÉS de
  * `JwtAuthGuard` (design.md §2.2). El modo de falla que importa: una ruta
  * nueva con `projectId`/`diagramId` en los params y sin `@RequiresProjectAction`
  * responde `403` y loguea el handler, en vez de dejar pasar.
  *
- * `PrismaModule` es `@Global()`, así que este guard inyecta `PrismaService`
- * desde el inyector raíz sin que `ProjectsModule` lo importe explícitamente.
+ * La consulta diagrama→proyecto→membresía→`can()` vive en
+ * `ProjectAccessResolver` (collaboration-gateway/design.md §D2) — este guard
+ * conserva el control de flujo, las excepciones, los códigos de error y el
+ * log de "ruta sin acción declarada"; **solo delega la consulta**.
  *
  * **Nota de orden de ejecución (desviación respecto a la lectura literal de
  * design.md §7.1):** los guards de Nest corren ANTES que los pipes de
@@ -48,7 +47,7 @@ export class ProjectAccessGuard implements CanActivate {
   private readonly logger = new Logger(ProjectAccessGuard.name);
 
   constructor(
-    private readonly prisma: PrismaService,
+    private readonly resolver: ProjectAccessResolver,
     private readonly reflector: Reflector,
   ) {}
 
@@ -58,6 +57,17 @@ export class ProjectAccessGuard implements CanActivate {
       context.getClass(),
     ]);
     if (isPublic) return true;
+
+    if (context.getType() === 'ws') {
+      // Un socket no tiene params de ruta: la autorización de sala se
+      // resolvió en el handshake (collaboration-gateway/design.md §D3) y
+      // quedó en `socket.data.access`. Acá solo se comprueba su presencia —
+      // misma política de fallo cerrado que en HTTP. `switchToHttp().getRequest()`
+      // sobre un socket devuelve el `Socket` crudo, sin `.params` — de ahí
+      // el `TypeError` que esta rama existe para evitar.
+      const client = context.switchToWs().getClient<{ data?: { access?: unknown } }>();
+      return client.data?.access !== undefined;
+    }
 
     const request = context.switchToHttp().getRequest<RequestWithProjectContext>();
     // Los params de ruta de Express tipan `string | string[]` en general
@@ -81,57 +91,33 @@ export class ProjectAccessGuard implements CanActivate {
       throw new ForbiddenException({ code: PROJECT_ERROR.INSUFFICIENT_ROLE });
     }
 
-    if (projectIdParam && !UUID_SHAPE.test(projectIdParam)) {
-      throw new BadRequestException();
-    }
-    if (diagramIdParam && !UUID_SHAPE.test(diagramIdParam)) {
-      throw new BadRequestException();
-    }
-
-    let projectId: string;
-    let diagram: ProjectContext['diagram'];
-
-    if (diagramIdParam) {
-      const found = await this.prisma.diagram.findUnique({
-        where: { id: diagramIdParam },
-        select: { id: true, projectId: true, deletedAt: true, lockState: true },
-      });
-      // Inexistente, borrado, o de un proyecto distinto al de la ruta: mismo
-      // código. No confirmar cuál de las tres cosas pasó (design.md §7.2).
-      if (!found || found.deletedAt || (projectIdParam && found.projectId !== projectIdParam)) {
-        throw new NotFoundException({ code: PROJECT_ERROR.DIAGRAM_NOT_FOUND });
-      }
-      projectId = found.projectId;
-      diagram = { id: found.id, projectId: found.projectId, lockState: found.lockState };
-    } else {
-      // biome-ignore lint/style/noNonNullAssertion: projectIdParam truthy por el guard de arriba
-      projectId = projectIdParam!;
-    }
-
-    const project = await this.prisma.project.findUnique({
-      where: { id: projectId },
-      select: { id: true, deletedAt: true },
-    });
-    if (!project || project.deletedAt) {
-      throw new NotFoundException({ code: PROJECT_ERROR.PROJECT_NOT_FOUND });
-    }
-
     // Este guard corre después de `JwtAuthGuard` (orden fijo en app.module.ts):
     // en toda ruta no pública que llega hasta acá, `req.user` ya existe.
     const userId = (request.user as CurrentUserPayload).id;
 
-    const membership = await this.prisma.projectMember.findUnique({
-      where: { projectId_userId: { projectId, userId } },
-      select: { role: true },
-    });
-    // No-miembro y miembro-con-rol-insuficiente responden IGUAL (design.md
-    // §7.2, SC-A12 respaldo): un projectId es un UUIDv4 no enumerable, a
-    // diferencia del email en `auth` (SC-A04).
-    if (!membership || !can(membership.role, action)) {
+    // La consulta (forma UUID, lookup de diagrama/proyecto/membresía,
+    // `can()`) vive en el resolver (collaboration-gateway/design.md §D2).
+    // Este guard solo traduce el veredicto a excepciones HTTP — mismos
+    // códigos y orden que antes de la extracción.
+    const result = await this.resolver.resolveAccess({ userId, projectId: projectIdParam, diagramId: diagramIdParam, action });
+
+    if (!result.ok) {
+      if (result.reason === 'bad_request') {
+        throw new BadRequestException();
+      }
+      if (result.reason === PROJECT_ERROR.DIAGRAM_NOT_FOUND) {
+        throw new NotFoundException({ code: PROJECT_ERROR.DIAGRAM_NOT_FOUND });
+      }
+      if (result.reason === PROJECT_ERROR.PROJECT_NOT_FOUND) {
+        throw new NotFoundException({ code: PROJECT_ERROR.PROJECT_NOT_FOUND });
+      }
+      // No-miembro y miembro-con-rol-insuficiente responden IGUAL (design.md
+      // §7.2, SC-A12 respaldo): un projectId es un UUIDv4 no enumerable, a
+      // diferencia del email en `auth` (SC-A04).
       throw new ForbiddenException({ code: PROJECT_ERROR.INSUFFICIENT_ROLE });
     }
 
-    request.projectContext = { projectId, role: membership.role, diagram };
+    request.projectContext = result.context;
     return true;
   }
 }
