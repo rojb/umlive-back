@@ -259,7 +259,14 @@ export interface IdOnly {
 }
 
 export interface ElementCreate {
-  /** Lo genera el cliente para poder referenciarlo antes del ida y vuelta. NUNCA es lo que se persiste (D5) — ver payload autoritativo. */
+  /**
+   * INERTE: el servidor lo IGNORA. Existe solo por forma del sobre, jamás es
+   * identidad — el único id válido es `committed.payload.id` (D5 de
+   * `operations-pipeline`, contradicción #18 de `frontend-cutover`). No se
+   * puede referenciar nada con este valor antes del ida y vuelta: la
+   * creación NO es optimista y el cliente que lo tratara como identidad
+   * inventaría un id fantasma.
+   */
   id: string;
   kind: ElementKind;
   /** `null` SOLO para `kind: 'COMMENT'`: `ck_element_named` exige body en ese caso y nombre no vacío en el resto (#13). */
@@ -324,6 +331,7 @@ export interface ElementDelete {
 }
 
 export interface FeatureCreate {
+  /** INERTE: el servidor lo IGNORA — el único id válido es `committed.payload.id` (contradicción #18 de `frontend-cutover`). El campo se queda por forma del sobre, nunca como identidad. */
   id: string;
   ownerId: string;
   kind: 'ATTRIBUTE' | 'OPERATION';
@@ -354,6 +362,7 @@ export interface FeatureReorder {
 }
 
 export interface ParameterAdd {
+  /** INERTE: el servidor lo IGNORA — el único id válido es `committed.payload.id` (contradicción #18 de `frontend-cutover`). El campo se queda por forma del sobre, nunca como identidad. */
   id: string;
   operationId: string;
   name: string;
@@ -374,6 +383,7 @@ export interface ParameterReorder {
 }
 
 export interface LiteralAdd {
+  /** INERTE: el servidor lo IGNORA — el único id válido es `committed.payload.id` (contradicción #18 de `frontend-cutover`). El campo se queda por forma del sobre, nunca como identidad. */
   id: string;
   enumerationId: string;
   name: string;
@@ -395,7 +405,7 @@ export interface RelationshipCreateEnd {
 }
 
 export interface RelationshipCreate {
-  /** Lo genera el cliente. NUNCA es lo que se persiste — ver payload autoritativo (D5). */
+  /** INERTE: el servidor lo IGNORA — el único id válido es `committed.payload.id` (contradicción #18 de `frontend-cutover`). Ver `ElementCreate.id` para el criterio completo. */
   id: string;
   kind: RelationshipKind;
   sourceElementId: string;

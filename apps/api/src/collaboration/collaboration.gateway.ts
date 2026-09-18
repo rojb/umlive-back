@@ -50,11 +50,25 @@ interface SocketData {
   presence?: PresenceUser;
   /** Piso de 20ms por socket para `presence:cursor` (design.md §D10). */
   lastCursorAt?: number;
+  /**
+   * Piso de 1s por socket entre re-syncs de un socket VIVO
+   * (`frontend-cutover/design.md` §D3). Solo lo escribe y lo lee la rama de
+   * RE-SYNC de `diagram:join` — mismo patrón que `lastCursorAt`.
+   */
+  lastSyncAt?: number;
 }
 
 /** Constantes de módulo (design.md §6) — una sola forma correcta, no configuración. */
 const CURSOR_MIN_INTERVAL_MS = 20;
 const MAX_ID_BATCH = 200;
+/**
+ * Límite de tasa OBLIGATORIO del re-sync (`frontend-cutover/design.md` §D3,
+ * `frontend-cutover-backend/spec.md`). Un hueco de versión dispara un re-sync
+ * y un re-sync mal manejado puede producir otro hueco: sin piso, la
+ * resincronización se convierte en tormenta de `diagram:sync`. El `Logger.warn`
+ * del descarte es la señal de que el cliente entró en bucle.
+ */
+const SYNC_MIN_INTERVAL_MS = 1000;
 
 type CollabSocket = Socket<ClientEvents, ServerEvents, Record<string, never>, SocketData>;
 type CollabServer = Server<ClientEvents, ServerEvents, Record<string, never>, SocketData>;
@@ -338,6 +352,13 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    * contra el mismo resolver — el punto donde se nota que a alguien lo
    * sacaron del proyecto entre el handshake y el join. Un socket sirve a un
    * solo diagrama: `diagramId` distinto al del handshake se rechaza.
+   *
+   * **Además, desde `frontend-cutover` (D3) este handler es IDEMPOTENTE**: un
+   * `diagram:join` repetido con el mismo `diagramId` sobre un socket que YA
+   * entró a la sala se trata como RE-SYNC (ver la rama más abajo), no como un
+   * segundo join. Es la costura que el hueco de versión y el pendiente vencido
+   * necesitan sin reconectar — reconectar tiraría sala, locks y color. Cero
+   * cambio de contrato: `ClientEvents` no se toca.
    */
   @SubscribeMessage('diagram:join')
   async handleJoin(
@@ -359,15 +380,48 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       return;
     }
 
+    const diagramId = client.data.diagramId;
+
+    // 🔴 RE-SYNC de un socket VIVO (`frontend-cutover/design.md` §D3).
+    // `socket.data.presence` es la marca de "entró a la sala" (D2 de
+    // `reconnect-and-presence`): si ya está asignada, este `diagram:join` no
+    // es un join. El re-chequeo de acceso de arriba YA corrió, igual que en
+    // el join original, así que un miembro expulsado a mitad de sesión sigue
+    // siendo rechazado por esta misma puerta.
+    if (client.data.presence) {
+      const now = Date.now();
+      const last = client.data.lastSyncAt ?? 0;
+      if (now - last < SYNC_MIN_INTERVAL_MS) {
+        // Límite de tasa OBLIGATORIO (D3): el pedido se DESCARTA y se avisa.
+        // No se responde nada — responder un error por cada pedido de una
+        // ráfaga es la tormenta que este piso existe para evitar.
+        this.logger.warn(`re-sync descartado por el piso de ${SYNC_MIN_INTERVAL_MS}ms en el socket ${client.id}`);
+        return;
+      }
+      client.data.lastSyncAt = now;
+
+      // SOLO la rama de sync. Deliberadamente NO se hace ninguna de estas:
+      //   · `socket.join()`      — el socket YA está en la sala (Socket.IO es
+      //                            idempotente, pero no dependemos de eso).
+      //   · asignar color        — el color es del SOCKET, no del join (D7 de
+      //                            `reconnect-and-presence`).
+      //   · `presence:joined`    — sería FALSO: el usuario ya estaba acá.
+      //   · tocar locks/roster   — nada cambió para la sala.
+      // Y `emitToSocket` (no `emitTo`): el sync es del que lo pidió, como en
+      // el join (W-1 del verify 2026-09-18).
+      const resync = await this.reconnect.sync(diagramId, payload.lastVersion);
+      this.emitToSocket(client, 'diagram:sync', resync);
+      return;
+    }
+
     // INV-RC-1 (reconnect-and-presence/design.md §D3): el join va PRIMERO,
     // SIEMPRE antes de leer la versión o las filas del log. Toda operación
     // confirmada es entonces anterior a la lectura de versión (y está en el
     // delta/snapshot) o posterior al join (y llega por difusión) — los dos
     // conjuntos se solapan, no dejan hueco. Si esto se reordena, el delta
     // deja de ser completo y nada falla ruidosamente.
-    await client.join(this.roomOf(client.data.diagramId));
+    await client.join(this.roomOf(diagramId));
 
-    const diagramId = client.data.diagramId;
     const userId = client.data.user.id;
 
     // Color por sala + roster (design.md §D7-D8). `fetchSockets()` YA
