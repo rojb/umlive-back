@@ -348,6 +348,11 @@ model UmlElement {
   relationshipsAsSource UmlRelationship[]     @relation("RelationshipSource")
   relationshipsAsTarget UmlRelationship[]     @relation("RelationshipTarget")
   relationshipEnds      UmlRelationshipEnd[]
+  /// FR-B10: the ASSOCIATION row(s) this element (kind CLASS) is the
+  /// association class of. `@@unique([associationClassId])` on the other side
+  /// caps this at zero-or-one in practice (Postgres: multiple NULLs are
+  /// distinct, so only a genuinely linked class is constrained).
+  associationClassOf UmlRelationship[] @relation("AssociationClassOf")
 
   @@index([diagramId])
   @@index([parentId])
@@ -442,6 +447,16 @@ model UmlRelationship {
   stereotype String?
   xmiId      String? @map("xmi_id")
 
+  /// FR-B10, `association-class` slice. UML 2.5 `AssociationClass` specializes
+  /// BOTH `Association` and `Class`; this column is the enlace (design.md
+  /// path 2, D-decisions): the row stays `kind = 'ASSOCIATION'` (D4 of
+  /// `uml-relationships-backend` is untouched), and this nullable FK points at
+  /// the `UmlElement` (kind CLASS) that carries the extra attributes/operations
+  /// that belong to neither end. Two hand-written CHECKs in the new migration
+  /// enforce what Prisma cannot: `association_class_id` only set when
+  /// `kind = 'ASSOCIATION'`, and never equal to either endpoint.
+  associationClassId String? @map("association_class_id") @db.Uuid
+
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -455,9 +470,17 @@ model UmlRelationship {
   sourceElement UmlElement @relation("RelationshipSource", fields: [sourceElementId], references: [id], onDelete: Restrict)
   targetElement UmlElement @relation("RelationshipTarget", fields: [targetElementId], references: [id], onDelete: Restrict)
 
+  /// Explicit `Restrict`, NOT the `SetNull` Prisma defaults to on optional
+  /// relations (design.md D4). `SetNull` would silently unlink the association
+  /// class on delete — a model mutation nobody asked for, exactly what FR-C07
+  /// forbids. `deleteElement` must see this coming and respond 409, not the
+  /// database quietly rewriting the model.
+  associationClass UmlElement? @relation("AssociationClassOf", fields: [associationClassId], references: [id], onDelete: Restrict)
+
   ends   UmlRelationshipEnd[]
   layout RelationshipLayout?
 
+  @@unique([associationClassId])
   @@index([diagramId])
   @@index([sourceElementId])
   @@index([targetElementId])

@@ -568,6 +568,16 @@ export const UML_ERROR = {
    * `MAX_STEREOTYPE_LENGTH` tras `normalizeStereotype()` (D10).
    */
   STEREOTYPE_INVALID: 'stereotype_invalid',
+
+  // ── Agregados por `association-class` (design.md §4, D2/D3) ───────────────
+  /** `P2002` sobre `uml_relationships_association_class_id_key`: la clase ya es clase asociación de otra relación. */
+  ASSOCIATION_CLASS_ALREADY_LINKED: 'association_class_already_linked',
+  /** Servicio (`loadLinkableClass`, D2): el elemento existe en el diagrama pero `kind !== 'CLASS'`. */
+  ASSOCIATION_CLASS_INVALID_KIND: 'association_class_invalid_kind',
+  /** `P2039` sobre `ck_assoc_class_not_endpoint`: la clase propuesta es uno de los dos extremos de la relación. */
+  ASSOCIATION_CLASS_IS_ENDPOINT: 'association_class_is_endpoint',
+  /** `P2039` sobre `ck_assoc_class_only_on_association`: la relación no es `kind: 'ASSOCIATION'`. */
+  ASSOCIATION_CLASS_KIND_NOT_ASSOCIATION: 'association_class_kind_not_association',
 } as const;
 
 export type UmlErrorCode = (typeof UML_ERROR)[keyof typeof UML_ERROR];

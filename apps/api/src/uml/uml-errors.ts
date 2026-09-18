@@ -65,12 +65,41 @@ import { UML_ERROR, type UmlErrorCode } from '@umlive/contracts';
  * `height`, fase 3) es la primera barrera real: la base es red de
  * seguridad, tal como dice design.md §3.
  */
+/**
+ * Fila agregada por `association-class` (design.md D3; tasks.md 1.5,
+ * bloqueante). Forzado real contra PostgreSQL 17 (puerto 5434,
+ * `@prisma/adapter-pg`), script descartable, borrado antes del commit —
+ * mismo precedente que el bloque de `uml-classifiers` de arriba.
+ *
+ * `@@unique([associationClassId])` sin `map` en `schema.prisma`: el nombre
+ * por convención de Postgres es `uml_relationships_association_class_id_key`
+ * — **confirmado** con `\d uml_relationships` contra la base real, no
+ * asumido (design.md D3: "expectativa, no hecho").
+ *
+ * Forma observada, IDÉNTICA al plan A ya documentado arriba (mismo camino
+ * `adapter-pg`, mismo driver adapter):
+ *
+ *   err.code = 'P2002'
+ *   err.meta = {
+ *     driverAdapterError: { cause: {
+ *       originalCode: '23505',
+ *       originalMessage: 'duplicate key value violates unique constraint
+ *         "uml_relationships_association_class_id_key"',
+ *       kind: 'UniqueConstraintViolation',
+ *       constraint: { index: 'uml_relationships_association_class_id_key' },
+ *       table: 'uml_relationships',
+ *     } },
+ *   }
+ *
+ * Resuelve por `extractAdapterIndexName` (plan A), sin cambios al resolvedor.
+ */
 const INDEX_TO_UML_ERROR: Record<string, UmlErrorCode> = {
   uq_element_name_per_parent: UML_ERROR.ELEMENT_NAME_TAKEN,
   uq_attribute_name_per_owner: UML_ERROR.ATTRIBUTE_NAME_TAKEN,
   uml_enum_literals_enumeration_id_name_key: UML_ERROR.ENUM_LITERAL_NAME_TAKEN,
   uml_parameters_operation_id_position_key: UML_ERROR.PARAMETER_POSITION_CONFLICT,
   uq_parameter_single_return: UML_ERROR.OPERATION_ALREADY_HAS_RETURN,
+  uml_relationships_association_class_id_key: UML_ERROR.ASSOCIATION_CLASS_ALREADY_LINKED,
 };
 
 const KNOWN_INDEX_NAMES = Object.keys(INDEX_TO_UML_ERROR);
@@ -291,6 +320,29 @@ const CHECK_CONSTRAINT_TO_UML_ERROR: Record<string, UmlErrorCode> = {
    * `500` de todos modos.
    */
   ck_element_not_own_parent: UML_ERROR.CONTAINMENT_CYCLE,
+
+  /**
+   * Dos filas agregadas por `association-class` (design.md D2/D3; tasks.md
+   * 1.5, bloqueante). Forzadas real contra PostgreSQL 17, script descartable
+   * — mismo procedimiento que el resto de este archivo. Ninguna de las dos
+   * trae `cause.constraint` estructurado (mismo hallazgo que el resto de
+   * `P2039` documentado arriba): el nombre solo aparece en
+   * `cause.originalMessage`, vía el mismo plan A (regex) ya escrito.
+   *
+   * 1) `ck_assoc_class_not_endpoint` (ligar la clase que es uno de los dos
+   *    extremos de su propia relación):
+   *
+   *      originalMessage: 'new row for relation "uml_relationships" ' +
+   *        'violates check constraint "ck_assoc_class_not_endpoint"'
+   *
+   * 2) `ck_assoc_class_only_on_association` (ligar sobre una relación que no
+   *    es `ASSOCIATION`, p. ej. `GENERALIZATION`):
+   *
+   *      originalMessage: 'new row for relation "uml_relationships" ' +
+   *        'violates check constraint "ck_assoc_class_only_on_association"'
+   */
+  ck_assoc_class_not_endpoint: UML_ERROR.ASSOCIATION_CLASS_IS_ENDPOINT,
+  ck_assoc_class_only_on_association: UML_ERROR.ASSOCIATION_CLASS_KIND_NOT_ASSOCIATION,
 };
 
 const KNOWN_CHECK_NAMES = Object.keys(CHECK_CONSTRAINT_TO_UML_ERROR);
@@ -353,6 +405,75 @@ function extractOriginalMessage(meta: Record<string, unknown> | undefined): stri
  */
 export function handleCheckViolation(err: unknown): never {
   const code = resolveCheckViolation(err);
+  if (code) {
+    throw new ConflictException({ code });
+  }
+  throw err;
+}
+
+/**
+ * Resolvedor de `P2003` (violación de FK, PostgreSQL `23503`) — el primero
+ * de este archivo (design.md D3: `uml-relationships` decidió explícitamente
+ * NO escribirlo porque su único `P2003` alcanzable era solo red de carrera
+ * que se relanzaba tal cual). Acá sí hace falta: borrar una clase asociación
+ * ligada dispara `uml_relationships_association_class_id_fkey` (`onDelete:
+ * Restrict`, explícito — design.md D4), y la comprobación previa autoritativa
+ * de `deleteElement` (D4, fase 2) puede perder la carrera contra un ligado
+ * concurrente entre la lectura y el `DELETE`.
+ *
+ * Forzado real contra PostgreSQL 17 (borrar la clase ligada del script de la
+ * tarea 1.5) — MISMA forma que `P2002` (a diferencia de `P2039`, un `23503`
+ * SÍ trae `cause.constraint.index` estructurado):
+ *
+ *   err.code = 'P2003'
+ *   err.meta = {
+ *     modelName: 'UmlElement',
+ *     driverAdapterError: { cause: {
+ *       originalCode: '23503',
+ *       originalMessage: 'update or delete on table "uml_elements" ' +
+ *         'violates foreign key constraint ' +
+ *         '"uml_relationships_association_class_id_fkey" on table ' +
+ *         '"uml_relationships"',
+ *       kind: 'ForeignKeyConstraintViolation',
+ *       constraint: { index: 'uml_relationships_association_class_id_fkey' },
+ *     } },
+ *   }
+ *
+ * Reusa `extractAdapterIndexName` (mismo helper que `resolveUniqueViolation`)
+ * porque un `23503` trae el nombre de la constraint en el MISMO campo que un
+ * `23505` — no hace falta un extractor nuevo.
+ */
+const FK_TO_UML_ERROR: Record<string, UmlErrorCode> = {
+  uml_relationships_association_class_id_fkey: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
+};
+
+/**
+ * `null` si no reconoce nada — mismo criterio que los otros dos
+ * resolvedores: el llamador relanza como `500`, nunca un `409` genérico.
+ */
+export function resolveForeignKeyViolation(err: unknown): UmlErrorCode | null {
+  if (!(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== 'P2003') {
+    return null;
+  }
+
+  const meta = err.meta as Record<string, unknown> | undefined;
+  const adapterIndex = extractAdapterIndexName(meta);
+  if (adapterIndex) {
+    const resolved = FK_TO_UML_ERROR[adapterIndex];
+    if (resolved) return resolved;
+  }
+  return null;
+}
+
+/**
+ * Envoltorio único, mismo patrón que `handleUniqueViolation`/
+ * `handleCheckViolation`. Uso previsto (D4, fase 2): red de carrera de
+ * `deleteElement` — la comprobación previa autoritativa ya produjo el `409`
+ * en el caso normal; este envoltorio existe para el caso raro en que alguien
+ * liga la clase entre la relectura y el `DELETE`.
+ */
+export function handleForeignKeyViolation(err: unknown): never {
+  const code = resolveForeignKeyViolation(err);
   if (code) {
     throw new ConflictException({ code });
   }

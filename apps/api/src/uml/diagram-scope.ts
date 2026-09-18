@@ -1,5 +1,6 @@
-import { NotFoundException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { Prisma } from '../generated/prisma/client';
+import { UML_ERROR } from '@umlive/contracts';
 
 /**
  * Aislamiento por diagrama para entidades direccionadas por su propio UUID
@@ -84,4 +85,41 @@ export async function assertRelationshipInDiagram(tx: Tx, relationshipId: string
     select: { id: true },
   });
   if (!row) throw new NotFoundException();
+}
+
+/**
+ * Agregado por `association-class` (design.md D2; tasks.md 1.7). Resuelve,
+ * en UNA sola consulta, las dos comprobaciones que un `CHECK` no puede
+ * expresar porque son entre tablas: que el elemento propuesto como clase
+ * asociación existe en ESTE diagrama y que su `kind` persistido es `CLASS`.
+ *
+ * `404` para diagrama ajeno/inexistente (mismo criterio que los cinco
+ * helpers de arriba: un recurso ajeno es un oráculo, no una decisión de
+ * permiso), `409 association_class_invalid_kind` para `kind` equivocado
+ * (estado propio y visible). No valida que no sea uno de los dos extremos de
+ * la relación — eso es un `CHECK` de una sola fila (`ck_assoc_class_not_endpoint`,
+ * ver la migración) y el llamador (`RelationshipsService.setAssociationClass`,
+ * fase 2) lo captura como `P2039`, no acá.
+ *
+ * Por qué NO hace falta un `CONSTRAINT TRIGGER` para `kind`/`diagramId`
+ * (design.md D2): las dos columnas son inmutables en este código — ninguna
+ * mutación existente de `UmlElement` las toca — así que una lectura dentro
+ * de la misma transacción no puede quedar rancia. La única carrera posible
+ * es que el elemento se BORRE entre esta lectura y el `UPDATE`, y de esa se
+ * ocupa la FK (`P2003`, ver `uml-errors.ts`), no esta función.
+ */
+export async function loadLinkableClass(
+  tx: Tx,
+  elementId: string,
+  diagramId: string,
+): Promise<{ id: string; kind: string; xmiId: string | null }> {
+  const row = await tx.umlElement.findFirst({
+    where: { id: elementId, diagramId },
+    select: { id: true, kind: true, xmiId: true },
+  });
+  if (!row) throw new NotFoundException();
+  if (row.kind !== 'CLASS') {
+    throw new ConflictException({ code: UML_ERROR.ASSOCIATION_CLASS_INVALID_KIND });
+  }
+  return row;
 }
