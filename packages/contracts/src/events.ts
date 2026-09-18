@@ -56,6 +56,14 @@ export interface ServerEvents {
   'presence:left': (p: { userId: string }) => void;
   'presence:cursor': (p: { userId: string; x: number; y: number }) => void;
   'presence:select': (p: { userId: string; elementIds: string[] }) => void;
+  /**
+   * Roster completo, dirigido SOLO al socket que se une. Deduplicado por
+   * `userId`: cuatro ventanas de la misma persona son UNA fila y UN color.
+   * Existe porque `presence:joined`/`presence:left` son incrementales y sin
+   * esto la cuarta ventana en abrirse no ve a las tres que ya estaban
+   * (SC-C27 sería incumplible). reconnect-and-presence/design.md §D8.
+   */
+  'presence:roster': (p: PresenceUser[]) => void;
   /** Expulsión: se quitó al usuario del proyecto (SC-A12). */
   'access:revoked': (p: { reason: string }) => void;
   /** Emitido justo antes de desconectar por `exp` vencido — distingue vencimiento de caída de red (design.md §D5). */
@@ -82,6 +90,12 @@ export interface PresenceUser {
  */
 export const PRESENCE_COLORS = ['#2B6CB8', '#7A4FD0', '#0E7C86', '#A8446B', '#B0562A', '#4A5C9E'] as const;
 
+/**
+ * ⚠️ ÚLTIMO RECURSO. La fuente primaria del color es la asignación POR SALA
+ * que hace el gateway al unirse (reconnect-and-presence/design.md §D7) y que
+ * el cliente lee del roster. Con 4 usuarios este hash colisiona el 72,2 % de
+ * las veces (1 − (5/6)(4/6)(3/6)). El cliente NUNCA lo llama.
+ */
 export function presenceColor(userId: string): string {
   let h = 0;
   for (let i = 0; i < userId.length; i++) h = (h * 31 + userId.charCodeAt(i)) >>> 0;

@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { LockHolder } from '@umlive/contracts';
+import type { LockHolder, LockReleased } from '@umlive/contracts';
 
 /**
  * Registro de bloqueos de elemento — en memoria, a propósito.
@@ -46,7 +46,7 @@ export class LocksService implements OnModuleDestroy {
    * Callback que el gateway registra para difundir liberaciones. El servicio
    * no conoce el socket: mantenerlo así lo hace testeable sin levantar red.
    */
-  private onRelease?: (diagramId: string, elementId: string, cause: string) => void;
+  private onRelease?: (diagramId: string, elementId: string, cause: LockReleased['cause']) => void;
 
   constructor(config: ConfigService) {
     this.ttlMs = Number(config.get('LOCK_TTL_MS') ?? 15_000);
@@ -60,7 +60,7 @@ export class LocksService implements OnModuleDestroy {
     clearInterval(this.sweeper);
   }
 
-  setReleaseListener(fn: (diagramId: string, elementId: string, cause: string) => void) {
+  setReleaseListener(fn: (diagramId: string, elementId: string, cause: LockReleased['cause']) => void) {
     this.onRelease = fn;
   }
 
@@ -88,6 +88,20 @@ export class LocksService implements OnModuleDestroy {
         return { ok: true, expiresAt: existing.expiresAt };
       }
       return { ok: false, holder: existing.holder };
+    }
+
+    // Relevo de un lock VENCIDO ajeno (reconnect-and-presence/design.md §D1).
+    // Si no se deindexa al dueño ANTERIOR acá, su clave `${diagramId}:${elementId}`
+    // queda stale en `byUser` para siempre: cuando ese usuario se desconecte,
+    // `releaseAllForUserInDiagrams` la recorre y borra el lock VIVO del nuevo
+    // dueño, más un `lock:released` que nadie pidió. Síncrono a propósito:
+    // `deindex` es un `Map`/`Set` en memoria y `onRelease` encola un `emit`
+    // de Socket.IO y vuelve — ninguno de los dos suspende la ejecución, así
+    // que `acquire` sigue siendo atómica (SC-C03). Si al tocar esto aparece
+    // la palabra clave que vuelve una función asíncrona, el arreglo está mal.
+    if (existing && existing.holder.userId !== holder.userId) {
+      this.deindex(existing.holder.userId, diagramId, elementId);
+      this.onRelease?.(diagramId, elementId, 'expired');
     }
 
     const expiresAt = now + this.ttlMs;
@@ -162,7 +176,7 @@ export class LocksService implements OnModuleDestroy {
     }
   }
 
-  release(diagramId: string, elementId: string, userId: string, cause = 'released'): boolean {
+  release(diagramId: string, elementId: string, userId: string, cause: LockReleased['cause'] = 'released'): boolean {
     const locks = this.byDiagram.get(diagramId);
     const lock = locks?.get(elementId);
     if (!lock || lock.holder.userId !== userId) return false;
@@ -173,47 +187,22 @@ export class LocksService implements OnModuleDestroy {
   }
 
   /**
-   * SC-C06. Al cerrarse el socket, sin esperar el TTL.
-   *
-   * ⚠️ **ALCANCE GLOBAL — no sirve para SC-A12.** Suelta los locks del usuario
-   * en **todos** los diagramas, de todos los proyectos. Eso es correcto para una
-   * desconexión, porque al caerse el socket el usuario deja de estar en todos
-   * lados a la vez.
-   *
-   * **No lo uses para expulsar a alguien de un proyecto.** Quitar a Diego de
-   * `P1` con este método también le soltaría lo que tiene tomado en `P2`, donde
-   * sigue siendo miembro y puede estar editando en ese mismo momento. Nadie
-   * vería un error: simplemente perdería su trabajo en otro proyecto.
-   *
-   * SC-A12 necesita un método con alcance por proyecto, que todavía no existe:
-   * hay que resolver los diagramas de ese proyecto y soltar solo esas claves.
-   * Detectado al proponer la rebanada `projects`, 2026-09-12.
-   */
-  releaseAllForUser(userId: string, cause = 'disconnected'): void {
-    const keys = this.byUser.get(userId);
-    if (!keys) return;
-    for (const key of [...keys]) {
-      const sep = key.indexOf(':');
-      const diagramId = key.slice(0, sep);
-      const elementId = key.slice(sep + 1);
-      this.byDiagram.get(diagramId)?.delete(elementId);
-      this.onRelease?.(diagramId, elementId, cause);
-    }
-    this.byUser.delete(userId);
-  }
-
-  /**
    * SC-A12. Alcance por proyecto: suelta los locks del usuario, pero SOLO en
-   * los diagramas de `diagramIds` — nunca en todos los suyos como
-   * `releaseAllForUser`. Quien llama resuelve primero los diagramas del
-   * proyecto del que se quitó al usuario (design.md §4).
+   * los diagramas de `diagramIds`. Quien llama resuelve primero los
+   * diagramas del proyecto del que se quitó al usuario (design.md §4).
    *
-   * Sin llamador en esta rebanada — ver el comentario de enganche en
-   * `members.service.ts` (`remove()`). Existe para que M3, cuando
-   * `collaboration.gateway.ts` exista, lo enchufe sin tener que diseñar el
-   * alcance correcto desde cero.
+   * También es el método que `reconnect-and-presence` cablea desde
+   * `teardown(socket)` para una desconexión/`diagram:leave` bajo INV-WS-1
+   * (design.md §D2): el alcance por diagrama es correcto ahí porque un
+   * socket sirve un solo diagrama (D3 de `collaboration-gateway`) y la
+   * contabilidad es por socket, no por usuario (D6). El método que ANTES
+   * existía para desconexión (`releaseAllForUser`, alcance GLOBAL) se
+   * eliminó: bajo D3+D6 su alcance era falso — cerrar una de cuatro ventanas
+   * habría soltado los locks del usuario en las otras tres y en todos los
+   * diagramas de todos los proyectos. Cero llamadores antes de esta
+   * rebanada; ahora dos: `teardown` y (más adelante) `MembersService.remove()`.
    */
-  releaseAllForUserInDiagrams(userId: string, diagramIds: string[], cause = 'removed_from_project'): void {
+  releaseAllForUserInDiagrams(userId: string, diagramIds: string[], cause: LockReleased['cause'] = 'removed_from_project'): void {
     const keys = this.byUser.get(userId);
     if (!keys) return;
     const scope = new Set(diagramIds);
@@ -232,7 +221,7 @@ export class LocksService implements OnModuleDestroy {
    * SC-C18. Congelar suelta TODO lo del diagrama, de todos los usuarios.
    * Se llama antes de difundir `diagram:frozen`.
    */
-  releaseAllInDiagram(diagramId: string, cause = 'frozen'): void {
+  releaseAllInDiagram(diagramId: string, cause: LockReleased['cause'] = 'frozen'): void {
     const locks = this.byDiagram.get(diagramId);
     if (!locks) return;
     for (const [elementId, lock] of locks) {

@@ -204,8 +204,16 @@ export interface LockDenied {
 
 export interface LockReleased {
   elementId: string;
-  /** Para qué se soltó. Útil para distinguir un final normal de una caída. */
-  cause: 'released' | 'expired' | 'disconnected' | 'frozen' | 'forced';
+  /**
+   * Para qué se soltó. Útil para distinguir un final normal de una caída.
+   * `'removed_from_project'` es el default de
+   * `LocksService.releaseAllForUserInDiagrams` (SC-A12). Faltaba en la
+   * unión: el día que `MembersService.remove()` lo cablee emitiría un
+   * `cause` que el cliente no sabe leer (reconnect-and-presence/design.md
+   * §D1). No lleva `userId` a propósito: hay UN lock por `elementId`, así
+   * que el cliente borra por clave (design.md §D12).
+   */
+  cause: 'released' | 'expired' | 'disconnected' | 'frozen' | 'forced' | 'removed_from_project';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
