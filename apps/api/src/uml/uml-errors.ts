@@ -507,6 +507,23 @@ export function handleCheckViolation(err: unknown): never {
  */
 const FK_TO_UML_ERROR: Record<string, UmlErrorCode> = {
   uml_relationships_association_class_id_fkey: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
+
+  /**
+   * Tres filas agregadas por `operations-pipeline` (design.md D8, orden del
+   * traductor #4; tasks.md fase 3). `deleteElementIn` (a diferencia del
+   * envoltorio HTTP `deleteElement`) no tiene su propio `catch` de `P2003`
+   * dentro de la transacción — el camino del socket deja que el error crudo
+   * llegue a `operation-rejection.ts`, que reusa ESTE resolvedor ya
+   * existente en vez de escribir uno nuevo. Sin `count`/`relationships`
+   * enriquecidos a propósito (design.md D8): duplicar
+   * `findIncidentRelationships` fuera de `ElementsService` para una carrera
+   * que los locks de M4 eliminan es costo sin retorno. `schema.prisma`:
+   * `sourceElement`/`targetElement` de `uml_relationships` y `element` de
+   * `uml_relationship_ends` son `onDelete: Restrict` (FR-C07).
+   */
+  uml_relationships_source_element_id_fkey: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
+  uml_relationships_target_element_id_fkey: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
+  uml_relationship_ends_element_id_fkey: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
 };
 
 /**
