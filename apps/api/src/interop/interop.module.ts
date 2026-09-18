@@ -4,6 +4,7 @@ import { XmiAdmissionService } from './xmi-admission';
 import { XmiExportController } from './xmi-export.controller';
 import { XmiExportService } from './xmi-export.service';
 import { XmiImportController } from './xmi-import.controller';
+import { XmiImportService } from './xmi-import.service';
 import { XsdValidatorService } from './xsd-validator.service';
 
 /**
@@ -29,19 +30,27 @@ import { XsdValidatorService } from './xsd-validator.service';
  * provider de ESTE módulo. `XmiExportService` lo inyecta y corre G2 al final
  * del pipeline, después de G1.
  *
- * ── `xmi-import` (M5, rebanada 2 de 4 — Fase 1, tarea 1.7) ────────────────
+ * ── `xmi-import` (M5, rebanada 2 de 4 — Fase 4, tarea 4.6) ────────────────
  * `XmiAdmissionService` es el nivel A de la admisión (tamaño, prólogo,
  * `windows-1252`, buena formación, namespace por URI) y el lugar del log al
- * arranque de la sonda de decodificación (D4). `XmiImportController` entra ya
- * registrado pero **sin rutas**: las cuatro de §3 las agrega la Fase 4. El
- * lector (`xmi-reader.ts`), el lector de la extensión EA
+ * arranque de la sonda de decodificación (D4).
+ *
+ * `XmiImportService` es el orquestador (nivel A→B→C) y el ÚNICO consumidor de
+ * `PrismaService` de esta rebanada: `PrismaModule` es `@Global()`, así que no
+ * hace falta importarlo. Registrado acá, `XmiImportController` expone sus
+ * cuatro rutas y el arranque pasa de 25 a 29 rutas mapeadas.
+ *
+ * El lector (`xmi-reader.ts`), el pre-vuelo (`import-preflight.ts`), el
+ * escritor tonto (`import-plan.ts`), el lector de la extensión EA
  * (`ea-extension-reader.ts`) y el auto-layout (`auto-layout.ts`) son funciones
- * puras: no son providers y no necesitan estar acá.
+ * puras: no son providers y no necesitan estar acá. Eso es deliberado — el
+ * escritor transaccional no puede tomar decisiones que lo hagan abortar (D1),
+ * y la forma más barata de garantizarlo es que no tenga nada inyectado.
  */
 @Module({
   imports: [UmlModule],
   controllers: [XmiExportController, XmiImportController],
-  providers: [XmiExportService, XsdValidatorService, XmiAdmissionService],
+  providers: [XmiExportService, XmiImportService, XsdValidatorService, XmiAdmissionService],
   exports: [XmiExportService, XmiAdmissionService],
 })
 export class InteropModule {}
