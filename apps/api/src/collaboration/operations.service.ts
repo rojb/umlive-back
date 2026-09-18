@@ -4,6 +4,7 @@ import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Tx } from '../prisma/tx.type';
 import { OperationDispatcher } from './operation-dispatch';
+import { validateOperationPayload } from './operation-validation';
 import { translateRejection } from './operation-rejection';
 
 /**
@@ -61,8 +62,60 @@ export class OperationsService {
       };
     }
 
+    // Lista blanca de `type` (verify-report 2026-09-18, C-1) — ANTES de
+    // abrir la transacción. `this.dispatcher.isKnownType` lee la MISMA
+    // fuente que ejecuta la operación (`OperationHandlers`, sin prototipo);
+    // un `type` que no es `Object.hasOwn` de ese mapa ('toString',
+    // 'constructor', '__proto__', 'hasOwnProperty', o cualquier tipo
+    // inventado) nunca llega a `dispatch` — antes, `this.handlers[type]`
+    // resolvía a un método HEREDADO de `Object.prototype`, escribía una fila
+    // imborrable (`trg_operations_append_only`) y difundía basura a la sala.
+    if (!this.dispatcher.isKnownType(req.type)) {
+      const currentVersion = await this.readCurrentVersion(diagramId);
+      return {
+        route: 'sender',
+        event: 'op:rejected',
+        payload: {
+          opId: req.opId,
+          diagramId,
+          reason: 'MALFORMED',
+          message: 'El tipo de operación no existe.',
+          currentVersion,
+        },
+      };
+    }
+
+    // Forma del payload (verify-report W-1, W-2) — MISMOS DTOs de
+    // `class-validator` que las rutas HTTP, mismas opciones que el
+    // `ValidationPipe` global (`whitelist: true, forbidNonWhitelisted: true`,
+    // `main.ts:37`). El resultado REEMPLAZA `req.payload`: lo que sigue
+    // viaje hacia el despachador — y lo que termina logueado y difundido en
+    // `toCommitted` — es el payload VALIDADO, nunca el crudo. Un campo
+    // ajeno al protocolo (`junk`), un campo del protocolo que ese handler no
+    // lee (`isAbstract` en `element.rename`), o un tipo de campo incorrecto
+    // (`x: '5'`, `x: 1.5` donde `MoveElementDto` exige `@IsInt()`) rechazan
+    // ACÁ, antes de cualquier escritura — nunca como un `INTERNAL` que
+    // ensucia el log del servidor (W-2), y nunca como un eco silencioso de
+    // algo que la base no persistió (W-1).
+    const validated = await validateOperationPayload(req.type, req.payload);
+    if (!validated.ok) {
+      const currentVersion = await this.readCurrentVersion(diagramId);
+      return {
+        route: 'sender',
+        event: 'op:rejected',
+        payload: {
+          opId: req.opId,
+          diagramId,
+          reason: 'MALFORMED',
+          message: validated.message,
+          currentVersion,
+        },
+      };
+    }
+    const validatedReq: OperationRequest = { ...req, payload: validated.value as PayloadFor<OperationType> };
+
     try {
-      return await this.prisma.$transaction((tx) => this.submitIn(tx, diagramId, actorId, req), {
+      return await this.prisma.$transaction((tx) => this.submitIn(tx, diagramId, actorId, validatedReq), {
         // Valores por defecto de Prisma, escritos explícitos para que sean un
         // número revisable y no una suposición (design.md D7). El `FOR
         // UPDATE` espera ADENTRO de la transacción, así que `timeout` cubre
@@ -74,7 +127,10 @@ export class OperationsService {
       });
     } catch (err) {
       const currentVersion = await this.readCurrentVersion(diagramId);
-      const rejection = translateRejection(err, req.opId, diagramId, req.type, req.payload, currentVersion);
+      // `validatedReq.payload`, no `req.payload`: si el rechazo necesita
+      // `conflictingName` (`resolveUniqueViolation`), tiene que salir del
+      // payload que YA pasó la validación de borde, nunca del crudo.
+      const rejection = translateRejection(err, validatedReq.opId, diagramId, validatedReq.type, validatedReq.payload, currentVersion);
       return { route: 'sender', event: 'op:rejected', payload: rejection };
     }
   }
@@ -83,6 +139,14 @@ export class OperationsService {
     // 1. Lock puro — una sola cosa por consulta (D7). `::uuid` no es
     // cosmético: sin el cast el driver adapter manda el parámetro como
     // `text` y Postgres responde 42804.
+    //
+    // Nota fechada 2026-09-18 (verify-report W-8, design.md D7): `lock_state`
+    // NO se selecciona acá a propósito. `DATA-MODEL.md:846-849` lo pone en
+    // este mismo `SELECT … FOR UPDATE`, junto con el `423` de diagrama
+    // congelado (C.1/C.4 de `SPECS.md:236`). Falta la rama que rechaza con
+    // `423 DIAGRAM_FROZEN` cuando `lock_state !== 'unlocked'` — es
+    // `concurrency-ux` (M4), no esta rebanada. Un comentario sobrevive a una
+    // limpieza de "columna sin usar"; una variable sin leer no.
     await tx.$queryRaw`SELECT 1 FROM diagrams WHERE id = ${diagramId}::uuid FOR UPDATE`;
 
     // 2. Idempotencia — se resuelve LEYENDO, nunca escribiendo (D6). El
@@ -153,6 +217,21 @@ export class OperationsService {
   private async readCurrentVersion(diagramId: string): Promise<number> {
     const row = await this.prisma.diagram.findUnique({ where: { id: diagramId }, select: { currentVersion: true } });
     return row ? Number(row.currentVersion) : 0;
+  }
+
+  /**
+   * Envoltorio público de `readCurrentVersion` (verify-report 2026-09-18,
+   * W-4/C-2). El gateway rechaza DOS casos antes de llamar `submit`
+   * (socket no unido a la sala, miembro sin permiso vigente) y esos
+   * `OperationRejected` también necesitan `currentVersion` "de ahora"
+   * (SC-C12) — sin este método, el gateway tendría que inyectar
+   * `PrismaService` directo, lo que rompería la barrera D4/D8 (`rg -n
+   * "prisma|Prisma" collaboration.gateway.ts` debe seguir dando CERO
+   * líneas). Sigue devolviendo solo un `number` del contrato — nunca una
+   * fila cruda.
+   */
+  async currentVersion(diagramId: string): Promise<number> {
+    return this.readCurrentVersion(diagramId);
   }
 }
 

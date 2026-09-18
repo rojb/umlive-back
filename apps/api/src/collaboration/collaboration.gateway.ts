@@ -11,6 +11,7 @@ import {
 import {
   PROJECT_ERROR,
   type ClientEvents,
+  type OperationRejected,
   type OperationRequest,
   type ProjectRole,
   type ServerEvents,
@@ -60,6 +61,19 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   private readonly server!: CollabServer;
 
   private sweeper?: NodeJS.Timeout;
+
+  /**
+   * Cola por socket (verify-report 2026-09-18, W-3) — una cadena de
+   * promesas por `socket.id`, NUNCA una cola global: sockets DISTINTOS
+   * siguen corriendo en paralelo, solo las operaciones del MISMO socket se
+   * serializan. Sin esto, Socket.IO despacha los handlers `async` de
+   * `op:submit` en paralelo y cada `submit` compite por el `FOR UPDATE` de
+   * fila — 30 `element.move` seguidos del mismo cliente confirmaban en un
+   * orden distinto al que se enviaron (4 inversiones observadas en runtime).
+   * Se limpia en `handleDisconnect` (design.md §D7 de `collaboration-gateway`:
+   * nada por-usuario, todo por-socket).
+   */
+  private readonly socketQueues = new Map<string, Promise<void>>();
 
   constructor(
     private readonly socketAuth: SocketAuthService,
@@ -120,17 +134,20 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   }
 
   /**
-   * `handleDisconnect` existe para dejar escrito, en el lugar donde el
-   * próximo que toque esta rebanada lo va a buscar, que NO llama a
-   * `LocksService` (design.md §D7): no hay handler `lock:request` todavía,
-   * así que el registro de locks está siempre vacío, y el alcance GLOBAL de
-   * `releaseAllForUser` soltaría locks vivos de otras ventanas del mismo
-   * usuario si alguna vez tuviera efecto — el defecto de contabilidad por
-   * usuario (D6) entrando por la puerta de atrás. Cablearlo es tarea de la
-   * rebanada 3, junto con INV-WS-1 y el protocolo `lock:*` completo.
+   * `handleDisconnect` NO llama a `LocksService` (design.md §D7): no hay
+   * handler `lock:request` todavía, así que el registro de locks está
+   * siempre vacío, y el alcance GLOBAL de `releaseAllForUser` soltaría locks
+   * vivos de otras ventanas del mismo usuario si alguna vez tuviera efecto —
+   * el defecto de contabilidad por usuario (D6) entrando por la puerta de
+   * atrás. Cablearlo es tarea de la rebanada 3, junto con INV-WS-1 y el
+   * protocolo `lock:*` completo. Lo único que SÍ limpia acá (verify-report
+   * W-3, `operations-pipeline`) es la cola por-socket de `op:submit`.
    */
-  handleDisconnect(_client: CollabSocket): void {
-    // Intencionalmente vacío.
+  handleDisconnect(client: CollabSocket): void {
+    // W-3: soltar la cola de este socket. Sin esto, `socketQueues` crece sin
+    // límite en un servidor de larga vida (una entrada por cada socket que
+    // alguna vez mandó un `op:submit`, nunca liberada).
+    this.socketQueues.delete(client.id);
   }
 
   /**
@@ -217,12 +234,20 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   }
 
   /**
-   * Handler `op:submit` (`operations-pipeline/design.md` D3). Una línea sin
-   * rama que pueda errarse: `diagramId`/`actorId` AUTORITATIVOS son los de
-   * `socket.data` (del handshake), NUNCA los que pudiera traer el payload —
-   * el pipeline no valida eso porque el gateway ya se lo garantiza. El
-   * despacho por `out.route` no es una decisión de este archivo: la trae el
-   * propio `OperationOutcome`, fijada por quien conoce el motivo
+   * Handler `op:submit` (`operations-pipeline/design.md` D3, corregido
+   * 2026-09-18 por verify-report C-2/W-3/W-4). Único punto de entrada
+   * validado ANTES de que nada llegue a `OperationsService`/la transacción
+   * (decisión del coordinador, verify-report): unido a la sala → miembro con
+   * permiso VIGENTE → recién ahí el pipeline (que valida `type`/forma de
+   * payload, D11). Todo bajo `enqueueForSocket` (W-3): las operaciones del
+   * MISMO socket se procesan en el orden en que se mandaron: la corrida
+   * anterior tiene que resolver (incluido el rechazo) antes de que empiece
+   * la siguiente. Sockets DISTINTOS no se estorban entre sí.
+   *
+   * `diagramId`/`actorId` AUTORITATIVOS son los de `socket.data` (del
+   * handshake), NUNCA los que pudiera traer el payload. El despacho por
+   * `out.route` no es una decisión de este archivo: la trae el propio
+   * `OperationOutcome`, fijada por quien conoce el motivo
    * (`OperationsService`). `emitToSocket` es la misma puerta por-socket que
    * ya usan `diagram:sync`/`access:revoked` (§D8 corregido 2026-09-18) — el
    * eco de SC-C10 y el rechazo de SC-C11 la reusan en vez de sumar un método
@@ -230,13 +255,98 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    */
   @SubscribeMessage('op:submit')
   async onOperationSubmit(@ConnectedSocket() client: CollabSocket, @MessageBody() req: OperationRequest): Promise<void> {
+    await this.enqueueForSocket(client, () => this.processOperationSubmit(client, req));
+  }
+
+  private async processOperationSubmit(client: CollabSocket, req: OperationRequest): Promise<void> {
+    const room = this.roomOf(client.data.diagramId);
+
+    // 1. Unido a la sala (verify-report W-4). `diagram:join` hace `await
+    // resolveAccess` antes de `client.join` (D3 de `collaboration-gateway`),
+    // y los handlers de Socket.IO corren en paralelo — un `op:submit` que
+    // llega ANTES de que el `join` termine (reconexión) confirmaba y
+    // difundía igual, pero el remitente nunca recibía nada: violaba "todo
+    // `op:submit` DEBE producir exactamente una salida". Nunca silenciar:
+    // rechazo tipado, solo al remitente.
+    if (!client.rooms.has(room)) {
+      this.emitToSocket(client, 'op:rejected', await this.rejectedOp(req, 'MALFORMED', 'Todavía no te uniste a este diagrama. Esperá a que la sincronización termine e intentá de nuevo.'));
+      return;
+    }
+
+    // 2. Membresía + permiso VIGENTES, en CADA `op:submit` (verify-report
+    // C-2, INV-8 de `SPECS.md:52`). El handshake y `diagram:join` autorizan
+    // una sola vez; sin esto, a un miembro EXPULSADO después de unirse le
+    // alcanzaba con seguir mandando operaciones (no solo renovar el token,
+    // como ya cerraba W-2 de `auth:token`) para seguir escribiendo — HTTP ya
+    // respondía 403 en el mismo instante. `resolveAccess` nunca lanza
+    // (`ProjectAccessResolver`, `design.md §D2` de `collaboration-gateway`):
+    // acá se traduce a un `OperationRejected`, nunca a una excepción HTTP.
+    const access = await this.accessResolver.resolveAccess({
+      userId: client.data.user.id,
+      diagramId: client.data.diagramId,
+      action: 'diagram.edit',
+    });
+    if (!access.ok) {
+      // `insufficient_role` de `ProjectAccessResolver` YA fusiona "no es
+      // miembro" y "es miembro pero el rol no alcanza" (mismo criterio que
+      // el handshake y que HTTP, `design.md §7.2`: un id no es enumerable).
+      // `NOT_A_MEMBER` es el motivo del protocolo (`operations.ts`) que
+      // describe el caso — el que este mismo hallazgo (C-2) demuestra: un
+      // miembro QUITADO. `diagram_not_found`/`project_not_found` (el
+      // diagrama o el proyecto desaparecieron a mitad de sesión) son la
+      // misma familia que `TARGET_NOT_FOUND`: lo que direccionó ya no está.
+      const reason = access.reason === 'bad_request' ? 'MALFORMED' : access.reason === PROJECT_ERROR.INSUFFICIENT_ROLE ? 'NOT_A_MEMBER' : 'TARGET_NOT_FOUND';
+      const message =
+        reason === 'NOT_A_MEMBER'
+          ? 'Ya no sos miembro de este proyecto, o tu rol no alcanza para editar.'
+          : reason === 'TARGET_NOT_FOUND'
+            ? 'El diagrama o el proyecto ya no existen.'
+            : 'La operación no tiene una forma válida.';
+      this.emitToSocket(client, 'op:rejected', await this.rejectedOp(req, reason, message));
+      return;
+    }
+
+    // 3-4. Lista blanca de `type` + validación de payload (C-1, W-1, W-2) y
+    // el resto del pipeline: `OperationsService.submit` (`operations.service.ts`).
     const out = await this.operations.submit(client.data.diagramId, client.data.user.id, req);
     // `as never`: el precio honesto de que TypeScript no correlaciona `event`
     // con `payload` en un índice dinámico — un solo `as`, en el sitio de
     // despacho, cero en las 32 entradas del mapa (design.md D3).
-    out.route === 'room'
-      ? this.emitTo(client.data.diagramId, out.event, out.payload as never)
-      : this.emitToSocket(client, out.event, out.payload as never);
+    out.route === 'room' ? this.emitTo(client.data.diagramId, out.event, out.payload as never) : this.emitToSocket(client, out.event, out.payload as never);
+  }
+
+  /**
+   * Construye un `OperationRejected` sin abrir la transacción — mismas cinco
+   * propiedades que `operation-rejection.ts#rejected`, para los dos rechazos
+   * que este archivo emite ANTES del pipeline (W-4, C-2). `currentVersion`
+   * sale de `OperationsService.currentVersion` (nunca del ORM directo acá —
+   * barrera D4/D8) para que el cliente pueda reconciliar (SC-C12) igual que
+   * en cualquier otro rechazo.
+   */
+  private async rejectedOp(req: OperationRequest, reason: OperationRejected['reason'], message: string): Promise<OperationRejected> {
+    const currentVersion = await this.operations.currentVersion(req.diagramId);
+    return { opId: req.opId, diagramId: req.diagramId, reason, message, currentVersion };
+  }
+
+  /**
+   * Cola por-socket (verify-report W-3): encadena `task` detrás de lo último
+   * que ese `socket.id` haya encolado. El `.catch` al final de la cadena
+   * (nunca dentro de `task`) es a propósito: si `task` fallara sin
+   * atraparlo, la promesa encadenada rechazaría y `socketQueues.get(id)`
+   * quedaría apuntando a una promesa rechazada — el SIGUIENTE `.then()`
+   * saltaría directo a su rama de error sin correr `task`, y ese socket
+   * dejaría de procesar operaciones en silencio. `processOperationSubmit` ya
+   * no debería lanzar (`OperationsService.submit` no lanza; los dos
+   * rechazos tempranos de acá tampoco), pero la cola no depende de esa
+   * garantía para seguir viva — el error se loguea y la cadena sigue.
+   */
+  private enqueueForSocket(client: CollabSocket, task: () => Promise<void>): Promise<void> {
+    const previous = this.socketQueues.get(client.id) ?? Promise.resolve();
+    const next = previous.then(task, task).catch((err) => {
+      this.logger.error(`op:submit sin atrapar en la cola de ${client.id}: ${err instanceof Error ? err.message : String(err)}`, err instanceof Error ? err.stack : undefined);
+    });
+    this.socketQueues.set(client.id, next);
+    return next;
   }
 
   /**

@@ -42,11 +42,37 @@ export class OperationDispatcher {
     private readonly relationships: RelationshipsService,
     private readonly features: FeaturesService,
     private readonly parameters: ParametersService,
-  ) {}
+  ) {
+    // Verify-report 2026-09-18, C-1. Corre DESPUÉS de que el inicializador
+    // de campo de `handlers` ya asignó las 32 entradas (los inicializadores
+    // de campo corren antes del cuerpo del constructor) — quitarle el
+    // prototipo acá, en vez de reescribir el literal completo con
+    // `Object.create(null)`, mantiene intacto el chequeo de completitud de
+    // D5 (el literal se sigue tipando `OperationHandlers` tal cual, así que
+    // el compilador SIGUE auditando las 32 entradas) y no toca ni una línea
+    // del mapa de handlers. Segunda barrera: `isKnownType` ya usa
+    // `Object.hasOwn`, que por sí solo alcanza para que `'toString'`,
+    // `'constructor'`, `'__proto__'` y `'hasOwnProperty'` den `false` (son
+    // heredadas de `Object.prototype`, nunca propias del literal) — esto
+    // hace que ni siquiera `this.handlers[type]` SIN `hasOwn` resuelva a
+    // algo heredado.
+    Object.setPrototypeOf(this.handlers, null);
+  }
 
   async dispatch<T extends OperationType>(tx: Tx, diagramId: string, type: T, payload: PayloadFor<T>): Promise<PayloadFor<T>> {
     const handler = this.handlers[type] as (tx: Tx, diagramId: string, payload: PayloadFor<T>) => Promise<PayloadFor<T>>;
     return handler(tx, diagramId, payload);
+  }
+
+  /**
+   * Lista blanca de `OperationType` (verify-report 2026-09-18, C-1). Lee la
+   * MISMA fuente que `dispatch` — nunca un `Set` aparte, que podría
+   * desincronizarse del mapa real. `Object.hasOwn` (no `type in this.handlers`
+   * ni `this.handlers[type]`) es lo que hace que `'toString'`, `'constructor'`,
+   * `'__proto__'` y `'hasOwnProperty'` den `false`.
+   */
+  isKnownType(type: unknown): type is OperationType {
+    return typeof type === 'string' && Object.hasOwn(this.handlers, type);
   }
 
   private readonly handlers: OperationHandlers = {
