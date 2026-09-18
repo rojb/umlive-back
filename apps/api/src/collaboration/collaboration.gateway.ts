@@ -161,15 +161,21 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // `lastVersion` se acepta y se DESCARTA a propósito (design.md §D9): el
     // log de operaciones está vacío en esta rebanada y la versión siempre es
     // 0 — `mode: 'delta'` no puede existir todavía.
+    //
+    // W-1 (verify 2026-09-18): el snapshot va SOLO al socket que se une, vía
+    // `emitToSocket`, nunca a la sala entera. `emitTo` (sala) difundía el
+    // sync completo a los demás miembros en cada join — costo innecesario y
+    // la vía por la que W-2 encontró que un expulsado seguía recibiendo
+    // contenido.
     const state = await this.diagramContent.getDiagramContent(client.data.diagramId);
-    this.emitTo(client.data.diagramId, 'diagram:sync', { mode: 'snapshot', version: 0, state, operations: [] });
+    this.emitToSocket(client, 'diagram:sync', { mode: 'snapshot', version: 0, state, operations: [] });
   }
 
   /**
    * Renovación sin reconectar (design.md §D5). El gateway NUNCA dispara ni
    * acepta que el socket llame a `/auth/refresh` — esa llamada es
    * responsabilidad exclusiva del cliente HTTP, fuera del socket (SC-A06).
-   * Este handler solo reverifica lo que el cliente ya obtuvo.
+   * Este handler reverifica lo que el cliente ya obtuvo.
    */
   @SubscribeMessage('auth:token')
   async handleAuthToken(
@@ -183,18 +189,52 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       client.disconnect(true);
       return;
     }
+
+    // W-2 (verify 2026-09-18): re-chequear membresía en CADA renovación, no
+    // solo en el join. Sin esto, a un miembro expulsado DESPUÉS de unirse a
+    // la sala le bastaba con seguir renovando su token para quedar vivo
+    // indefinidamente, mientras HTTP ya le respondía 403. Expulsar de
+    // inmediato al momento exacto de la revocación (sin esperar a que el
+    // socket intente renovar) es `concurrency-ux` (SC-A12) — deuda explícita
+    // de la rebanada 3 (design.md §D7/§11). Acá solo se cierra la ventana de
+    // "seguir vivo renovando" que encontró W-2, con el mismo vocabulario de
+    // error que ya usa el handshake.
+    const access = await this.accessResolver.resolveAccess({
+      userId: client.data.user.id,
+      diagramId: client.data.diagramId,
+      action: 'diagram.view',
+    });
+    if (!access.ok) {
+      this.emitToSocket(client, 'access:revoked', { reason: this.toRejectionCode(access.reason) });
+      client.disconnect(true);
+      return;
+    }
+
     client.data.tokenExp = verified.exp;
   }
 
   /**
-   * Única puerta de salida del proceso hacia la red (design.md §D8): ningún
-   * otro punto de este archivo, ni ningún otro service, llama
-   * `this.server.emit`/`.to(...).emit` directo. La barrera de tipos
-   * (`ServerEvents`) más la de grafo (este gateway NO inyecta
-   * `PrismaService`) hacen imposible emitir una fila cruda de Prisma.
+   * Puerta de salida por SALA (design.md §D8). Ningún otro punto de este
+   * archivo, ni ningún otro service, llama `this.server.emit`/`.to(...).emit`
+   * directo. La barrera de tipos (`ServerEvents`) más la de grafo (este
+   * gateway NO inyecta `PrismaService`) hacen imposible emitir una fila
+   * cruda de Prisma.
+   *
+   * **Corrección 2026-09-18 (verify W-3)**: `emitTo` (sala) NO es la única
+   * puerta — hay una segunda, `emitToSocket` (un socket), con el mismo
+   * tipado sobre `ServerEvents`. La letra original del MUST ("todo evento
+   * saliente pasa por `emitTo`") era incompleta: `emitTo` firma por sala y
+   * ni el snapshot del join (W-1) ni `auth:expired`/`access:revoked`, que
+   * son estrictamente por-socket, entran ahí. Ver
+   * `collaboration-gateway-backend/spec.md` para el texto corregido.
    */
   private emitTo<E extends keyof ServerEvents>(diagramId: string, event: E, payload: Parameters<ServerEvents[E]>[0]): void {
     this.server.to(this.roomOf(diagramId)).emit(event, ...([payload] as Parameters<ServerEvents[E]>));
+  }
+
+  /** Puerta de salida por SOCKET individual — ver la nota de `emitTo` de arriba. */
+  private emitToSocket<E extends keyof ServerEvents>(client: CollabSocket, event: E, ...payload: Parameters<ServerEvents[E]>): void {
+    client.emit(event, ...payload);
   }
 
   /**
@@ -210,7 +250,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     for (const client of this.server.sockets.sockets.values()) {
       const data = (client as CollabSocket).data;
       if (!data || nowSeconds <= data.tokenExp + graceSeconds) continue;
-      client.emit('auth:expired');
+      this.emitToSocket(client as CollabSocket, 'auth:expired');
       client.disconnect(true);
     }
   }
