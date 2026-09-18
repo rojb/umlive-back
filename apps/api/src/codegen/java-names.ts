@@ -34,10 +34,24 @@
  * (`Buffer.byteLength`), nunca con `.length`: una letra acentuada ocupa dos
  * bytes. Si un nombre SQL lo supera, se recorta en un límite de punto de
  * código (nunca partiendo un carácter) y se marca `escaped`/`truncated`.
+ *
+ * Los nombres que **esta** rebanada compone (columna FK, tabla intermedia,
+ * restricciones) pasan por `sqlIdent` (D8), que agrega además el sufijo
+ * `_<sha256:8>`: ver más abajo.
  */
 
+import { createHash } from 'node:crypto';
+
 /** Espacios de nombres de D3. La unicidad se evalúa dentro de cada uno. */
-export type NameSpace = 'types' | 'members' | 'tables' | 'columns' | 'routes' | 'enumLiterals';
+export type NameSpace =
+  | 'types'
+  | 'members'
+  | 'tables'
+  | 'columns'
+  | 'routes'
+  | 'enumLiterals'
+  /** Nuevo en la rebanada 4 (D8): restricciones e índices del esquema (`pk_*`, `fk_*`, `uk_*`), que PostgreSQL exige únicos por esquema. */
+  | 'constraints';
 
 /** Forma final de un nombre derivado de uno del modelo. */
 export interface ResolvedName {
@@ -214,14 +228,25 @@ const JAVA_RESERVED_SIMPLE_NAMES = [
   // jakarta.persistence / jakarta.transaction
   'Entity', 'Table', 'Id', 'Column', 'GeneratedValue', 'GenerationType', 'Enumerated', 'EnumType',
   'EntityManager', 'PersistenceContext', 'Transactional',
+  // jakarta.persistence — agregadas por la rebanada 4 (D8): las importa el
+  // código emitido de relaciones, herencia y `@MappedSuperclass`, así que un
+  // nombre del modelo no puede sombrearlas.
+  'ManyToOne', 'OneToMany', 'OneToOne', 'ManyToMany', 'JoinColumn', 'JoinTable', 'FetchType',
+  'CascadeType', 'Inheritance', 'InheritanceType', 'PrimaryKeyJoinColumn', 'MappedSuperclass',
   // spring (web, context, stereotype, http)
   'RestController', 'RequestMapping', 'GetMapping', 'PostMapping', 'PutMapping', 'DeleteMapping',
   'RequestBody', 'PathVariable', 'RequestParam', 'Service', 'Repository', 'Component', 'Configuration',
   'Bean', 'Value', 'Autowired', 'HttpStatus', 'ResponseEntity', 'ResponseStatus', 'ResponseStatusException',
   'SpringApplication', 'SpringBootApplication',
+  // spring — agregadas por la rebanada 4 (D6, D8): el advice generado importa
+  // `ProblemDetail` y el nombre reservado `ApiExceptionHandler`.
+  'ProblemDetail', 'ApiExceptionHandler',
   // spring-data / colecciones / tipos
   'JpaRepository', 'List', 'Optional', 'UUID', 'BigDecimal', 'LocalDate', 'LocalDateTime', 'Set', 'Map',
   'ArrayList', 'HashMap', 'Stream', 'Collectors',
+  // Rebanada 4 (D5): el mapper ordena los ids de una colección `UUID` con
+  // `Comparator.comparing(UUID::toString)`, así que `Comparator` también entra.
+  'Comparator',
   // lombok (FR-F13 cortado, pero un nombre generado no debe chocar si un día se agrega)
   'Data', 'Getter', 'Setter', 'Builder', 'NoArgsConstructor', 'AllArgsConstructor', 'RequiredArgsConstructor',
 ];
@@ -336,6 +361,51 @@ function truncateSqlName(name: string): { name: string; truncated: boolean } {
     bytes += size;
   }
   return { name: out, truncated: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `sqlIdent` — el acortado determinista de esta rebanada (D8)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Bytes que puede ocupar el prefijo cuando hace falta el sufijo `_<hash>`: 63 − 1 − 8. */
+const SQL_IDENT_PREFIX_MAX_BYTES = POSTGRES_IDENTIFIER_MAX_BYTES - 9;
+
+/**
+ * Acorta un identificador SQL a ≤63 **bytes UTF-8** con sufijo `_<sha256:8>`
+ * (D8). Es lo que aplica esta rebanada a los nombres que compone —columna FK,
+ * tabla intermedia, columnas de esa tabla y restricciones—, porque un rol de
+ * 40 caracteres con acentos ya pasa el límite: `í` ocupa dos bytes.
+ *
+ * Dos propiedades que el código anterior no tenía:
+ *
+ * - **Corta por punto de código**, nunca por índice de caracteres ni de bytes:
+ *   una secuencia UTF-8 partida da un identificador que PostgreSQL trunca
+ *   distinto de como lo escribió JPA.
+ * - **El sufijo hash hace deterministas dos nombres distintos** que comparten
+ *   el prefijo: sin él, dos roles largos con el mismo arranque colisionarían
+ *   en el espacio de restricciones del esquema.
+ */
+export function sqlIdent(full: string): string {
+  if (sqlByteLength(full) <= POSTGRES_IDENTIFIER_MAX_BYTES) return full;
+  const hash = createHash('sha256').update(full, 'utf8').digest('hex').slice(0, 8);
+  let prefix = '';
+  let bytes = 0;
+  for (const ch of full) {
+    const size = Buffer.byteLength(ch, 'utf8');
+    if (bytes + size > SQL_IDENT_PREFIX_MAX_BYTES) break;
+    prefix += ch;
+    bytes += size;
+  }
+  return `${prefix}_${hash}`;
+}
+
+/**
+ * `true` si `sqlIdent` recorta: el llamador lo declara con la nota
+ * `name_shortened`. Se deriva de la ENTRADA para no tener que devolver dos
+ * valores desde la función del diseño.
+ */
+export function isSqlIdentifierShortened(full: string): boolean {
+  return sqlByteLength(full) > POSTGRES_IDENTIFIER_MAX_BYTES;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

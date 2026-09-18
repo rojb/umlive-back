@@ -1,38 +1,49 @@
 /**
- * Emisor de la migración Flyway `V1__init.sql` (tarea 3.1, D4, D11).
+ * Emisor de la migración Flyway `V1__init.sql` (tarea 2.8, D4, D9, D11).
  *
- * Hasta esta tarea el ZIP traía entidades JPA con `ddl-auto=validate` y ninguna
- * migración que las respaldara: el proyecto compilaba (`mvnw -q verify`) pero
- * **fallaba al arrancar** contra PostgreSQL 17, porque `validate` no encontraba
- * la tabla. Con este archivo el ZIP sí se sostiene solo, y esa es la mitad de
- * SC-F10 que el reporte de la Fase 2 declaró pendiente.
+ * Hasta `codegen-core` el ZIP traía entidades JPA con `ddl-auto=validate` y
+ * ninguna migración que las respaldara: el proyecto compilaba (`mvnw -q verify`)
+ * pero **fallaba al arrancar** contra PostgreSQL 17, porque `validate` no
+ * encontraba la tabla.
+ *
+ * ── Cuatro bloques, sin orden topológico (D9) ───────────────────────────────
+ *
+ * 1. `CREATE TABLE` de las tablas de entidad, con su PK y sus `UNIQUE` en línea:
+ *    no referencian a ninguna otra tabla.
+ * 2. `CREATE TABLE` de las join tables, con su PK compuesta.
+ * 3. Al final, todas las `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`, ordenadas
+ *    por **nombre de restricción**.
+ * 4. Nada más. Al agregar las FK al final no hace falta orden topológico: los
+ *    ciclos opcionales y las autoasociaciones aplican igual.
+ *
+ * `ON DELETE`: `NO ACTION` en todas, **salvo las FK de join table**, que llevan
+ * `ON DELETE CASCADE`. Un vínculo `*—*` no es una entidad: sin la cascada,
+ * borrar el lado inverso daría `409` y borrar el dueño no, una asimetría que el
+ * usuario no modeló (D9). La composición la borra Hibernate, no la base.
  *
  * Las tres reglas que este emisor NO puede romper:
  *
  * 1. **Los nombres SQL salen de la IR, nunca de la estrategia de Hibernate**
- *    (D4). Cada tabla usa `entity.table` y cada columna `field.column` — el
- *    MISMO campo que `@Table(name = …)`/`@Column(name = …)` en `entity.ts`. Si
- *    el DDL y el JPA leyeran de fuentes distintas, bastaría una diferencia en
- *    un caso borde para que `validate` falle al arrancar con un modelo que
- *    compiló bien.
+ *    (D4). Cada tabla usa `entity.table`/`joinTable.name`, cada columna
+ *    `field.column`/`joinColumn.name` y cada restricción `foreignKey.name` — el
+ *    MISMO nombre que leen `@Table`, `@Column` y `@JoinColumn`/`@JoinTable` en
+ *    `entity.ts`. Si el DDL y el JPA leyeran de fuentes distintas, bastaría una
+ *    diferencia en un caso borde para que `validate` falle al arrancar con un
+ *    modelo que compiló bien.
  * 2. **Los identificadores van SIN comillas** (D3, corrección FR-D20b):
  *    `CREATE TABLE dirección (` y `código_postal varchar(255)`. PostgreSQL 17
  *    acepta letras acentuadas en un identificador sin comillas, y el golden de
- *    la Fase 0 (0.10) confirmó que `validate` no reporta discrepancia entre la
- *    entidad `Dirección`/`códigoPostal` y la tabla `dirección`/`código_postal`.
- *    El límite de 63 **bytes UTF-8** lo aplica la tubería de `java-names.ts`
- *    (`tableName`/`columnName`), que es la única que puede recortar: acá se
+ *    la Fase 0 (0.12) confirmó que `validate` reconoce `dirección_id` y un
+ *    nombre acortado de 63 bytes con `í`. El recorte a 63 **bytes UTF-8** lo
+ *    aplica la tubería de `java-names.ts`/`sqlIdent` en `build-ir`; acá se
  *    escribe el nombre ya resuelto, sin volver a medirlo.
- * 3. **Sin claves foráneas** (FR-F06, SC-F10): las relaciones son de
- *    `codegen-relationships`, y esta rebanada no emite ninguna. La PK va inline
- *    (`PRIMARY KEY (<columna>)`), porque Hibernate no valida nombres de
- *    constraint y así el emisor no tiene que inventar uno que quepa en 63 bytes.
+ * 3. **Sin claves foráneas en línea**: van todas al bloque 3 (D9).
  *
  * Función pura: sin reloj, sin azar, sin locale. El orden de las tablas es el
  * de las entidades en la IR, que es estable (D7).
  */
 
-import type { CodegenIr, IrEntity, IrField } from '../codegen-ir';
+import type { CodegenIr, IrEntity, IrField, IrForeignKey, IrJoinTable, IrUnique } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
 
 /** Ruta de la migración dentro del ZIP (D11): la que Flyway descubre al arrancar. */
@@ -42,7 +53,7 @@ const MIGRATION_PATH = 'src/main/resources/db/migration/V1__init.sql';
 const INDENT = '    ';
 
 /**
- * Definición de una columna. `field.nullable` en la IR significa
+ * Definición de una columna de atributo. `field.nullable` en la IR significa
  * «`lowerBound < 1`», así que un campo NO nulo (`nullable === false`) lleva
  * `NOT NULL`, igual que su `@Column(nullable = false)`.
  *
@@ -62,31 +73,96 @@ function columnDefinition(field: IrField): string {
   return `${INDENT}${parts.join(' ')}`;
 }
 
-/**
- * `CREATE TABLE` de una entidad: sus columnas en el orden de la IR y la PK al
- * final. `buildIr` garantiza que toda entidad emitible tiene una PK —declarada
- * válida o inyectada—; una entidad con `pk_type_invalid` bloquea y nunca llega
- * acá.
- */
-function createTable(entity: IrEntity): string {
+/** La PK de una entidad; `buildIr` garantiza que toda entidad emitible tiene una. */
+function primaryKey(entity: IrEntity): IrField {
   const id = entity.fields.find((field) => field.isId);
   if (id === undefined) {
     throw new Error(`la IR de ${entity.name} no tiene clave primaria y no está bloqueada`);
   }
+  return id;
+}
+
+/**
+ * Bloque 1: `CREATE TABLE` de una entidad, con sus columnas de atributo, sus
+ * columnas FK (las que lleva su lado dueño), su PK y sus `UNIQUE` en línea.
+ */
+function createTable(
+  entity: IrEntity,
+  entityByName: Map<string, IrEntity>,
+  uniques: readonly IrUnique[],
+): string {
   const lines = entity.fields.map(columnDefinition);
-  lines.push(`${INDENT}PRIMARY KEY (${id.column})`);
+  for (const relation of entity.relations) {
+    if (relation.joinColumn === null) continue;
+    const target = entityByName.get(relation.target);
+    if (target === undefined) {
+      throw new Error(`la IR de ${entity.name} referencia a ${relation.target} y esa entidad no está en la IR`);
+    }
+    const targetPk = primaryKey(target);
+    lines.push(
+      `${INDENT}${relation.joinColumn.name} ${targetPk.type.sql}${relation.joinColumn.nullable ? '' : ' NOT NULL'}`,
+    );
+  }
+  lines.push(`${INDENT}PRIMARY KEY (${primaryKey(entity).column})`);
+  for (const unique of uniques.filter((item) => item.table === entity.table)) {
+    lines.push(`${INDENT}CONSTRAINT ${unique.name} UNIQUE (${unique.columns.join(', ')})`);
+  }
   return `CREATE TABLE ${entity.table} (\n${lines.join(',\n')}\n);`;
 }
 
-/** El texto completo de `V1__init.sql`. Un `CREATE TABLE` por entidad, ninguno por enum. */
+/**
+ * Bloque 2: `CREATE TABLE` de una join table con su PK compuesta. Las columnas
+ * salen en el orden `(owner, target)` —el mismo de la PK— y su tipo sale de la
+ * PK de la tabla referenciada, leída de las FK de la tabla en la IR, no de una
+ * convención aparte.
+ */
+function createJoinTable(
+  table: IrJoinTable,
+  entityByTable: Map<string, IrEntity>,
+  foreignKeys: readonly IrForeignKey[],
+): string {
+  const own = foreignKeys.filter((key) => key.table === table.name);
+  const columnFor = (column: string): string => {
+    const key = own.find((item) => item.columns[0] === column);
+    if (key === undefined) {
+      throw new Error(`la join table ${table.name} no tiene FK para la columna ${column}`);
+    }
+    const referenced = entityByTable.get(key.refTable);
+    if (referenced === undefined) {
+      throw new Error(`la IR de la join table ${table.name} referencia a ${key.refTable} y esa entidad no está en la IR`);
+    }
+    return `${INDENT}${column} ${primaryKey(referenced).type.sql} NOT NULL`;
+  };
+  const lines = [columnFor(table.ownerColumn), columnFor(table.targetColumn)];
+  lines.push(`${INDENT}PRIMARY KEY (${table.ownerColumn}, ${table.targetColumn})`);
+  return `CREATE TABLE ${table.name} (\n${lines.join(',\n')}\n);`;
+}
+
+/** Bloque 3: una FK agregada al final, con su `ON DELETE` según D9. */
+function addForeignKey(key: IrForeignKey): string {
+  const onDelete = key.onDeleteCascade ? 'CASCADE' : 'NO ACTION';
+  return (
+    `ALTER TABLE ${key.table} ADD CONSTRAINT ${key.name} FOREIGN KEY (${key.columns.join(', ')}) ` +
+    `REFERENCES ${key.refTable} (${key.refColumns.join(', ')}) ON DELETE ${onDelete};`
+  );
+}
+
+/** El texto completo de `V1__init.sql`: cuatro bloques ordenados, sin topología. */
 export function emitFlywayMigration(ir: CodegenIr): string {
   const header = [
     '-- Esquema inicial generado por UMLive.',
-    '-- Una tabla por entidad, sin claves foraneas: las relaciones son de codegen-relationships.',
+    '-- Bloque 1: tablas de entidad con PK y UNIQUE en linea.',
+    '-- Bloque 2: tablas intermedias de las asociaciones *-* con PK compuesta.',
+    '-- Bloque 3: claves foraneas al final, ordenadas por nombre, sin orden topologico.',
+    '-- ON DELETE CASCADE solo en las FK de tabla intermedia; NO ACTION en el resto.',
     '-- Los identificadores son los mismos que declara el JPA, para que ddl-auto=validate los acepte.',
   ];
-  const statements = ir.entities.map(createTable);
-  return `${[...header, ...statements].join('\n\n')}\n`;
+  const entityByName = new Map(ir.entities.map((entity) => [entity.name, entity]));
+  const entityByTable = new Map(ir.entities.map((entity) => [entity.table, entity]));
+  const tables = ir.entities.map((entity) => createTable(entity, entityByName, ir.uniques));
+  const joinTables = ir.joinTables.map((table) => createJoinTable(table, entityByTable, ir.foreignKeys));
+  const keys = ir.foreignKeys.map(addForeignKey);
+  return `${[...header, ...tables, ...joinTables, ...keys].join('\n\n')}\n`;
 }
 
 /** `db/migration/V1__init.sql` para el ZIP (D11). */

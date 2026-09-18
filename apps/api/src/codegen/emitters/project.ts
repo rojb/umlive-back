@@ -36,6 +36,7 @@ import { APPLICATION_TYPE_NAME } from '../java-names';
 import type { CodegenIr, IrEntity } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
 import { JAVA_SOURCE_ROOT, emitEntityFiles } from './entity';
+import { emitErrorAdviceFile } from './error-advice';
 import { emitFlywayFile } from './flyway';
 import { emitEnumFile } from './layers';
 import { emitPostmanFiles } from './postman';
@@ -268,12 +269,19 @@ ${endpointRows(ir.entities)}
 
 - \`ddl-auto: validate\`: el esquema lo aplica Flyway y Hibernate solo lo valida.
 - Sin Bean Validation: un \`POST\` al que le falte un campo obligatorio responde
-  \`500\`, no \`400\`. Es una consecuencia aceptada de haber cortado FR-F11.
+  \`400\`, no \`500\`. Lo produce el \`ApiExceptionHandler\` al hacer \`flush\`:
+  Hibernate detecta el nulo antes de tocar la base (\`PropertyValueException\`) y,
+  si la columna llega igual a PostgreSQL, el \`SQLState 23502\` también se traduce
+  a \`400\`. El golden de la Fase 0 (0.10) midió los dos caminos.
+- Las referencias se exponen por id (\`clienteId\`, \`cursoIds\`): ningún DTO contiene
+  una entidad, así que no hay ciclos en el JSON ni \`@JsonIgnore\`. Un id que no
+  existe responde \`400\`, y borrar un registro referenciado, \`409\`.
+- Las relaciones \`DEPENDENCY\` y \`USAGE\` no producen código: quedan listadas como
+  \`relationship_not_emitted\` en el reporte de generación.
+- Las jerarquías (\`GENERALIZATION\`), las interfaces y las cascadas de agregación
+  todavía no se emiten; el reporte las declara con \`relationship_not_emitted\`.
 - Las operaciones UML se emiten como métodos que lanzan
   \`UnsupportedOperationException\`: la firma está, el cuerpo todavía no.
-- Las relaciones (asociación, agregación, composición, generalización y
-  \`AssociationClass\`) **no** se emiten: pertenecen a \`codegen-relationships\`.
-  Cada una aparece listada como diferida en el reporte de generación.
 - El proyecto no trae tests: la suite ejecutable es la colección Postman que
   UMLive genera junto con este ZIP.
 `;
@@ -289,6 +297,9 @@ ${endpointRows(ir.entities)}
  * ninguna tabla, así que el proyecto arrancaba en verde solo mientras nadie lo
  * levantara contra PostgreSQL 17. La colección Postman (tarea 3.2) es la suite
  * ejecutable del proyecto generado, que no trae tests.
+ *
+ * El `ApiExceptionHandler` (tarea 2.6) entra siempre: mapea errores por
+ * `SQLState` y no depende del modelo.
  */
 export function emitProject(ir: CodegenIr): GeneratedFile[] {
   const files: GeneratedFile[] = [
@@ -302,6 +313,7 @@ export function emitProject(ir: CodegenIr): GeneratedFile[] {
   ];
 
   files.push(emitFlywayFile(ir));
+  files.push(emitErrorAdviceFile());
   files.push(...emitPostmanFiles(ir));
   for (const irEnum of ir.enums) files.push(emitEnumFile(irEnum));
   for (const entity of ir.entities) files.push(...emitEntityFiles(entity));

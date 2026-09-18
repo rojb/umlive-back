@@ -95,6 +95,34 @@ export interface IrEntity {
   fields: IrField[];
   operations: IrOperation[];
   /**
+   * Nombre Java de la superclase (`extends`), o `null` si la clase es raíz.
+   * Lo llena la pasada de herencia (Fase 4, D2).
+   */
+  superclass: string | null;
+  /**
+   * `true` si la clase es la raíz de su jerarquía y tiene al menos una hija
+   * emitida: lleva `@Inheritance(strategy = InheritanceType.JOINED)` (D2).
+   */
+  inheritanceRoot: boolean;
+  /** `true` si la clase UML es abstracta. Con hijas emitidas sigue teniendo repositorio (D5), pero no controller ni DTO. */
+  isAbstract: boolean;
+  /** `true` si el estereotipo la convirtió en `@MappedSuperclass`: sin `@Entity` y sin tabla propia (D2). */
+  mappedSuperclass: boolean;
+  /** Interfaces Java que la clase declara con `implements`, ordenadas con `<` (D2). */
+  implementsInterfaces: string[];
+  /**
+   * Campos de relación **propios** de esta clase (D1): los que las otras
+   * entidades reciben apuntando a ella viven en su propia `relations`, no acá.
+   * Ordenados por el orden de `content.relationships`.
+   */
+  relations: IrRelationField[];
+  /**
+   * Componentes de los `record` DTO, ya aplanados (ancestros primero, después
+   * los propios): un `record` no hereda componentes (D1). Los emisores de
+   * `dto/` leen esta lista y no vuelven a caminar la jerarquía.
+   */
+  dtoFields: IrDtoField[];
+  /**
    * Tipos derivados que la entidad aporta al espacio de tipos (D3, D11):
    * `XRepository`, `XService`, `XServiceImpl`, `XController`, `XRequest`,
    * `XResponse`, `XMapper`. Viven acá y no en el emisor porque la detección de
@@ -105,6 +133,97 @@ export interface IrEntity {
   imports: string[];
   /** `true` si la PK no venía del modelo y se inyectó `Long id` (`pk_injected`). */
   idInjected: boolean;
+}
+
+/**
+ * Un campo de relación ya resuelto (D1, D3). El emisor **solo traduce**: dueño,
+ * `mappedBy`, nulabilidad, cascada y nombres vienen decididos de acá, y el
+ * tipo JPA sale del `kind` que esta rebanada ya resolvió.
+ */
+export interface IrRelationField {
+  /** Nombre del miembro Java (`cliente`, `cursoList`). */
+  name: string;
+  /** Nombre Java de la clase del otro extremo. */
+  target: string;
+  /** Anotación JPA resultante. */
+  kind: 'ManyToOne' | 'OneToOne' | 'OneToMany' | 'ManyToMany';
+  /** `true` si el campo es el lado dueño de la FK. */
+  owning: boolean;
+  /** Nombre del campo dueño, para el `mappedBy` del lado inverso; `null` en el dueño. */
+  mappedBy: string | null;
+  /** Cascada del lado TODO (D4). En esta fase sin agregación siempre es `NONE`. */
+  cascade: 'NONE' | 'PERSIST_MERGE' | 'ALL';
+  /** `true` solo con composición (`cascade = ALL, orphanRemoval = true`). */
+  orphanRemoval: boolean;
+  /** `@JoinColumn` del lado dueño de una referencia simple; `null` en colecciones e inversos. */
+  joinColumn: { name: string; nullable: boolean; unique: boolean } | null;
+  /** `@JoinTable` del dueño de una asociación `* — *`; `null` en el resto. */
+  joinTable: IrJoinTable | null;
+  /** Componente correspondiente en los `record` DTO (D5): `cursoIds`, no `cursoList`. */
+  dto: { name: string; inRequest: boolean; required: boolean; idType: string };
+}
+
+/** Tabla intermedia de una asociación `* — *` (D3, D8, D9). */
+export interface IrJoinTable {
+  /** Nombre de la tabla intermedia. */
+  name: string;
+  /** Columna que referencia a la tabla del lado dueño. */
+  ownerColumn: string;
+  /** Columna que referencia a la tabla del otro extremo. */
+  targetColumn: string;
+}
+
+/**
+ * Componente de un `record` DTO (D1, D5). Es la lista aplanada que leen los
+ * emisores de `dto/`; en esta fase no hay herencia, así que coincide con los
+ * campos propios más los componentes de relación.
+ */
+export interface IrDtoField {
+  /** Nombre del componente (`id`, `códigoPostal`, `clienteId`, `cursoIds`). */
+  name: string;
+  /** Tipo Java tal como se escribe en el `record` (`String`, `Long`, `List<Long>`). */
+  type: string;
+  /** Importaciones que exige el tipo, ordenadas y sin duplicados. */
+  imports: string[];
+  /** `true` si el componente viaja en `XRequest`; `false` para la PK y las referencias inversas. */
+  inRequest: boolean;
+}
+
+/**
+ * Interfaz UML ya resuelta a `interface` Java (D2). La llena la Fase 4; el tipo
+ * vive acá porque `CodegenIr` la lleva desde la unidad 1.
+ */
+export interface IrInterface {
+  /** `UmlElement.id` de la interfaz. */
+  elementId: string;
+  /** Nombre del tipo Java (PascalCase, NFC). */
+  name: string;
+  /** Interfaces que extiende, ordenadas con `<`. */
+  extends: string[];
+  methods: IrOperation[];
+}
+
+/** Clave foránea del `V1__init.sql` (D9), agregada al final y ordenada por `name`. */
+export interface IrForeignKey {
+  /** Nombre de la restricción (`fk_pedido_cliente_id`). */
+  name: string;
+  /** Tabla que lleva la columna. */
+  table: string;
+  columns: string[];
+  /** Tabla referenciada. */
+  refTable: string;
+  /** Columnas referenciadas (la PK de `refTable`). */
+  refColumns: string[];
+  /** `true` solo en las FK de una tabla intermedia: `ON DELETE CASCADE` (D9). */
+  onDeleteCascade: boolean;
+}
+
+/** Restricción `UNIQUE` en línea del `V1__init.sql` (D9). */
+export interface IrUnique {
+  /** Nombre de la restricción (`uk_cliente_pasaporte_id`). */
+  name: string;
+  table: string;
+  columns: string[];
 }
 
 /** Un literal de enumeración ya resuelto. */
@@ -147,6 +266,22 @@ export interface CodegenIr {
   diagramName: string;
   entities: IrEntity[];
   enums: IrEnum[];
+  /**
+   * Interfaces UML emitidas como `interface` Java (D2). La llena la Fase 4; en
+   * esta fase queda vacía porque `INTERFACE` sigue clasificándose como omitido.
+   */
+  interfaces: IrInterface[];
+  /** Tablas intermedias de las asociaciones `* — *`, en orden de la IR. */
+  joinTables: IrJoinTable[];
+  /** Claves foráneas del bloque 3 de `V1__init.sql`, ordenadas por `name` (D9). */
+  foreignKeys: IrForeignKey[];
+  /** Restricciones `UNIQUE` en línea de `V1__init.sql` (D9). */
+  uniques: IrUnique[];
+  /**
+   * Clausura de referencias obligatorias por entidad concreta, en orden
+   * topológico (D9). La llena la Fase 5; en esta fase queda vacía.
+   */
+  fixturePlan: Record<string, string[]>;
   blockers: CodegenFinding[];
   notes: CodegenNote[];
 }

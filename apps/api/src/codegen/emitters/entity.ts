@@ -28,9 +28,9 @@
 
 import { BASE_PACKAGE } from '../build-ir';
 import { DERIVED_TYPE_SUFFIXES } from '../java-names';
-import type { IrEntity, IrField } from '../codegen-ir';
+import type { IrEntity, IrField, IrRelationField } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
-import { emitOperationStub } from './layers';
+import { emitOperationStub, renderRecord } from './layers';
 
 /** Raíz del código fuente emitido. Ancla del layout; la comparte `project.ts`. */
 export const JAVA_SOURCE_ROOT = `src/main/java/${BASE_PACKAGE.replace(/\./g, '/')}`;
@@ -84,6 +84,33 @@ function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/** `cliente` → `Cliente`, para los nombres de accesor y de método que la IR no trae precomputados. */
+function capitalizeFirst(name: string): string {
+  const chars = [...name];
+  if (chars.length === 0) return name;
+  chars[0] = (chars[0] as string).toUpperCase();
+  return chars.join('');
+}
+
+/** `true` si el campo de relación es una colección (`List<X>`) y no una referencia simple. */
+function relationIsCollection(relation: IrRelationField): boolean {
+  return relation.kind === 'OneToMany' || relation.kind === 'ManyToMany';
+}
+
+/** Nombre del repositorio de la entidad destino: `Cliente` → `clienteRepository` (D5: nunca otro servicio). */
+function repositoryFieldName(target: string): string {
+  return `${target.charAt(0).toLowerCase()}${target.slice(1)}Repository`;
+}
+
+/**
+ * Ordena los ids de una colección (`cursoIds` ascendente, D5). Con PK numérica
+ * `sorted()` alcanza; `UUID` no es `Comparable`, así que se ordena por su forma
+ * textual para no romper la compilación.
+ */
+function sortedIdsClause(idType: string): string {
+  return idType === 'UUID' ? '.sorted(Comparator.comparing(UUID::toString))' : '.sorted()';
+}
+
 /**
  * Bloque de `import`, sin duplicados, ordenado y **sin las clases del propio
  * paquete** (importarlas es legal pero ruidoso, y el golden no lo hace). Lo que
@@ -129,6 +156,59 @@ function renderField(field: IrField): string {
 }
 
 /**
+ * Campo de relación (tarea 2.3, D3). El emisor NO decide acá nada del modelo:
+ * `kind`, `owning`, `mappedBy`, nulabilidad y los nombres de las columnas ya
+ * vienen resueltos en la IR. Lo único que hace es traducirlos a anotaciones.
+ */
+function renderRelationField(relation: IrRelationField): string {
+  const lines: string[] = [];
+  const optional = relation.joinColumn !== null && !relation.joinColumn.nullable ? ', optional = false' : '';
+  if (relation.kind === 'ManyToOne') {
+    lines.push(`@ManyToOne(fetch = FetchType.LAZY${optional})`);
+  } else if (relation.kind === 'OneToOne') {
+    lines.push(
+      relation.owning
+        ? `@OneToOne(fetch = FetchType.LAZY${optional})`
+        : `@OneToOne(fetch = FetchType.LAZY, mappedBy = "${relation.mappedBy}")`,
+    );
+  } else if (relation.kind === 'OneToMany') {
+    lines.push(`@OneToMany(mappedBy = "${relation.mappedBy}")`);
+  } else {
+    lines.push(relation.owning ? '@ManyToMany' : `@ManyToMany(mappedBy = "${relation.mappedBy}")`);
+  }
+  if (relation.joinColumn !== null) {
+    const unique = relation.joinColumn.unique ? ', unique = true' : '';
+    const nullable = relation.joinColumn.nullable ? '' : ', nullable = false';
+    lines.push(`@JoinColumn(name = "${relation.joinColumn.name}"${unique}${nullable})`);
+  }
+  if (relation.joinTable !== null) {
+    lines.push(
+      `@JoinTable(name = "${relation.joinTable.name}", joinColumns = @JoinColumn(name = "${relation.joinTable.ownerColumn}"), inverseJoinColumns = @JoinColumn(name = "${relation.joinTable.targetColumn}"))`,
+    );
+  }
+  const type = relationIsCollection(relation) ? `List<${relation.target}>` : relation.target;
+  const initializer = relationIsCollection(relation) ? ' = new ArrayList<>()' : '';
+  lines.push(`private ${type} ${relation.name}${initializer};`);
+  return lines.map((line) => `${INDENT}${line}`).join('\n');
+}
+
+/**
+ * Accesores del campo de relación. El lado **inverso** (`mappedBy`) sale SIN
+ * setter: el compilador garantiza que nadie lo reemplace, que es lo que cierra
+ * el riesgo de `orphanRemoval` + `PUT` (D4, D5).
+ */
+function renderRelationAccessors(relation: IrRelationField): string {
+  const type = relationIsCollection(relation) ? `List<${relation.target}>` : relation.target;
+  const capitalized = capitalizeFirst(relation.name);
+  const getter = `${INDENT}public ${type} get${capitalized}() { return ${relation.name}; }`;
+  if (!relation.owning) return getter;
+  return [
+    getter,
+    `${INDENT}public void set${capitalized}(${type} ${relation.name}) { this.${relation.name} = ${relation.name}; }`,
+  ].join('\n');
+}
+
+/**
  * Accesores que acompañan al campo, en la forma compacta del golden. Existen
  * como campo de la IR (`field.getter`/`field.setter`) porque la clave de firma
  * de las operaciones los necesita: un `getNombre()` de la entidad y una
@@ -141,11 +221,13 @@ function renderAccessors(field: IrField): string {
   ].join('\n');
 }
 
-/** Entidad JPA: campos con `@Column` explícito, accesores y los stubs de las operaciones UML. */
+/** Entidad JPA: campos con `@Column` explícito, campos de relación, accesores y los stubs de las operaciones UML. */
 export function emitEntity(entity: IrEntity): string {
   const blocks: string[] = [];
   for (const field of entity.fields) blocks.push(renderField(field));
+  for (const relation of entity.relations) blocks.push(renderRelationField(relation));
   for (const field of entity.fields) blocks.push(renderAccessors(field));
+  for (const relation of entity.relations) blocks.push(renderRelationAccessors(relation));
   for (const operation of entity.operations) blocks.push(emitOperationStub(operation));
 
   const body = [
@@ -206,6 +288,25 @@ export function emitServiceInterface(entity: IrEntity): string {
  * Implementación del CRUD. `404` con `ResponseStatusException` y no
  * `ResponseEntity` en el service (D11); `findAll` mapea con la referencia de
  * método del mapper para no depender de ningún bean de mapeo.
+ *
+ * ── Lo que agrega la rebanada 4 (D5, D6, tarea 2.5) ─────────────────────────
+ *
+ * - **Todo el método va `@Transactional`** (`readOnly = true` en las lecturas):
+ *   `open-in-view: false` corta la sesión al salir del controlador, así que el
+ *   mapeo a DTO —que toca asociaciones `LAZY`— tiene que pasar adentro.
+ * - **Los ids se resuelven dentro de la transacción**: `findById` → `400` si no
+ *   existe; `findAllById` + comparación de tamaño para las colecciones; una FK
+ *   obligatoria que llega `null` → `400` **antes** de tocar la base.
+ * - **`repository.flush()` tras cada escritura**: la violación de integridad
+ *   salta adentro del proxy del repositorio, donde Spring la traduce a
+ *   `DataIntegrityViolationException`, y no en el commit (D6).
+ * - **La colección dueña de un `PUT` muta en sitio** (`clear()` + `addAll()`),
+ *   nunca `setX(nuevaLista)`: si no, Hibernate lanza «collection … no longer
+ *   referenced» (D4, riesgo de la propuesta).
+ *
+ * Los repositorios de las entidades referenciadas se inyectan acá. **Nunca otro
+ * servicio**: así no hay ciclos de beans aunque el modelo tenga ciclos de
+ * referencias (D5).
  */
 export function emitServiceImpl(entity: IrEntity): string {
   const name = derivedName(entity, 'ServiceImpl');
@@ -215,10 +316,84 @@ export function emitServiceImpl(entity: IrEntity): string {
   const response = derivedName(entity, 'Response');
   const mapper = derivedName(entity, 'Mapper');
   const id = idType(entity);
-  const setters = entity.fields
+
+  // Solo las referencias que el Request trae (las dueñas) se resuelven (D5).
+  const requestRelations = entity.relations.filter((relation) => relation.dto.inRequest);
+  // Un repositorio por entidad destino, sin repetir: dos relaciones al mismo
+  // destino comparten el repositorio.
+  const repositories = new Map<string, string>();
+  for (const relation of requestRelations) {
+    if (!repositories.has(relation.target)) {
+      repositories.set(relation.target, repositoryFieldName(relation.target));
+    }
+  }
+
+  const plainSetters = entity.fields
     .filter((field) => !field.isId)
-    .map((field) => `${INDENT}${INDENT}entity.${field.setter}(request.${field.name}());`)
-    .join('\n');
+    .map((field) => `${INDENT}${INDENT}entity.${field.setter}(request.${field.name}());`);
+  const relationSetters = requestRelations.map((relation) => {
+    const capitalized = capitalizeFirst(relation.name);
+    if (relationIsCollection(relation)) {
+      return [
+        `${INDENT}${INDENT}entity.get${capitalized}().clear();`,
+        `${INDENT}${INDENT}entity.get${capitalized}().addAll(resolve${capitalized}(request.${relation.dto.name}()));`,
+      ].join('\n');
+    }
+    return `${INDENT}${INDENT}entity.set${capitalized}(resolve${capitalized}(request.${relation.dto.name}()));`;
+  });
+
+  const constructorParams = [
+    `${repository} repository`,
+    ...[...repositories.entries()].map(([target, field]) => `${target}Repository ${field}`),
+  ];
+  const constructorBody = [
+    `${INDENT}${INDENT}this.repository = repository;`,
+    ...[...repositories.values()].map((field) => `${INDENT}${INDENT}this.${field} = ${field};`),
+  ];
+
+  const createArgs = requestRelations.map(
+    (relation) => `resolve${capitalizeFirst(relation.name)}(request.${relation.dto.name}())`,
+  );
+  const createCall =
+    createArgs.length === 0 ? `${mapper}.toEntity(request)` : `${mapper}.toEntity(request, ${createArgs.join(', ')})`;
+
+  const resolvers: string[] = [];
+  for (const relation of requestRelations) {
+    const capitalized = capitalizeFirst(relation.name);
+    const repo = repositories.get(relation.target) as string;
+    if (relationIsCollection(relation)) {
+      resolvers.push(
+        [
+          `${INDENT}private List<${relation.target}> resolve${capitalized}(List<${relation.dto.idType}> ${relation.dto.name}) {`,
+          `${INDENT}${INDENT}if (${relation.dto.name} == null || ${relation.dto.name}.isEmpty()) {`,
+          `${INDENT}${INDENT}${INDENT}return new ArrayList<>();`,
+          `${INDENT}${INDENT}}`,
+          `${INDENT}${INDENT}List<${relation.dto.idType}> distinct = ${relation.dto.name}.stream().distinct().toList();`,
+          `${INDENT}${INDENT}List<${relation.target}> found = ${repo}.findAllById(distinct);`,
+          `${INDENT}${INDENT}if (found.size() != distinct.size()) {`,
+          `${INDENT}${INDENT}${INDENT}throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "${relation.dto.name} contiene un id inexistente");`,
+          `${INDENT}${INDENT}}`,
+          `${INDENT}${INDENT}return found;`,
+          `${INDENT}}`,
+        ].join('\n'),
+      );
+      continue;
+    }
+    const whenNull = relation.dto.required
+      ? `${INDENT}${INDENT}${INDENT}throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "${relation.dto.name} es obligatorio");`
+      : `${INDENT}${INDENT}${INDENT}return null;`;
+    resolvers.push(
+      [
+        `${INDENT}private ${relation.target} resolve${capitalized}(${relation.dto.idType} ${relation.dto.name}) {`,
+        `${INDENT}${INDENT}if (${relation.dto.name} == null) {`,
+        whenNull,
+        `${INDENT}${INDENT}}`,
+        `${INDENT}${INDENT}return ${repo}.findById(${relation.dto.name})`,
+        `${INDENT}${INDENT}${INDENT}${INDENT}.orElseThrow(() -> new ResponseStatusException(HttpStatus.BAD_REQUEST, "${relation.dto.name} no existe"));`,
+        `${INDENT}}`,
+      ].join('\n'),
+    );
+  }
 
   const imports = [
     `${DTO_PACKAGE}.${request}`,
@@ -226,60 +401,86 @@ export function emitServiceImpl(entity: IrEntity): string {
     `${ENTITY_PACKAGE}.${entity.name}`,
     `${MAPPER_PACKAGE}.${mapper}`,
     `${REPOSITORY_PACKAGE}.${repository}`,
+    ...[...repositories.keys()].map((target) => `${REPOSITORY_PACKAGE}.${target}Repository`),
+    ...[...repositories.keys()].map((target) => `${ENTITY_PACKAGE}.${target}`),
     ...idField(entity).type.imports,
+    ...(requestRelations.some((relation) => relation.dto.idType === 'UUID') ? ['java.util.UUID'] : []),
     'java.util.List',
+    ...(requestRelations.some(relationIsCollection) ? ['java.util.ArrayList'] : []),
     'org.springframework.http.HttpStatus',
     'org.springframework.stereotype.Service',
+    'org.springframework.transaction.annotation.Transactional',
     'org.springframework.web.server.ResponseStatusException',
   ];
 
-  const updateBody = setters === ''
-    ? [`${INDENT}${INDENT}${entity.name} entity = load(id);`]
-    : [`${INDENT}${INDENT}${entity.name} entity = load(id);`, setters];
+  const updateBody = [
+    `${INDENT}${INDENT}${entity.name} entity = load(id);`,
+    ...plainSetters,
+    ...relationSetters,
+  ];
 
-  const body = [
+  const propertyLines = [
+    `${INDENT}private final ${repository} repository;`,
+    ...[...repositories.entries()].map(
+      ([target, field]) => `${INDENT}private final ${target}Repository ${field};`,
+    ),
+  ];
+
+  const rendered = [
     '@Service',
     `public class ${name} implements ${service} {`,
     '',
-    `${INDENT}private final ${repository} repository;`,
+    propertyLines.join('\n'),
     '',
-    `${INDENT}public ${name}(${repository} repository) {`,
-    `${INDENT}${INDENT}this.repository = repository;`,
+    `${INDENT}public ${name}(${constructorParams.join(', ')}) {`,
+    constructorBody.join('\n'),
     `${INDENT}}`,
     '',
     `${INDENT}@Override`,
+    `${INDENT}@Transactional(readOnly = true)`,
     `${INDENT}public List<${response}> findAll() {`,
     `${INDENT}${INDENT}return repository.findAll().stream().map(${mapper}::toResponse).toList();`,
     `${INDENT}}`,
     '',
     `${INDENT}@Override`,
+    `${INDENT}@Transactional(readOnly = true)`,
     `${INDENT}public ${response} findById(${id} id) {`,
     `${INDENT}${INDENT}return ${mapper}.toResponse(load(id));`,
     `${INDENT}}`,
     '',
     `${INDENT}@Override`,
+    `${INDENT}@Transactional`,
     `${INDENT}public ${response} create(${request} request) {`,
-    `${INDENT}${INDENT}return ${mapper}.toResponse(repository.save(${mapper}.toEntity(request)));`,
+    `${INDENT}${INDENT}${entity.name} entity = ${createCall};`,
+    `${INDENT}${INDENT}${entity.name} saved = repository.save(entity);`,
+    `${INDENT}${INDENT}repository.flush();`,
+    `${INDENT}${INDENT}return ${mapper}.toResponse(saved);`,
     `${INDENT}}`,
     '',
     `${INDENT}@Override`,
+    `${INDENT}@Transactional`,
     `${INDENT}public ${response} update(${id} id, ${request} request) {`,
     ...updateBody,
-    `${INDENT}${INDENT}return ${mapper}.toResponse(repository.save(entity));`,
+    `${INDENT}${INDENT}${entity.name} saved = repository.save(entity);`,
+    `${INDENT}${INDENT}repository.flush();`,
+    `${INDENT}${INDENT}return ${mapper}.toResponse(saved);`,
     `${INDENT}}`,
     '',
     `${INDENT}@Override`,
+    `${INDENT}@Transactional`,
     `${INDENT}public void delete(${id} id) {`,
     `${INDENT}${INDENT}repository.delete(load(id));`,
+    `${INDENT}${INDENT}repository.flush();`,
     `${INDENT}}`,
     '',
     `${INDENT}private ${entity.name} load(${id} id) {`,
     `${INDENT}${INDENT}return repository.findById(id)`,
     `${INDENT}${INDENT}${INDENT}${INDENT}.orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));`,
     `${INDENT}}`,
+    ...resolvers.flatMap((resolver) => ['', resolver]),
     '}',
   ].join('\n');
-  return renderFile(SERVICE_PACKAGE, imports, body);
+  return renderFile(SERVICE_PACKAGE, imports, rendered);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -364,25 +565,24 @@ export function emitController(entity: IrEntity): string {
 // dto/XRequest.java y dto/XResponse.java
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Componentes del `record` en el orden de la entidad, con la sangría del golden. */
-function renderRecord(recordName: string, fields: readonly IrField[]): string {
-  const components = fields.map((field) => `${INDENT}${INDENT}${field.type.java} ${field.name}`).join(',\n');
-  return `public record ${recordName}(\n${components}) {\n}`;
-}
-
-/** `record` de petición: **sin la PK**, que la asigna la base (D11). */
+/**
+ * `record` de petición (D5): **sin la PK**, que la asigna la base, y **solo con
+ * las referencias dueñas**. Los lados inversos (`mappedBy`) son de solo lectura:
+ * un `PUT` no puede reemplazar la colección que Hibernate administra (D4).
+ *
+ * Los componentes salen de `dtoFields` (D1) y no de los campos: así la Fase 4
+ * puede aplanar los ancestros sin tocar este emisor.
+ */
 export function emitRequestDto(entity: IrEntity): string {
   const name = derivedName(entity, 'Request');
-  const fields = entity.fields.filter((field) => !field.isId);
-  const imports = fields.flatMap((field) => field.type.imports);
-  return renderFile(DTO_PACKAGE, imports, renderRecord(name, fields));
+  const fields = entity.dtoFields.filter((field) => field.inRequest);
+  return renderFile(DTO_PACKAGE, fields.flatMap((field) => field.imports), renderRecord(name, fields));
 }
 
-/** `record` de respuesta: **con la PK** (D11). */
+/** `record` de respuesta: **con la PK** y con todas las referencias, dueñas o inversas (D5). */
 export function emitResponseDto(entity: IrEntity): string {
   const name = derivedName(entity, 'Response');
-  const imports = entity.fields.flatMap((field) => field.type.imports);
-  return renderFile(DTO_PACKAGE, imports, renderRecord(name, entity.fields));
+  return renderFile(DTO_PACKAGE, entity.dtoFields.flatMap((field) => field.imports), renderRecord(name, entity.dtoFields));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,28 +592,70 @@ export function emitResponseDto(entity: IrEntity): string {
 /**
  * Mapeo entidad ↔ DTO. Clase final con constructor privado y métodos estáticos:
  * sin `@Mapper`, sin MapStruct y sin ningún bean que inyectar (D11).
+ *
+ * La rebanada 4 (D5) cambia la forma: `toEntity` recibe las **referencias ya
+ * resueltas** por el servicio dentro del `@Transactional` (el mapper no tiene
+ * repositorios, y no debe tenerlos), y `toResponse` proyecta cada referencia a
+ * su id —`clienteId`, `cursoIds` ascendente— para que ningún DTO contenga una
+ * entidad y el JSON no pueda tener ciclos.
  */
 export function emitMapper(entity: IrEntity): string {
   const name = derivedName(entity, 'Mapper');
   const request = derivedName(entity, 'Request');
   const response = derivedName(entity, 'Response');
-  const setters = entity.fields
-    .filter((field) => !field.isId)
-    .map((field) => `${INDENT}${INDENT}entity.${field.setter}(request.${field.name}());`)
-    .join('\n');
-  const getters = entity.fields
-    .map((field) => `${INDENT}${INDENT}${INDENT}${INDENT}entity.${field.getter}()`)
-    .join(',\n');
+  const requestRelations = entity.relations.filter((relation) => relation.dto.inRequest);
+
+  const relationParameters = requestRelations.map((relation) =>
+    relationIsCollection(relation) ? `List<${relation.target}> ${relation.name}` : `${relation.target} ${relation.name}`,
+  );
+  const toEntitySignature =
+    relationParameters.length === 0
+      ? `${request} request`
+      : `${request} request, ${relationParameters.join(', ')}`;
+
+  const assignments = [
+    ...entity.fields
+      .filter((field) => !field.isId)
+      .map((field) => `${INDENT}${INDENT}entity.${field.setter}(request.${field.name}());`),
+    ...requestRelations.map((relation) => {
+      const capitalized = capitalizeFirst(relation.name);
+      return relationIsCollection(relation)
+        ? `${INDENT}${INDENT}entity.get${capitalized}().addAll(${relation.name});`
+        : `${INDENT}${INDENT}entity.${`set${capitalized}`}(${relation.name});`;
+    }),
+  ];
+
+  const components: string[] = [
+    ...entity.fields.map((field) => `${INDENT}${INDENT}${INDENT}${INDENT}entity.${field.getter}()`),
+    ...entity.relations.map((relation) => {
+      const capitalized = capitalizeFirst(relation.name);
+      if (relationIsCollection(relation)) {
+        return `${INDENT}${INDENT}${INDENT}${INDENT}entity.get${capitalized}().stream().map(${relation.target}::getId)${sortedIdsClause(relation.dto.idType)}.toList()`;
+      }
+      return `${INDENT}${INDENT}${INDENT}${INDENT}entity.get${capitalized}() == null ? null : entity.get${capitalized}().getId()`;
+    }),
+  ];
 
   const imports = [
     `${DTO_PACKAGE}.${request}`,
     `${DTO_PACKAGE}.${response}`,
     `${ENTITY_PACKAGE}.${entity.name}`,
+    ...[...new Set(entity.relations.map((relation) => relation.target))].map(
+      (target) => `${ENTITY_PACKAGE}.${target}`,
+    ),
+    ...(entity.relations.some(relationIsCollection) ? ['java.util.List'] : []),
+    ...(entity.relations.some(
+      (relation) => relationIsCollection(relation) && relation.dto.idType === 'UUID',
+    )
+      ? ['java.util.Comparator', 'java.util.UUID']
+      : []),
   ];
 
-  const toEntityBody = setters === ''
-    ? [`${INDENT}${INDENT}${entity.name} entity = new ${entity.name}();`]
-    : [`${INDENT}${INDENT}${entity.name} entity = new ${entity.name}();`, setters];
+  const toEntityBody = [
+    `${INDENT}${INDENT}${entity.name} entity = new ${entity.name}();`,
+    ...assignments,
+    `${INDENT}${INDENT}return entity;`,
+  ];
 
   const body = [
     `public final class ${name} {`,
@@ -421,14 +663,13 @@ export function emitMapper(entity: IrEntity): string {
     `${INDENT}private ${name}() {`,
     `${INDENT}}`,
     '',
-    `${INDENT}public static ${entity.name} toEntity(${request} request) {`,
+    `${INDENT}public static ${entity.name} toEntity(${toEntitySignature}) {`,
     ...toEntityBody,
-    `${INDENT}${INDENT}return entity;`,
     `${INDENT}}`,
     '',
     `${INDENT}public static ${response} toResponse(${entity.name} entity) {`,
     `${INDENT}${INDENT}return new ${response}(`,
-    `${getters});`,
+    `${components.join(',\n')});`,
     `${INDENT}}`,
     '}',
   ].join('\n');

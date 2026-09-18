@@ -19,8 +19,12 @@
  *   los métodos de `Object`.
  * - **Nombres** (D3): NFC sin plegar para Java/SQL; la ruta es la única que
  *   pliega a ASCII, y lo declara con `route_ascii_folded`.
- * - **Relaciones** (D5/D6): todas quedan en el reporte como
- *   `relationship_deferred`, incluidas las `GENERALIZATION` (herencia diferida).
+ * - **Relaciones** (D3, D10): cada `ASSOCIATION` se resuelve a campos JPA, columnas
+ *   FK, join tables y restricciones según la multiplicidad (y, en la fase de
+ *   agregación, la del TODO). `DEPENDENCY`/`USAGE` y los extremos sobre
+ *   no-entidad quedan declarados con `relationship_not_emitted`; la herencia y
+ *   las interfaces las cubre la Fase 4 de la misma rebanada y hasta entonces
+ *   también se declaran con esa nota. `relationship_deferred` ya no existe (D1).
  * - **Orden de los hallazgos** (D6): primero los de validación en el orden del
  *   servicio, después los del generador en el orden de esta construcción.
  */
@@ -31,11 +35,14 @@ import {
   type CodegenElementRef,
   type CodegenFinding,
   type CodegenNote,
+  type CodegenRelationshipRef,
   type DiagramContent,
   type UmlElementView,
   type UmlEnumLiteralView,
   type UmlFeatureView,
   type UmlParameterView,
+  type UmlRelationshipEndView,
+  type UmlRelationshipView,
   type ValidationReport,
 } from '@umlive/contracts';
 import {
@@ -44,13 +51,29 @@ import {
   columnName,
   enumLiteralName,
   hqlEntityName,
+  isSqlIdentifierShortened,
   memberName,
   routeSegment,
+  snakeCase,
+  sqlIdent,
   tableName,
   typeName,
 } from './java-names';
 import { mapPrimitive } from './type-mapping';
-import type { CodegenIr, IrEntity, IrEnum, IrField, IrOperation, IrParameter, IrTypeRef } from './codegen-ir';
+import type {
+  CodegenIr,
+  IrDtoField,
+  IrEntity,
+  IrEnum,
+  IrField,
+  IrForeignKey,
+  IrJoinTable,
+  IrOperation,
+  IrParameter,
+  IrRelationField,
+  IrTypeRef,
+  IrUnique,
+} from './codegen-ir';
 
 /**
  * Paquete base fijo del proyecto emitido (D11). FR-F13 —poder elegirlo— está en
@@ -80,6 +103,35 @@ interface TypeSet {
   keys: Map<string, string>;
 }
 
+/**
+ * Lo que la pasada de asociaciones necesita de cada entidad ya construida y lo
+ * que la comprobación de colisiones lee DESPUÉS de agregar los campos de
+ * relación (D1, D3, D8).
+ */
+interface EntityBookkeeping {
+  entity: IrEntity;
+  /** Nombre Java de la clase, para el detalle del bloqueo. */
+  label: string;
+  /** Miembros de la entidad: atributos, accesores y ahora campos de relación. */
+  memberOwners: Map<string, string[]>;
+  /** Columnas de la tabla: atributos y ahora las columnas FK. */
+  columnOwners: Map<string, string[]>;
+  /** Componentes de los `record` DTO, que comparten espacio propio. */
+  dtoOwners: Map<string, string[]>;
+  /** Importaciones que agregan los campos de relación, para fusionar al final. */
+  extraImports: string[];
+}
+
+/** Un extremo de la asociación en curso, con su entidad y el extremo opuesto (D3). */
+interface RelationshipSide {
+  build: EntityBookkeeping;
+  /** Extremo que cae SOBRE esta clase. */
+  end: UmlRelationshipEndView;
+  /** Extremo que cae sobre la clase opuesta: de ahí sale la multiplicidad de la FK. */
+  other: UmlRelationshipEndView;
+  otherBuild: EntityBookkeeping;
+}
+
 function groupBy<T>(items: readonly T[], key: (item: T) => string): Map<string, T[]> {
   const map = new Map<string, T[]>();
   for (const item of items) {
@@ -101,12 +153,27 @@ function blocker(
   code: 'name_collision' | 'name_unrepresentable' | 'pk_type_invalid' | 'operation_signature_collision',
   elements: CodegenElementRef[],
   detail: string | null,
+  relationships: CodegenRelationshipRef[] = [],
 ): CodegenFinding {
-  return { source: 'codegen', code, elements, detail };
+  return { source: 'codegen', code, elements, relationships, detail };
 }
 
-function note(code: CodegenNote['code'], elements: CodegenElementRef[], detail: string | null): CodegenNote {
-  return { code, elements, detail };
+function note(
+  code: CodegenNote['code'],
+  elements: CodegenElementRef[],
+  detail: string | null,
+  relationships: CodegenRelationshipRef[] = [],
+): CodegenNote {
+  return { code, elements, relationships, detail };
+}
+
+/** Etiqueta de una arista para el lienzo (D10): el nombre de la relación si lo tiene, si no los dos extremos calificados. */
+function relationshipLabel(relationship: UmlRelationshipView, ctx: BuildContext): string {
+  const declared = (relationship.name ?? '').trim();
+  if (declared !== '') return declared;
+  const source = ctx.ref(relationship.sourceElementId).qualifiedName ?? relationship.sourceElementId;
+  const target = ctx.ref(relationship.targetElementId).qualifiedName ?? relationship.targetElementId;
+  return `${source} — ${target} (${relationship.kind})`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,6 +295,17 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
   const entities: IrEntity[] = [];
   const tableOwners = new Map<string, { name: string; ids: string[]; labels: string[] }>();
   const routeOwners = new Map<string, { name: string; ids: string[]; labels: string[] }>();
+  // Espacio de unicidad "restricciones e índices del esquema" (D8), nuevo en
+  // esta rebanada: PostgreSQL exige nombres de índice únicos por esquema, así
+  // que `pk_*`, `fk_*` y `uk_*` comparten un solo conjunto.
+  const constraintOwners = new Map<
+    string,
+    { name: string; entries: { elements: CodegenElementRef[]; relationships: CodegenRelationshipRef[]; label: string }[] }
+  >();
+  // Lo que la pasada de asociaciones necesita para completar cada entidad
+  // (campos de relación, componentes de DTO, columnas FK) y para emitir las
+  // colisiones de nombres DESPUÉS de agregarlos.
+  const entityBuilds = new Map<string, EntityBookkeeping>();
 
   for (const el of content.elements) {
     if (el.kind !== 'CLASS') continue;
@@ -258,6 +336,7 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     const imports: string[] = [];
     const memberOwners = new Map<string, string[]>();
     const columnOwners = new Map<string, string[]>();
+    const dtoOwners = new Map<string, string[]>();
 
     const registerMember = (name: string): void => {
       const key = collisionKey(name);
@@ -270,6 +349,12 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       const owners = columnOwners.get(key);
       if (owners) owners.push(column);
       else columnOwners.set(key, [column]);
+    };
+    const registerDto = (name: string): void => {
+      const key = collisionKey(name);
+      const owners = dtoOwners.get(key);
+      if (owners) owners.push(name);
+      else dtoOwners.set(key, [name]);
     };
 
     // PK declarada o inyectada (D5).
@@ -342,20 +427,14 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       }
     }
 
-    for (const [, owners] of memberOwners) {
-      if (owners.length > 1) {
-        generatorBlockers.push(
-          blocker('name_collision', [ctx.ref(el.id)], `miembros de ${resolvedName.name}: ${owners.join(', ')}`),
-        );
-      }
-    }
-    for (const [, owners] of columnOwners) {
-      if (owners.length > 1) {
-        generatorBlockers.push(
-          blocker('name_collision', [ctx.ref(el.id)], `columnas de ${resolvedName.name}: ${owners.join(', ')}`),
-        );
-      }
-    }
+    // Componentes de los `record` DTO (D1, D5): la PK primero —solo en la
+    // respuesta—, después los atributos, que viajan en las dos. La pasada de
+    // asociaciones agrega los componentes de relación. Se registran en su
+    // propio espacio porque los componentes comparten nombre con los campos.
+    const dtoFields: IrDtoField[] = fields.map((field) => {
+      registerDto(field.name);
+      return { name: field.name, type: field.type.java, imports: field.type.imports, inRequest: !field.isId };
+    });
 
     // Operaciones: stub con la clave de firma ya mapeada (contradicción 2, D5).
     const irOperations: IrOperation[] = [];
@@ -480,7 +559,7 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       jpaImports.push('jakarta.persistence.EnumType', 'jakarta.persistence.Enumerated');
     }
 
-    entities.push({
+    const entity: IrEntity = {
       elementId: el.id,
       name: resolvedName.name,
       hqlName: hql.name,
@@ -488,9 +567,27 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       route: route.name,
       fields,
       operations: irOperations,
+      // Campos de la IR que llena otra pasada: la herencia y las interfaces
+      // son de la Fase 4 y las asociaciones de la Fase D de acá abajo (D1).
+      superclass: null,
+      inheritanceRoot: false,
+      isAbstract: false,
+      mappedSuperclass: false,
+      implementsInterfaces: [],
+      relations: [],
+      dtoFields,
       derivedTypeNames,
       imports: sortedUnique([...jpaImports, ...imports]),
       idInjected,
+    };
+    entities.push(entity);
+    entityBuilds.set(el.id, {
+      entity,
+      label: resolvedName.name,
+      memberOwners,
+      columnOwners,
+      dtoOwners,
+      extraImports: [],
     });
 
     const keys = new Map<string, string>([[collisionKey(resolvedName.name), resolvedName.name]]);
@@ -528,6 +625,472 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       );
     }
   }
+  // ── Fase D: asociaciones sin agregación (D3, D8, D9) ─────────────────────
+  //
+  // La agregación (D4) llega en la Fase 3 de esta misma rebanada: hasta
+  // entonces `cascade` queda en `NONE` y la cascada del TODO no se emite. Todo
+  // lo demás —forma, dueño, `mappedBy`, nulabilidad, columnas, join tables y
+  // restricciones— ya se decide acá, así que la Fase 3 solo cambiará el valor
+  // de `cascade`/`orphanRemoval`.
+  const joinTables: IrJoinTable[] = [];
+  const foreignKeys: IrForeignKey[] = [];
+  const uniques: IrUnique[] = [];
+  const endsByRelationship = groupBy(content.relationshipEnds, (end) => end.relationshipId);
+
+  const shortenSql = (
+    raw: string,
+    elements: CodegenElementRef[],
+    relationships: CodegenRelationshipRef[],
+    what: string,
+  ): string => {
+    const name = sqlIdent(raw);
+    if (isSqlIdentifierShortened(raw)) {
+      generatorNotes.push(
+        note('name_shortened', elements, `${what} ${raw} → ${name} (acortado a 63 bytes UTF-8)`, relationships),
+      );
+    }
+    return name;
+  };
+
+  const registerConstraint = (
+    rawName: string,
+    elements: CodegenElementRef[],
+    relationships: CodegenRelationshipRef[],
+    label: string,
+  ): string => {
+    const name = shortenSql(rawName, elements, relationships, 'restricción');
+    const key = collisionKey(name);
+    const entry = constraintOwners.get(key);
+    if (entry) entry.entries.push({ elements, relationships, label });
+    else constraintOwners.set(key, { name, entries: [{ elements, relationships, label }] });
+    return name;
+  };
+
+  const ownIn = (registry: Map<string, string[]>, name: string): void => {
+    const key = collisionKey(name);
+    const owners = registry.get(key);
+    if (owners) owners.push(name);
+    else registry.set(key, [name]);
+  };
+
+  const pkField = (build: EntityBookkeeping): IrField => {
+    const id = build.entity.fields.find((field) => field.isId);
+    if (id === undefined) {
+      throw new Error(`la IR de ${build.entity.name} no tiene clave primaria y no está bloqueada`);
+    }
+    return id;
+  };
+
+  /** `rol ?? camel(Clase)` del extremo apuntado; `null` si no deja ninguna palabra (D5, D3). */
+  const fieldBase = (side: RelationshipSide): string | null => {
+    const declared = (side.other.roleName ?? '').trim();
+    const resolved = memberName(declared === '' ? side.otherBuild.entity.name : declared);
+    return resolved.unrepresentable || resolved.name === '' ? null : resolved.name;
+  };
+
+  const relationJpaImports = (relation: IrRelationField, targetType: string): string[] => {
+    const imports = [`${ENTITY_PACKAGE}.${targetType}`, `jakarta.persistence.${relation.kind}`];
+    if (relation.kind === 'ManyToOne' || relation.kind === 'OneToOne') imports.push('jakarta.persistence.FetchType');
+    if (relation.joinColumn !== null) imports.push('jakarta.persistence.JoinColumn');
+    if (relation.joinTable !== null) imports.push('jakarta.persistence.JoinColumn', 'jakarta.persistence.JoinTable');
+    if (relation.kind === 'OneToMany' || relation.kind === 'ManyToMany') {
+      imports.push('java.util.ArrayList', 'java.util.List');
+    }
+    return imports;
+  };
+
+  const collectionOf = (relation: IrRelationField): boolean =>
+    relation.kind === 'OneToMany' || relation.kind === 'ManyToMany';
+
+  /** Agrega el campo a su entidad, registra sus nombres e importaciones y suma el componente de DTO. */
+  const addRelation = (side: RelationshipSide, relation: IrRelationField): void => {
+    const build = side.build;
+    build.entity.relations.push(relation);
+    build.extraImports.push(...relationJpaImports(relation, side.otherBuild.entity.name));
+    ownIn(build.memberOwners, relation.name);
+    ownIn(build.dtoOwners, relation.dto.name);
+    if (relation.joinColumn !== null) ownIn(build.columnOwners, relation.joinColumn.name);
+    const pk = pkField(side.otherBuild);
+    build.entity.dtoFields.push({
+      name: relation.dto.name,
+      type: collectionOf(relation) ? `List<${relation.dto.idType}>` : relation.dto.idType,
+      imports: [...(collectionOf(relation) ? ['java.util.List'] : []), ...pk.type.imports],
+      inRequest: relation.dto.inRequest,
+    });
+  };
+
+  for (const relationship of content.relationships) {
+    const elements = [ctx.ref(relationship.sourceElementId), ctx.ref(relationship.targetElementId)];
+    const label = relationshipLabel(relationship, ctx);
+    const relRefs: CodegenRelationshipRef[] = [{ id: relationship.id, label }];
+
+    if (relationship.kind === 'DEPENDENCY' || relationship.kind === 'USAGE') {
+      generatorNotes.push(
+        note('relationship_not_emitted', elements, `${label}: ${relationship.kind} no produce código`, relRefs),
+      );
+      continue;
+    }
+
+    if (relationship.kind !== 'ASSOCIATION') {
+      // GENERALIZATION e INTERFACE_REALIZATION los emite la Fase 4 de esta
+      // rebanada (D2). Hasta que esa pasada exista, declararlos acá es lo que
+      // evita una pérdida silenciosa: la nota `relationship_deferred` de core
+      // ya no existe (D1) y la spec exige que toda relación quede emitida o
+      // declarada como `relationship_not_emitted`.
+      generatorNotes.push(
+        note(
+          'relationship_not_emitted',
+          elements,
+          `${label}: ${relationship.kind}, pendiente de la Fase 4 (herencia e interfaces)`,
+          relRefs,
+        ),
+      );
+      continue;
+    }
+
+    const ends = [...(endsByRelationship.get(relationship.id) ?? [])].sort((a, b) => a.endIndex - b.endIndex);
+    const end0 = ends.find((end) => end.endIndex === 0);
+    const end1 = ends.find((end) => end.endIndex === 1);
+    const sourceBuild = entityBuilds.get(relationship.sourceElementId);
+    const targetBuild = entityBuilds.get(relationship.targetElementId);
+    if (!end0 || !end1 || !sourceBuild || !targetBuild) {
+      generatorNotes.push(
+        note('relationship_not_emitted', elements, `${label}: un extremo no se emite como entidad`, relRefs),
+      );
+      continue;
+    }
+
+    // «Simple» = `upper ≤ 1`; «múltiple» = `upper` nulo o `> 1` (D3).
+    const simple0 = end0.upperBound !== null && end0.upperBound <= 1;
+    const simple1 = end1.upperBound !== null && end1.upperBound <= 1;
+    const sideOf = (source: boolean): RelationshipSide =>
+      source
+        ? { build: sourceBuild, end: end0, other: end1, otherBuild: targetBuild }
+        : { build: targetBuild, end: end1, other: end0, otherBuild: sourceBuild };
+
+    if (simple0 !== simple1) {
+      // ── simple — múltiple: la FK vive en la tabla del extremo múltiple ────
+      const owner = simple0 ? sideOf(false) : sideOf(true);
+      const inverse = simple0 ? sideOf(true) : sideOf(false);
+      const ownerBase = fieldBase(owner);
+      const inverseBase = fieldBase(inverse);
+      if (ownerBase === null || inverseBase === null) {
+        generatorBlockers.push(blocker('name_unrepresentable', elements, `${label}: nombre de rol vacío`));
+        continue;
+      }
+      const targetPk = pkField(owner.otherBuild);
+      const column = shortenSql(`${snakeCase(ownerBase)}_id`, elements, relRefs, 'columna FK');
+      const nullable = owner.other.lowerBound < 1;
+      const ownerRelation: IrRelationField = {
+        name: ownerBase,
+        target: owner.otherBuild.entity.name,
+        kind: 'ManyToOne',
+        owning: true,
+        mappedBy: null,
+        cascade: 'NONE',
+        orphanRemoval: false,
+        joinColumn: { name: column, nullable, unique: false },
+        joinTable: null,
+        dto: { name: `${ownerBase}Id`, inRequest: true, required: !nullable, idType: targetPk.type.java },
+      };
+      addRelation(owner, ownerRelation);
+      if (!owner.other.isNavigable) {
+        generatorNotes.push(
+          note(
+            'navigability_widened',
+            [ctx.ref(owner.build.entity.elementId)],
+            `${label}: ${ownerBase} se emite con @ManyToOne aunque su extremo no sea navegable`,
+            relRefs,
+          ),
+        );
+      }
+      foreignKeys.push({
+        name: registerConstraint(
+          `fk_${owner.build.entity.table}_${column}`,
+          elements,
+          relRefs,
+          `${label}: FK de ${ownerBase}`,
+        ),
+        table: owner.build.entity.table,
+        columns: [column],
+        refTable: owner.otherBuild.entity.table,
+        refColumns: [targetPk.column],
+        onDeleteCascade: false,
+      });
+
+      if (owner.end.isNavigable) {
+        const ownerPk = pkField(owner.build);
+        addRelation(inverse, {
+          name: `${inverseBase}List`,
+          target: owner.build.entity.name,
+          kind: 'OneToMany',
+          owning: false,
+          mappedBy: ownerRelation.name,
+          cascade: 'NONE',
+          orphanRemoval: false,
+          joinColumn: null,
+          joinTable: null,
+          dto: { name: `${inverseBase}Ids`, inRequest: false, required: false, idType: ownerPk.type.java },
+        });
+        if (owner.end.upperBound !== null && owner.end.upperBound > 1) {
+          generatorNotes.push(
+            note(
+              'upper_bound_not_enforced',
+              [ctx.ref(inverse.build.entity.elementId)],
+              `${inverseBase}List: la cota superior ${owner.end.upperBound} no se aplica`,
+              relRefs,
+            ),
+          );
+        }
+        if (owner.end.lowerBound >= 1) {
+          generatorNotes.push(
+            note(
+              'collection_lower_bound_not_enforced',
+              [ctx.ref(inverse.build.entity.elementId)],
+              `${inverseBase}List: 1..* no se valida`,
+              relRefs,
+            ),
+          );
+        }
+      }
+      continue;
+    }
+
+    if (simple0 && simple1) {
+      // ── simple — simple: FK `UNIQUE` en el lado dependiente ───────────────
+      // Dependiente = la clase cuyo extremo OPUESTO es obligatorio (así el
+      // `NOT NULL` dice algo); empate → `source` (spec de la rebanada).
+      const ownerIsSource = !(end0.lowerBound >= 1 && end1.lowerBound < 1);
+      const owner = sideOf(ownerIsSource);
+      const inverse = sideOf(!ownerIsSource);
+      const ownerBase = fieldBase(owner);
+      const inverseBase = fieldBase(inverse);
+      if (ownerBase === null || inverseBase === null) {
+        generatorBlockers.push(blocker('name_unrepresentable', elements, `${label}: nombre de rol vacío`));
+        continue;
+      }
+      const targetPk = pkField(owner.otherBuild);
+      const column = shortenSql(`${snakeCase(ownerBase)}_id`, elements, relRefs, 'columna FK');
+      const nullable = owner.other.lowerBound < 1;
+      const ownerRelation: IrRelationField = {
+        name: ownerBase,
+        target: owner.otherBuild.entity.name,
+        kind: 'OneToOne',
+        owning: true,
+        mappedBy: null,
+        cascade: 'NONE',
+        orphanRemoval: false,
+        joinColumn: { name: column, nullable, unique: true },
+        joinTable: null,
+        dto: { name: `${ownerBase}Id`, inRequest: true, required: !nullable, idType: targetPk.type.java },
+      };
+      addRelation(owner, ownerRelation);
+      if (!owner.other.isNavigable) {
+        generatorNotes.push(
+          note(
+            'navigability_widened',
+            [ctx.ref(owner.build.entity.elementId)],
+            `${label}: ${ownerBase} se emite con @OneToOne aunque su extremo no sea navegable`,
+            relRefs,
+          ),
+        );
+      }
+      uniques.push({
+        name: registerConstraint(
+          `uk_${owner.build.entity.table}_${column}`,
+          elements,
+          relRefs,
+          `${label}: UNIQUE de ${ownerBase}`,
+        ),
+        table: owner.build.entity.table,
+        columns: [column],
+      });
+      foreignKeys.push({
+        name: registerConstraint(
+          `fk_${owner.build.entity.table}_${column}`,
+          elements,
+          relRefs,
+          `${label}: FK de ${ownerBase}`,
+        ),
+        table: owner.build.entity.table,
+        columns: [column],
+        refTable: owner.otherBuild.entity.table,
+        refColumns: [targetPk.column],
+        onDeleteCascade: false,
+      });
+
+      if (owner.end.isNavigable) {
+        const ownerPk = pkField(owner.build);
+        addRelation(inverse, {
+          name: `${inverseBase}`,
+          target: owner.build.entity.name,
+          kind: 'OneToOne',
+          owning: false,
+          mappedBy: ownerRelation.name,
+          cascade: 'NONE',
+          orphanRemoval: false,
+          joinColumn: null,
+          joinTable: null,
+          dto: { name: `${inverseBase}Id`, inRequest: false, required: false, idType: ownerPk.type.java },
+        });
+        if (inverse.other.lowerBound >= 1) {
+          generatorNotes.push(
+            note(
+              'inverse_lower_bound_not_enforced',
+              [ctx.ref(inverse.build.entity.elementId)],
+              `${inverseBase}: 1..1 en el lado inverso no se valida`,
+              relRefs,
+            ),
+          );
+        }
+      }
+      continue;
+    }
+
+    // ── múltiple — múltiple: tabla intermedia con PK compuesta ──────────────
+    const ownerIsSource = !(end0.isNavigable && !end1.isNavigable);
+    const owner = sideOf(ownerIsSource);
+    const inverse = sideOf(!ownerIsSource);
+    const ownerBase = fieldBase(owner);
+    const inverseBase = fieldBase(inverse);
+    if (ownerBase === null || inverseBase === null) {
+      generatorBlockers.push(blocker('name_unrepresentable', elements, `${label}: nombre de rol vacío`));
+      continue;
+    }
+    const declaredName = (relationship.name ?? '').trim();
+    const joinTableName = shortenSql(
+      declaredName === ''
+        ? `${owner.build.entity.table}_${inverse.build.entity.table}`
+        : snakeCase(declaredName),
+      elements,
+      relRefs,
+      'tabla intermedia',
+    );
+    const ownerColumn = shortenSql(`${owner.build.entity.table}_id`, elements, relRefs, 'columna de join table');
+    const targetColumn = shortenSql(`${snakeCase(ownerBase)}_id`, elements, relRefs, 'columna de join table');
+    registerNamespace(tableOwners, joinTableName, relationship.sourceElementId, `tabla intermedia de ${label}`);
+    if (collisionKey(ownerColumn) === collisionKey(targetColumn)) {
+      // Autoasociación `* — *` sin roles (D7): las dos columnas salen del mismo
+      // nombre y la PK compuesta no se puede crear.
+      generatorBlockers.push(
+        blocker('name_collision', elements, `${label}: las dos columnas de ${joinTableName} se llaman ${ownerColumn}`),
+      );
+      continue;
+    }
+
+    const ownerPk = pkField(owner.build);
+    const targetPk = pkField(owner.otherBuild);
+    const ownerRelation: IrRelationField = {
+      name: `${ownerBase}List`,
+      target: owner.otherBuild.entity.name,
+      kind: 'ManyToMany',
+      owning: true,
+      mappedBy: null,
+      cascade: 'NONE',
+      orphanRemoval: false,
+      joinColumn: null,
+      joinTable: { name: joinTableName, ownerColumn, targetColumn },
+      dto: { name: `${ownerBase}Ids`, inRequest: true, required: false, idType: targetPk.type.java },
+    };
+    addRelation(owner, ownerRelation);
+    joinTables.push(ownerRelation.joinTable as IrJoinTable);
+    if (!owner.other.isNavigable) {
+      generatorNotes.push(
+        note(
+          'navigability_widened',
+          [ctx.ref(owner.build.entity.elementId)],
+          `${label}: ${ownerBase}List se emite con @ManyToMany aunque su extremo no sea navegable`,
+          relRefs,
+        ),
+      );
+    }
+    if (owner.other.upperBound !== null && owner.other.upperBound > 1) {
+      generatorNotes.push(
+        note(
+          'upper_bound_not_enforced',
+          [ctx.ref(owner.build.entity.elementId)],
+          `${ownerBase}List: la cota superior ${owner.other.upperBound} no se aplica`,
+          relRefs,
+        ),
+      );
+    }
+    if (owner.other.lowerBound >= 1) {
+      generatorNotes.push(
+        note(
+          'collection_lower_bound_not_enforced',
+          [ctx.ref(owner.build.entity.elementId)],
+          `${ownerBase}List: 1..* no se valida`,
+          relRefs,
+        ),
+      );
+    }
+    foreignKeys.push({
+      name: registerConstraint(
+        `fk_${joinTableName}_${ownerColumn}`,
+        elements,
+        relRefs,
+        `${label}: FK de join table hacia ${owner.build.entity.name}`,
+      ),
+      table: joinTableName,
+      columns: [ownerColumn],
+      refTable: owner.build.entity.table,
+      refColumns: [ownerPk.column],
+      onDeleteCascade: true,
+    });
+    foreignKeys.push({
+      name: registerConstraint(
+        `fk_${joinTableName}_${targetColumn}`,
+        elements,
+        relRefs,
+        `${label}: FK de join table hacia ${owner.otherBuild.entity.name}`,
+      ),
+      table: joinTableName,
+      columns: [targetColumn],
+      refTable: owner.otherBuild.entity.table,
+      refColumns: [targetPk.column],
+      onDeleteCascade: true,
+    });
+
+    if (owner.end.isNavigable) {
+      addRelation(inverse, {
+        name: `${inverseBase}List`,
+        target: owner.build.entity.name,
+        kind: 'ManyToMany',
+        owning: false,
+        mappedBy: ownerRelation.name,
+        cascade: 'NONE',
+        orphanRemoval: false,
+        joinColumn: null,
+        joinTable: null,
+        dto: { name: `${inverseBase}Ids`, inRequest: false, required: false, idType: ownerPk.type.java },
+      });
+      if (inverse.other.upperBound !== null && inverse.other.upperBound > 1) {
+        generatorNotes.push(
+          note(
+            'upper_bound_not_enforced',
+            [ctx.ref(inverse.build.entity.elementId)],
+            `${inverseBase}List: la cota superior ${inverse.other.upperBound} no se aplica`,
+            relRefs,
+          ),
+        );
+      }
+      if (inverse.other.lowerBound >= 1) {
+        generatorNotes.push(
+          note(
+            'collection_lower_bound_not_enforced',
+            [ctx.ref(inverse.build.entity.elementId)],
+            `${inverseBase}List: 1..* no se valida`,
+            relRefs,
+          ),
+        );
+      }
+    }
+  }
+
+  // ── Fase E: colisiones de nombres (D3, D8) ────────────────────────────────
+  // Corre DESPUÉS de las asociaciones porque los campos de relación, las
+  // columnas FK y las join tables entran en los mismos espacios que los campos
+  // y las tablas del modelo.
   for (const [, entry] of sortedEntries(tableOwners)) {
     if (entry.ids.length > 1) {
       generatorBlockers.push(
@@ -542,16 +1105,43 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       );
     }
   }
-
-  // ── Fase D: relaciones diferidas (D5, D6) ─────────────────────────────────
-  for (const relationship of content.relationships) {
-    const detail = relationship.kind === 'GENERALIZATION'
-      ? `${relationship.kind}: herencia diferida a codegen-relationships`
-      : `${relationship.kind}: diferida a codegen-relationships`;
-    generatorNotes.push(
-      note('relationship_deferred', [ctx.ref(relationship.sourceElementId), ctx.ref(relationship.targetElementId)], detail),
-    );
+  for (const [, entry] of sortedEntries(constraintOwners)) {
+    if (entry.entries.length > 1) {
+      generatorBlockers.push(
+        blocker(
+          'name_collision',
+          entry.entries.flatMap((item) => item.elements),
+          `restricciones con el mismo nombre (${entry.name}): ${entry.entries.map((item) => item.label).join(', ')}`,
+          entry.entries.flatMap((item) => item.relationships),
+        ),
+      );
+    }
   }
+  for (const [, build] of sortedEntries(entityBuilds)) {
+    build.entity.imports = sortedUnique([...build.entity.imports, ...build.extraImports]);
+    for (const [, owners] of build.memberOwners) {
+      if (owners.length > 1) {
+        generatorBlockers.push(
+          blocker('name_collision', [ctx.ref(build.entity.elementId)], `miembros de ${build.label}: ${owners.join(', ')}`),
+        );
+      }
+    }
+    for (const [, owners] of build.columnOwners) {
+      if (owners.length > 1) {
+        generatorBlockers.push(
+          blocker('name_collision', [ctx.ref(build.entity.elementId)], `columnas de ${build.label}: ${owners.join(', ')}`),
+        );
+      }
+    }
+    for (const [, owners] of build.dtoOwners) {
+      if (owners.length > 1) {
+        generatorBlockers.push(
+          blocker('name_collision', [ctx.ref(build.entity.elementId)], `componentes de DTO de ${build.label}: ${owners.join(', ')}`),
+        );
+      }
+    }
+  }
+  foreignKeys.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   if (entities.length === 0) {
     generatorNotes.push(note('no_entities', [], 'el diagrama no tiene clasificadores emitibles'));
@@ -566,6 +1156,12 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     diagramName: content.diagram.name,
     entities,
     enums,
+    interfaces: [],
+    joinTables,
+    foreignKeys,
+    uniques,
+    // La clausura de fixtures obligatorios es de la Fase 5 (D9).
+    fixturePlan: {},
     blockers: [...blocking, ...generatorBlockers],
     notes: [...warnings, ...generatorNotes],
   };
@@ -611,11 +1207,19 @@ function extractValidation(validationReport: ValidationReport): { blocking: Code
   const warnings: CodegenNote[] = [];
   for (const finding of validationReport.findings) {
     if (isBlockingRule(finding.ruleId)) {
-      blocking.push({ source: 'validation', ruleId: finding.ruleId, elements: finding.elements, detail: finding.detail });
+      blocking.push({
+        source: 'validation',
+        ruleId: finding.ruleId,
+        elements: finding.elements,
+        // Los hallazgos de validación solo conocen elementos (D10).
+        relationships: [],
+        detail: finding.detail,
+      });
     } else {
       warnings.push({
         code: 'validation_warning',
         elements: finding.elements,
+        relationships: [],
         detail: finding.detail === null ? finding.ruleId : `${finding.ruleId}: ${finding.detail}`,
       });
     }
