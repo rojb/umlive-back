@@ -33,6 +33,15 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
   app.use(cookieParser());
+
+  // D3 (xmi-import): el limite del body JSON **se declara**, no se hereda.
+  // El XMI NO viaja por `json()` —viaja como multipart, y multer lo consume
+  // antes de que body-parser lo vea—, pero un default invisible es como nacio
+  // el riesgo de la compuerta [0]: nadie sabia que regia 100 kB hasta que un
+  // archivo de 1.2 MB respondio 413. 256 kB es holgado para los DTOs reales y
+  // no compite con el tope de 50 MB de la subida.
+  app.useBodyParser('json', { limit: '256kb' });
+
   app.useGlobalPipes(
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
   );

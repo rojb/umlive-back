@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
 import { UmlModule } from '../uml/uml.module';
+import { XmiAdmissionService } from './xmi-admission';
 import { XmiExportController } from './xmi-export.controller';
 import { XmiExportService } from './xmi-export.service';
+import { XmiImportController } from './xmi-import.controller';
 import { XsdValidatorService } from './xsd-validator.service';
 
 /**
@@ -26,11 +28,20 @@ import { XsdValidatorService } from './xsd-validator.service';
  * D7/Trampa de empaquetado) y `XsdValidatorService` (G2, fail-closed) es
  * provider de ESTE módulo. `XmiExportService` lo inyecta y corre G2 al final
  * del pipeline, después de G1.
+ *
+ * ── `xmi-import` (M5, rebanada 2 de 4 — Fase 1, tarea 1.7) ────────────────
+ * `XmiAdmissionService` es el nivel A de la admisión (tamaño, prólogo,
+ * `windows-1252`, buena formación, namespace por URI) y el lugar del log al
+ * arranque de la sonda de decodificación (D4). `XmiImportController` entra ya
+ * registrado pero **sin rutas**: las cuatro de §3 las agrega la Fase 4. El
+ * lector (`xmi-reader.ts`), el lector de la extensión EA
+ * (`ea-extension-reader.ts`) y el auto-layout (`auto-layout.ts`) son funciones
+ * puras: no son providers y no necesitan estar acá.
  */
 @Module({
   imports: [UmlModule],
-  controllers: [XmiExportController],
-  providers: [XmiExportService, XsdValidatorService],
-  exports: [XmiExportService],
+  controllers: [XmiExportController, XmiImportController],
+  providers: [XmiExportService, XsdValidatorService, XmiAdmissionService],
+  exports: [XmiExportService, XmiAdmissionService],
 })
 export class InteropModule {}
