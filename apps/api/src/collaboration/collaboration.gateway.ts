@@ -18,6 +18,7 @@ import {
   type SocketHandshakeAuth,
   type SocketRejectionCode,
 } from '@umlive/contracts';
+import { isUUID } from 'class-validator';
 import type { Server, Socket } from 'socket.io';
 import type { CurrentUserPayload } from '../auth/current-user.decorator';
 import { SocketAuthService } from '../auth/socket-auth.service';
@@ -74,6 +75,17 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    * nada por-usuario, todo por-socket).
    */
   private readonly socketQueues = new Map<string, Promise<void>>();
+
+  /**
+   * Tope de profundidad por-socket (verify-report 2026-09-18, RS-4). Sin
+   * esto, un cliente puede encolar miles de `op:submit` en `socketQueues` y
+   * cada uno retiene su payload en memoria hasta que le toca procesarse —
+   * el patrón normal de `enqueueForSocket` (W-3) no tiene, por diseño,
+   * ningún límite propio. Se lee y actualiza ANTES de encolar, nunca
+   * adentro de la cadena de promesas.
+   */
+  private readonly socketQueueDepth = new Map<string, number>();
+  private static readonly MAX_QUEUE_DEPTH = 100;
 
   constructor(
     private readonly socketAuth: SocketAuthService,
@@ -148,6 +160,8 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // límite en un servidor de larga vida (una entrada por cada socket que
     // alguna vez mandó un `op:submit`, nunca liberada).
     this.socketQueues.delete(client.id);
+    // RS-4: mismo motivo, para el contador de profundidad.
+    this.socketQueueDepth.delete(client.id);
   }
 
   /**
@@ -235,45 +249,70 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
 
   /**
    * Handler `op:submit` (`operations-pipeline/design.md` D3, corregido
-   * 2026-09-18 por verify-report C-2/W-3/W-4). Único punto de entrada
-   * validado ANTES de que nada llegue a `OperationsService`/la transacción
-   * (decisión del coordinador, verify-report): unido a la sala → miembro con
-   * permiso VIGENTE → recién ahí el pipeline (que valida `type`/forma de
-   * payload, D11). Todo bajo `enqueueForSocket` (W-3): las operaciones del
-   * MISMO socket se procesan en el orden en que se mandaron: la corrida
-   * anterior tiene que resolver (incluido el rechazo) antes de que empiece
-   * la siguiente. Sockets DISTINTOS no se estorban entre sí.
+   * 2026-09-18 por verify-report C-2/W-3/W-4, y de nuevo en la
+   * re-verificación 2026-09-18 por RW-1/RW-2/RS-4). Orden de admisión,
+   * del más barato al más caro:
    *
-   * `diagramId`/`actorId` AUTORITATIVOS son los de `socket.data` (del
-   * handshake), NUNCA los que pudiera traer el payload. El despacho por
-   * `out.route` no es una decisión de este archivo: la trae el propio
-   * `OperationOutcome`, fijada por quien conoce el motivo
-   * (`OperationsService`). `emitToSocket` es la misma puerta por-socket que
-   * ya usan `diagram:sync`/`access:revoked` (§D8 corregido 2026-09-18) — el
-   * eco de SC-C10 y el rechazo de SC-C11 la reusan en vez de sumar un método
-   * hermano.
+   * 0. Forma del SOBRE (RW-2) — SINCRÓNICO, fuera de la cola: un `req` roto
+   *    no toca la base ni compite por ningún lock, así que no necesita el
+   *    orden estricto de la cola por-socket.
+   * 0.5. Tope de profundidad por-socket (RS-4) — también fuera de la cola:
+   *    es una defensa de CAPACIDAD, no de contenido.
+   * 1. Membresía + permiso VIGENTE (C-2/RW-1) — el diagrama SIEMPRE es
+   *    `client.data.diagramId` (autoritativo, del handshake), nunca el que
+   *    pudiera traer el payload. Sin acceso confirmado, el rechazo NO lleva
+   *    `currentVersion` (RW-1): nada que no esté autorizado para ESTE
+   *    diagrama se entera de su versión.
+   * 2. Unido a la sala (W-4) — recién acá, con el acceso YA confirmado en el
+   *    paso 1, `currentVersion` es seguro de revelar.
+   * 3-4. Lista blanca de `type` + validación de payload (C-1, W-1, W-2) y el
+   *    resto del pipeline: `OperationsService.submit`.
+   *
+   * Todo del paso 1 en adelante bajo `enqueueForSocket` (W-3): las
+   * operaciones del MISMO socket se procesan en el orden en que se
+   * mandaron. Sockets DISTINTOS no se estorban entre sí. `emitToSocket` es
+   * la misma puerta por-socket que ya usan `diagram:sync`/`access:revoked`.
    */
   @SubscribeMessage('op:submit')
-  async onOperationSubmit(@ConnectedSocket() client: CollabSocket, @MessageBody() req: OperationRequest): Promise<void> {
-    await this.enqueueForSocket(client, () => this.processOperationSubmit(client, req));
+  async onOperationSubmit(@ConnectedSocket() client: CollabSocket, @MessageBody() req: unknown): Promise<void> {
+    // 0. Forma del SOBRE (verify-report 2026-09-18, RW-2). `req === null`
+    // (`emit('op:submit', null)`) o un `diagramId` que no es un UUID
+    // (`req.diagramId = "pepe"`) tiraban un `TypeError`/`22P02` sin atrapar
+    // más abajo en el pipeline — el remitente se quedaba sin NINGUNA
+    // salida, la misma violación que W-2 ya había cerrado para la FORMA del
+    // *payload* (acá es la forma del SOBRE que lo contiene).
+    const envelope = parseOperationEnvelope(req);
+    if (!envelope.ok) {
+      this.emitToSocket(client, 'op:rejected', this.rejectedOp(client, envelope.opId, 'MALFORMED', envelope.message));
+      return;
+    }
+
+    // 0.5. Tope de profundidad por-socket (RS-4), ANTES de encolar.
+    // `MALFORMED` porque `RATE_LIMITED` no existe en `RejectionReason`
+    // (`operations.ts`) — sumar un motivo nuevo movería el contrato y el
+    // frontend por una defensa de borde que esta pasada no pidió.
+    const depth = this.socketQueueDepth.get(client.id) ?? 0;
+    if (depth >= CollaborationGateway.MAX_QUEUE_DEPTH) {
+      this.emitToSocket(
+        client,
+        'op:rejected',
+        this.rejectedOp(client, envelope.value.opId, 'MALFORMED', 'Demasiadas operaciones en cola para este socket. Esperá a que se procesen las anteriores.'),
+      );
+      return;
+    }
+    this.socketQueueDepth.set(client.id, depth + 1);
+
+    await this.enqueueForSocket(client, () => this.processOperationSubmit(client, envelope.value)).finally(() => {
+      const left = (this.socketQueueDepth.get(client.id) ?? 1) - 1;
+      if (left <= 0) this.socketQueueDepth.delete(client.id);
+      else this.socketQueueDepth.set(client.id, left);
+    });
   }
 
   private async processOperationSubmit(client: CollabSocket, req: OperationRequest): Promise<void> {
     const room = this.roomOf(client.data.diagramId);
 
-    // 1. Unido a la sala (verify-report W-4). `diagram:join` hace `await
-    // resolveAccess` antes de `client.join` (D3 de `collaboration-gateway`),
-    // y los handlers de Socket.IO corren en paralelo — un `op:submit` que
-    // llega ANTES de que el `join` termine (reconexión) confirmaba y
-    // difundía igual, pero el remitente nunca recibía nada: violaba "todo
-    // `op:submit` DEBE producir exactamente una salida". Nunca silenciar:
-    // rechazo tipado, solo al remitente.
-    if (!client.rooms.has(room)) {
-      this.emitToSocket(client, 'op:rejected', await this.rejectedOp(req, 'MALFORMED', 'Todavía no te uniste a este diagrama. Esperá a que la sincronización termine e intentá de nuevo.'));
-      return;
-    }
-
-    // 2. Membresía + permiso VIGENTES, en CADA `op:submit` (verify-report
+    // 1. Membresía + permiso VIGENTES, en CADA `op:submit` (verify-report
     // C-2, INV-8 de `SPECS.md:52`). El handshake y `diagram:join` autorizan
     // una sola vez; sin esto, a un miembro EXPULSADO después de unirse le
     // alcanzaba con seguir mandando operaciones (no solo renovar el token,
@@ -302,7 +341,28 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
           : reason === 'TARGET_NOT_FOUND'
             ? 'El diagrama o el proyecto ya no existen.'
             : 'La operación no tiene una forma válida.';
-      this.emitToSocket(client, 'op:rejected', await this.rejectedOp(req, reason, message));
+      // RW-1 (verify-report 2026-09-18): SIN `currentVersion` — la
+      // autorización para ESTE diagrama recién falló, así que no hay
+      // "versión de ahora" que sea seguro revelarle a este remitente.
+      this.emitToSocket(client, 'op:rejected', this.rejectedOp(client, req.opId, reason, message));
+      return;
+    }
+
+    // 2. Unido a la sala (verify-report W-4). `diagram:join` hace `await
+    // resolveAccess` antes de `client.join` (D3 de `collaboration-gateway`),
+    // y los handlers de Socket.IO corren en paralelo — un `op:submit` que
+    // llega ANTES de que el `join` termine (reconexión) confirmaba y
+    // difundía igual, pero el remitente nunca recibía nada: violaba "todo
+    // `op:submit` DEBE producir exactamente una salida". Nunca silenciar:
+    // rechazo tipado, solo al remitente. El acceso YA se confirmó arriba
+    // (paso 1), así que acá `currentVersion` es seguro de revelar (RW-1).
+    if (!client.rooms.has(room)) {
+      const currentVersion = await this.operations.currentVersion(client.data.diagramId);
+      this.emitToSocket(
+        client,
+        'op:rejected',
+        this.rejectedOp(client, req.opId, 'MALFORMED', 'Todavía no te uniste a este diagrama. Esperá a que la sincronización termine e intentá de nuevo.', currentVersion),
+      );
       return;
     }
 
@@ -316,16 +376,17 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
   }
 
   /**
-   * Construye un `OperationRejected` sin abrir la transacción — mismas cinco
-   * propiedades que `operation-rejection.ts#rejected`, para los dos rechazos
-   * que este archivo emite ANTES del pipeline (W-4, C-2). `currentVersion`
-   * sale de `OperationsService.currentVersion` (nunca del ORM directo acá —
-   * barrera D4/D8) para que el cliente pueda reconciliar (SC-C12) igual que
-   * en cualquier otro rechazo.
+   * Construye un `OperationRejected` sin abrir la transacción — para los
+   * rechazos que este archivo emite ANTES del pipeline (RW-2, RS-4, W-4,
+   * C-2). `diagramId` SIEMPRE es `client.data.diagramId` (autoritativo, del
+   * handshake) — NUNCA el que pudiera traer el payload (RW-1: antes de esta
+   * corrección, un rechazo leía y devolvía el `diagramId` del CLIENTE, un
+   * oráculo de existencia/versión para un diagrama ajeno). `currentVersion`
+   * es OPCIONAL (RW-1) y el LLAMADOR decide si corresponde: solo después de
+   * confirmar autorización vigente para este diagrama.
    */
-  private async rejectedOp(req: OperationRequest, reason: OperationRejected['reason'], message: string): Promise<OperationRejected> {
-    const currentVersion = await this.operations.currentVersion(req.diagramId);
-    return { opId: req.opId, diagramId: req.diagramId, reason, message, currentVersion };
+  private rejectedOp(client: CollabSocket, opId: string, reason: OperationRejected['reason'], message: string, currentVersion?: number): OperationRejected {
+    return { opId, diagramId: client.data.diagramId, reason, message, currentVersion };
   }
 
   /**
@@ -409,4 +470,35 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     this.logger.debug(`handshake rechazado: ${code}`);
     return err;
   }
+}
+
+type OperationEnvelope = { ok: true; value: OperationRequest } | { ok: false; opId: string; message: string };
+
+/**
+ * Forma del SOBRE de `op:submit`, ANTES de que nada en el pipeline lea un
+ * campo de `req` (verify-report 2026-09-18, RW-2). Es una capa MÁS angosta
+ * que `validateOperationPayload` (que valida `req.payload` para un `type` ya
+ * conocido, dentro de `OperationsService.submit`): acá no hace falta abrir
+ * la base ni conocer el `OperationType` — un objeto sin `diagramId`/`opId`/
+ * `type` con la FORMA correcta no llega ni siquiera a la cola por-socket.
+ * `diagramId` se valida solo por FORMA (no se usa para autorizar nada — eso
+ * es siempre `client.data.diagramId`, RW-1); esta capa existe para que un
+ * `req.diagramId` no-string no tire una excepción sin atrapar más abajo.
+ */
+function parseOperationEnvelope(req: unknown): OperationEnvelope {
+  if (typeof req !== 'object' || req === null || Array.isArray(req)) {
+    return { ok: false, opId: '', message: 'La operación no tiene una forma válida.' };
+  }
+  const r = req as Record<string, unknown>;
+  const opId = typeof r.opId === 'string' ? r.opId : '';
+  if (typeof r.diagramId !== 'string' || !isUUID(r.diagramId)) {
+    return { ok: false, opId, message: 'El identificador del diagrama no es un UUID válido.' };
+  }
+  if (opId.length === 0) {
+    return { ok: false, opId, message: 'El identificador de la operación no tiene una forma válida.' };
+  }
+  if (typeof r.type !== 'string' || r.type.length === 0) {
+    return { ok: false, opId, message: 'El tipo de operación no tiene una forma válida.' };
+  }
+  return { ok: true, value: req as OperationRequest };
 }

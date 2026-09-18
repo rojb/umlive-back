@@ -157,8 +157,19 @@ export interface OperationRejected {
    * Versión autoritativa actual, para que el cliente reconcilie tras
    * revertir (SC-C12). Leída DESPUÉS del rollback: si otro confirmó
    * mientras tanto, el cliente necesita la versión de AHORA.
+   *
+   * Nota fechada 2026-09-18 (verify-report, RW-1): OPCIONAL a propósito.
+   * Antes de esta corrección, un rechazo temprano del gateway (socket no
+   * unido a la sala, miembro sin permiso vigente) leía `currentVersion` del
+   * `diagramId` que mandaba el CLIENTE — un oráculo de versión/existencia
+   * por UUID para un diagrama al que el remitente podía no tener acceso.
+   * Ahora el campo SOLO viaja cuando la autorización para ESE diagrama ya
+   * se confirmó (el remitente reconoce el diagrama, o su falta de acceso a
+   * él es justo lo que se está rechazando). Un consumidor (`collaboration.
+   * store.ts`, rebanada 3+) DEBE conservar la última `currentVersion`
+   * conocida cuando el rechazo llega sin ella, nunca pisarla con `undefined`.
    */
-  currentVersion: number;
+  currentVersion?: number;
 }
 
 export interface ModelViolation {
