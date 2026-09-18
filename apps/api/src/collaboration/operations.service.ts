@@ -3,9 +3,11 @@ import type { ActorKind, OperationCommitted, OperationRejected, OperationRequest
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Tx } from '../prisma/tx.type';
+import { LocksService } from './locks.service';
+import { resolveLockTargets } from './lock-targets';
 import { OperationDispatcher } from './operation-dispatch';
 import { validateOperationPayload } from './operation-validation';
-import { translateRejection } from './operation-rejection';
+import { DiagramFrozenError, ElementLockedError, translateRejection } from './operation-rejection';
 
 /**
  * Lo que `OperationsService.submit` devuelve — lleva su propio destino
@@ -25,10 +27,20 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 
 /**
  * El corazón del pipeline (design.md §1, D3, D6, D7, D9). Una única
- * transacción Prisma: `SELECT … FOR UPDATE` sobre la fila del diagrama →
- * versión siguiente → fila de log → mutación (vía el despachador) → un solo
- * `COMMIT`. Dentro del lock, SOLO trabajo de base — nada de red, nada de
- * emitir, nada de esperar al cliente (D7 regla dura).
+ * transacción Prisma: `SELECT … FOR UPDATE` sobre la fila del diagrama → eco
+ * idempotente por `opId` → versión + `lockState` → `423` si está congelado →
+ * `resolveLockTargets` + `canWrite()` → versión siguiente → mutación (vía el
+ * despachador) → fila de log → un solo `COMMIT`. Dentro del lock, SOLO trabajo
+ * de base — nada de red, nada de emitir, nada de esperar al cliente (D7 regla
+ * dura).
+ *
+ * **Las dos ramas de exigencia las agrega `element-lock-enforcement` (M4)**, y
+ * su ORDEN es load-bearing (design.md D3): el eco idempotente va ANTES del
+ * `423` y del `409`. Un reintento del mismo `opId` no escribe nada — rechazarlo
+ * sería mentirle al cliente sobre un hecho ya confirmado y difundido, y el
+ * motor de reversión de `frontend-cutover` revertiría estado AUTORITATIVO
+ * (SC-C10). El Apéndice A.1 del PRD dice lo contrario en su numeración; la
+ * nota fechada de esa sección explica por qué el código manda.
  *
  * NO inyecta el gateway, ni el `Server` de Socket.IO, ni nada capaz de
  * emitir. Su superficie pública es exclusivamente `OperationOutcome`: un
@@ -41,6 +53,7 @@ export class OperationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly dispatcher: OperationDispatcher,
+    private readonly locks: LocksService,
   ) {}
 
   async submit(diagramId: string, actorId: string, req: OperationRequest): Promise<OperationOutcome> {
@@ -140,13 +153,13 @@ export class OperationsService {
     // cosmético: sin el cast el driver adapter manda el parámetro como
     // `text` y Postgres responde 42804.
     //
-    // Nota fechada 2026-09-18 (verify-report W-8, design.md D7): `lock_state`
-    // NO se selecciona acá a propósito. `DATA-MODEL.md:846-849` lo pone en
-    // este mismo `SELECT … FOR UPDATE`, junto con el `423` de diagrama
-    // congelado (C.1/C.4 de `SPECS.md:236`). Falta la rama que rechaza con
-    // `423 DIAGRAM_FROZEN` cuando `lock_state !== 'unlocked'` — es
-    // `concurrency-ux` (M4), no esta rebanada. Un comentario sobrevive a una
-    // limpieza de "columna sin usar"; una variable sin leer no.
+    // Nota fechada 2026-09-18 (`element-lock-enforcement`, design.md D3-ter):
+    // `lock_state` NO se selecciona acá aunque `DATA-MODEL.md:846-849` lo ponga
+    // en este mismo `SELECT … FOR UPDATE`. La rama que lo lee vive ABAJO, junto
+    // con la versión (paso 3): tiene que ir DESPUÉS del eco idempotente (paso 2)
+    // y no antes. Seleccionar columnas que nadie lee en este punto era el error
+    // que D7 evitó a propósito; `locked_by`/`locked_at` NO se seleccionan nunca
+    // — `OperationRejected` no tiene campo para ellos (D3-ter).
     await tx.$queryRaw`SELECT 1 FROM diagrams WHERE id = ${diagramId}::uuid FOR UPDATE`;
 
     // 2. Idempotencia — se resuelve LEYENDO, nunca escribiendo (D6). El
@@ -178,11 +191,60 @@ export class OperationsService {
       return { route: 'sender', event: 'op:committed', payload: toCommitted(prev) };
     }
 
-    // 3. Versión siguiente — API tipada, bigint (D7). Dos consultas a
+    // 3. Versión + `lockState` — API tipada, bigint (D7). Dos consultas a
     // propósito: el `$queryRaw` de arriba lockea, esta lee con el tipo que
     // documenta el resto del proyecto (`@prisma/adapter-pg` no normaliza
     // `int8` fuera de la API tipada).
-    const diagram = await tx.diagram.findUniqueOrThrow({ where: { id: diagramId }, select: { currentVersion: true } });
+    //
+    // Esta es la única consulta que M4 toca del orden ya construido por M3:
+    // gana `lockState`. Nada más se reordena.
+    const diagram = await tx.diagram.findUniqueOrThrow({
+      where: { id: diagramId },
+      select: { currentVersion: true, lockState: true },
+    });
+
+    // 3-bis. Diagrama congelado → `423 DIAGRAM_FROZEN` (D3, D3-bis). Va
+    // DESPUÉS del eco (paso 2) y ANTES de resolver targets: el reintento de una
+    // operación ya confirmada no escribe, así que no puede ser un `423`.
+    //
+    // La comparación es `!== 'UNLOCKED'`, NUNCA `=== 'LOCKED_BY_HOST'` (D3-bis):
+    // falla cerrado. Si `DiagramLockState` ganara un tercer valor, la igualdad
+    // lo dejaría pasar en silencio. No lleva `lockedBy`/`lockedAt` al rechazo
+    // (D3-ter): el cartel con nombre y hora es de la rebanada 4 y se alimenta
+    // del evento `diagram:frozen`, no de acá.
+    //
+    // Esto alcanza también al host y a la IA (SC-C19 pagado por construcción:
+    // el chequeo es sobre la FILA, no sobre el actor).
+    if (diagram.lockState !== 'UNLOCKED') throw new DiagramFrozenError();
+
+    // 3-ter. Objetivos de lock reales, con `tx` (D4): traduce la fila de
+    // `LOCK_REQUIREMENTS` a `elementId[]` — las cadenas de dueño de uno y dos
+    // saltos incluidas. Duplica lecturas que el handler vuelve a hacer, a
+    // propósito: resolver fuera de la transacción leería un snapshot distinto
+    // del que muta.
+    const lockTargets = await resolveLockTargets(tx, diagramId, req.type, req.payload);
+
+    // 3-quater. LA EXIGENCIA (SC-C08). `canWrite()` es SÍNCRONO a propósito —
+    // consulta un `Map` en memoria, sin un solo `await` adentro — y va acá, LO
+    // ÚLTIMO antes de mutar, no apenas se tomó el `FOR UPDATE` (D3). El
+    // Apéndice A.1 del PRD lo pone al principio de la lista de admisión; eso
+    // MAXIMIZA la ventana de la carrera TTL/`COMMIT` y es lo que esta rebanada
+    // corrige.
+    //
+    // Esa carrera es un LÍMITE ACEPTADO, no un bug (D8): entre este chequeo y
+    // el `COMMIT` el TTL puede vencer y otro puede ganar el lock por WebSocket
+    // (que no toca la base, así que el `FOR UPDATE` no lo serializa). No se
+    // cierra: cerrarla exige acoplar `LocksService` a PostgreSQL, lo que
+    // `DATA-MODEL.md` §1.6 evita a propósito, y ningún lock debe sobrevivir un
+    // reinicio (SC-C06 exige lo contrario). El `FOR UPDATE` serializa las dos
+    // transacciones igual, así que el peor caso aterriza en orden, ambas en el
+    // log, versiones sin huecos: lo único que se pierde es la exclusión, por
+    // milisegundos. QUIEN "ARREGLE" ESTO ACOPLANDO LOCKS A LA BASE ROMPE SC-C06.
+    //
+    // Cero `await` entre este retorno y el `dispatch` de abajo (D3, V10).
+    const lock = this.locks.canWrite(diagramId, lockTargets, actorId);
+    if (!lock.ok) throw new ElementLockedError(lock.holder);
+
     const next = diagram.currentVersion + 1n;
 
     // 4. Mutación — el despachador solo conoce las variantes `…In(tx)`

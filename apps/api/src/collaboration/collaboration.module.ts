@@ -14,10 +14,15 @@ import { ReconnectService } from './reconnect.service';
  * M4).
  *
  * Piezas:
- *   locks.service.ts          exclusión por elemento — hecho (rebanada 1), cableado (rebanada 3)
+ *   locks.service.ts          exclusión por elemento — hecho (rebanada 1), cableado (rebanada 3);
+ *                             su `canWrite()` pasa de PROTOCOLO a EXIGENCIA en la rebanada 4
+ *                             (`element-lock-enforcement`: `OperationsService` lo inyecta y lo
+ *                             llama como último paso antes de mutar, dentro de la transacción)
  *   operations.service.ts     validación, orden y persistencia del log — hecho (rebanada 2)
  *   operation-dispatch.ts     mapa OperationType → …In(tx), 32 entradas — hecho (rebanada 2)
- *   operation-rejection.ts    traducción de errores → OperationRejected — hecho (rebanada 2)
+ *   operation-rejection.ts    traducción de errores → OperationRejected — hecho (rebanada 2);
+ *                             desde la rebanada 4 traduce también `DiagramFrozenError`/`ElementLockedError`
+ *   lock-targets.ts           traductor total de LOCK_REQUIREMENTS → elementId[] — rebanada 4
  *   reconnect.service.ts      delta/snapshot de `diagram:sync` — hecho (esta rebanada)
  *   presence.ts               color por sala, roster — rebanada 3 (helpers puros)
  *   collaboration.gateway.ts  el WebSocket que las une — modificado esta rebanada (join honra `lastVersion`)

@@ -73,7 +73,28 @@ export interface OperationRequest<T extends OperationType = OperationType> {
   /** UUID generado por el cliente. Clave de idempotencia (SC-C10, SC-C26). */
   opId: string;
   diagramId: string;
-  /** Última versión que el cliente conocía al construir esta operación. */
+  /**
+   * Se recibe y SE IGNORA. Para siempre — no "hasta algún hito".
+   *
+   * `current_version` es monótona por DIAGRAMA, no por elemento. Honrar esto
+   * haría colisionar SIEMPRE a dos personas editando elementos DISTINTOS del
+   * mismo diagrama: el segundo en llegar trae una versión vieja aunque nadie
+   * tocó lo suyo. El lienzo pasaría a tener un solo escritor.
+   *
+   * El control de concurrencia por elemento es el LOCK (SC-C08). La versión
+   * ORDENA (SC-C09) y DEDUPLICA por `opId` (SC-C10). Son trabajos distintos, y
+   * pedirle a la versión que además haga concurrencia optimista por elemento es
+   * pedirle dos trabajos incompatibles.
+   *
+   * Existe porque el cliente lo usa para detectar que está atrasado y pedir un
+   * `diagram:sync`. Ésa es toda su función.
+   *
+   * Deroga la nota de `operations-pipeline` D10 (que decía que se empezaría a
+   * honrar cuando M4 trajera la exigencia de locks). `element-lock-enforcement`,
+   * M4, design.md D7.
+   *
+   * SÍNTOMA SI ALGUIEN LO IMPLEMENTA: lienzo de un solo escritor.
+   */
   baseVersion: number;
   type: T;
   payload: PayloadFor<T>;
@@ -629,3 +650,33 @@ export const LOCK_REQUIREMENTS: { [T in OperationType]: LockRequirement<T> } = {
   'layout.waypoints': { targets: [{ from: 'payload', field: 'relationshipId' }] },
   'layout.anchors': { targets: [{ from: 'payload', field: 'relationshipId' }] },
 };
+
+/**
+ * Los objetivos de lock que se resuelven SIN base: solo los `from: 'payload'`.
+ *
+ * Existe para el gesto de cliente (D11): en `relationship.create` y
+ * `relationship.reroute` el gesto actual no alcanza todos los extremos que la
+ * tabla exige, y el cliente necesita saber cuáles pedir antes de emitir. El
+ * servidor los resuelve los cinco (`lock-targets.ts`); acá solo viajan los que
+ * el payload ya contiene.
+ *
+ * **Optimización, NUNCA la autoridad.** `canWrite()` del servidor decide, con
+ * las cuatro consultas de cadena de dueño incluidas. Un cliente que no la
+ * llame (o que la llame y no consiga el lock) recibe el `409` igual.
+ *
+ * Pura: no consulta nada, no mira el socket, no lanza. Un campo ausente o de
+ * tipo distinto de `string` simplemente no entra — a diferencia del servidor,
+ * donde eso es un bug de tabla (`INTERNAL` + `Logger.error`, D5).
+ *
+ * Deduplica: una `ASSOCIATION` reflexiva (`sourceElementId === targetElementId`)
+ * produce un solo id, no dos pedidos iguales.
+ */
+export function payloadLockTargets<T extends OperationType>(type: T, payload: PayloadFor<T>): string[] {
+  const targets: string[] = [];
+  for (const target of LOCK_REQUIREMENTS[type].targets) {
+    if (target.from !== 'payload') continue;
+    const value = (payload as Record<string, unknown>)[target.field as string];
+    if (typeof value === 'string') targets.push(value);
+  }
+  return [...new Set(targets)];
+}

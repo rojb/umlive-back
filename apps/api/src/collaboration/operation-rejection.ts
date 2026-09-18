@@ -1,9 +1,39 @@
 import { BadRequestException, ConflictException, Logger, NotFoundException } from '@nestjs/common';
-import type { OperationRejected, OperationType, RejectionReason, UmlErrorDetail } from '@umlive/contracts';
+import type { LockHolder, OperationRejected, OperationType, RejectionReason, UmlErrorDetail } from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import { resolveCheckViolation, resolveForeignKeyViolation, resolveUniqueViolation } from '../uml/uml-errors';
 
 const logger = new Logger('OperationsService');
+
+/**
+ * Diagrama congelado (`lock_state !== 'UNLOCKED'`) → `423` (design.md D9).
+ *
+ * Clase PLANA, nunca una `HttpException` de Nest: el traductor lee
+ * `getResponse()` de cualquier `ConflictException`/`BadRequestException` y la
+ * mapearía a `CONSTRAINT_VIOLATION` con un `code` inexistente. Por eso su
+ * `instanceof` va PRIMERO en la cadena.
+ */
+export class DiagramFrozenError extends Error {
+  constructor() {
+    super('DIAGRAM_FROZEN');
+    this.name = 'DiagramFrozenError';
+  }
+}
+
+/**
+ * Algún objetivo tiene lock ajeno vigente → `409` CON el holder (SC-C08,
+ * FR-C04: denegar sin decir quién es el bug que FR-C04 evita).
+ *
+ * Clase PLANA por el mismo motivo que `DiagramFrozenError`. El `holder` viaja
+ * en la instancia porque `canWrite()` ya lo devuelve: `submit()` solo recibe
+ * el `userId`, pero el rechazo necesita el nombre.
+ */
+export class ElementLockedError extends Error {
+  constructor(readonly holder: LockHolder) {
+    super('ELEMENT_LOCKED');
+    this.name = 'ElementLockedError';
+  }
+}
 
 /**
  * Traduce cualquier error que haya salido de la transacción de
@@ -16,6 +46,11 @@ const logger = new Logger('OperationsService');
  * Orden del traductor (design.md D8), del más barato y estructurado al más
  * caro y genérico:
  *
+ * 0. `DiagramFrozenError` / `ElementLockedError` — las DOS que agrega
+ *    `element-lock-enforcement` (M4, design.md D9). Son clases PLANAS, así que
+ *    no colisionan con nada, pero van PRIMERO igual: es la regla permanente
+ *    que impide que un camino futuro las haga caer en `getResponse()` o en
+ *    `CONSTRAINT_VIOLATION`.
  * 1. `ConflictException`/`BadRequestException` lanzadas DESDE el cuerpo
  *    mudado (`…In(tx)`) o desde la guarda del despachador → se lee
  *    `getResponse()`. Es el camino principal: `element_has_relationships`
@@ -49,6 +84,16 @@ export function translateRejection(
   payload: unknown,
   currentVersion: number,
 ): OperationRejected {
+  // 0. Exigencia de locks (M4, D9). PRIMERO, antes de `getResponse()` y de los
+  // tres resolvedores. Ambas son clases planas propias, nunca `ConflictException`.
+  if (err instanceof DiagramFrozenError) {
+    return rejected(opId, diagramId, 'DIAGRAM_FROZEN', 'El diagrama está congelado por el host. No se puede escribir hasta que se descongele.', currentVersion);
+  }
+  if (err instanceof ElementLockedError) {
+    const { displayName } = err.holder;
+    return rejected(opId, diagramId, 'ELEMENT_LOCKED', `${displayName} está editando este elemento. Esperá a que termine o pedile que suelte el bloqueo.`, currentVersion, undefined, err.holder);
+  }
+
   // 1. Excepciones de dominio lanzadas desde el cuerpo mudado o la guarda.
   if (err instanceof NotFoundException) {
     return rejected(opId, diagramId, 'TARGET_NOT_FOUND', 'El elemento o la relación que esta operación referencia ya no está en el diagrama.', currentVersion);
@@ -126,8 +171,9 @@ function rejected(
   message: string,
   currentVersion: number,
   umlError?: UmlErrorDetail,
+  holder?: LockHolder,
 ): OperationRejected {
-  return { opId, diagramId, reason, message, currentVersion, umlError };
+  return { opId, diagramId, reason, message, currentVersion, umlError, holder };
 }
 
 function humanMessage(reason: RejectionReason): string {

@@ -141,16 +141,35 @@ export class LocksService implements OnModuleDestroy {
   /**
    * ¿Puede este usuario escribir sobre estos elementos?
    *
-   * Lo llama el pipeline de operaciones ANTES de tocar la base (SC-C08). Un
-   * elemento libre se considera escribible: pedir el lock es responsabilidad
-   * del cliente, pero no tenerlo no habilita a otro a pisarlo — porque si otro
-   * lo tuviera, este chequeo fallaría.
+   * Lo llama el pipeline de operaciones **lo ÚLTIMO antes de la mutación,
+   * dentro de la transacción y después del eco idempotente por `opId`** — ver
+   * `element-lock-enforcement/design.md` D3. Este docstring decía antes «ANTES
+   * de tocar la base», que prescribe el sitio que MAXIMIZA la ventana de la
+   * carrera TTL/`COMMIT` (D8): el `423` y el `409` van después del eco porque
+   * un reintento de una operación ya confirmada no escribe nada, y rechazarlo
+   * revertiría estado autoritativo (SC-C10).
+   *
+   * SÍNCRONO a propósito: lee un `Map` en memoria y no tiene un solo `await`
+   * adentro. Eso y su ubicación tardía son las dos únicas mitigaciones posibles
+   * de esa carrera sin acoplar los locks a PostgreSQL (D8). La carrera sigue
+   * existiendo y sigue siendo un límite ACEPTADO.
+   *
+   * Un elemento libre se considera escribible: pedir el lock es
+   * responsabilidad del cliente, pero no tenerlo no habilita a otro a pisarlo
+   * — porque si otro lo tuviera, este chequeo fallaría.
+   *
+   * Es CONSULTA PURA (D6): no adquiere nada, así que `atomic` no participa acá
+   * — no hay estado parcial que revertir y se devuelve al primer dueño ajeno.
    */
   canWrite(diagramId: string, elementIds: string[], userId: string): LockOutcome {
     for (const id of elementIds) {
       const holder = this.holderOf(diagramId, id);
       if (holder && holder.userId !== userId) return { ok: false, holder };
     }
+    // `expiresAt` NO significa nada en este retorno: `canWrite` no adquiere
+    // nada, así que no hay TTL que devolver. Es un centinela que miente a
+    // propósito por compatibilidad de forma con `acquire`. El pipeline NO
+    // debe leerlo (D10).
     return { ok: true, expiresAt: 0 };
   }
 
