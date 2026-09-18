@@ -1,5 +1,6 @@
-import { IsIn, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
+import { IsIn, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
 import type { AddParameterRequest, EditableParameterDirection } from '@umlive/contracts';
+import { NoNulBytes } from './no-nul-bytes.decorator';
 
 const EDITABLE_DIRECTIONS: EditableParameterDirection[] = ['IN', 'OUT', 'INOUT'];
 
@@ -14,6 +15,8 @@ const EDITABLE_DIRECTIONS: EditableParameterDirection[] = ['IN', 'OUT', 'INOUT']
 export class AddParameterDto implements AddParameterRequest {
   @IsString()
   @MinLength(1)
+  @MaxLength(120)
+  @NoNulBytes()
   name!: string;
 
   @IsIn(EDITABLE_DIRECTIONS)
@@ -25,9 +28,11 @@ export class AddParameterDto implements AddParameterRequest {
 
   @IsOptional()
   @IsString()
+  @NoNulBytes()
   typeName?: string | null;
 
   @IsOptional()
   @IsString()
+  @NoNulBytes()
   defaultValue?: string | null;
 }

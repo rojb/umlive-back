@@ -1,5 +1,7 @@
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MinLength } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, MinLength } from 'class-validator';
 import type { AddFeatureRequest, FeatureKind, Visibility } from '@umlive/contracts';
+import { IsInt32Range } from './int32-range.decorator';
+import { NoNulBytes } from './no-nul-bytes.decorator';
 
 const FEATURE_KINDS: FeatureKind[] = ['ATTRIBUTE', 'OPERATION'];
 const VISIBILITIES: Visibility[] = ['PUBLIC', 'PRIVATE', 'PROTECTED', 'PACKAGE'];
@@ -16,6 +18,8 @@ export class AddFeatureDto implements AddFeatureRequest {
 
   @IsString()
   @MinLength(1)
+  @MaxLength(120)
+  @NoNulBytes()
   name!: string;
 
   @IsIn(VISIBILITIES)
@@ -27,14 +31,17 @@ export class AddFeatureDto implements AddFeatureRequest {
 
   @IsOptional()
   @IsString()
+  @NoNulBytes()
   typeName?: string | null;
 
   @IsOptional()
   @IsInt()
+  @IsInt32Range()
   lowerBound?: number;
 
   @IsOptional()
   @IsInt()
+  @IsInt32Range()
   upperBound?: number | null;
 
   @IsOptional()
@@ -59,5 +66,6 @@ export class AddFeatureDto implements AddFeatureRequest {
 
   @IsOptional()
   @IsString()
+  @NoNulBytes()
   defaultValue?: string | null;
 }

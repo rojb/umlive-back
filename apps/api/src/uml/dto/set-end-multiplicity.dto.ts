@@ -1,5 +1,6 @@
 import { IsInt, Min, ValidateIf } from 'class-validator';
 import type { SetEndMultiplicityRequest } from '@umlive/contracts';
+import { IsInt32Range } from './int32-range.decorator';
 
 /**
  * `upperBound` acepta `null` (`*`) y "sin definir" (`undefined`) sin
@@ -11,9 +12,11 @@ import type { SetEndMultiplicityRequest } from '@umlive/contracts';
 export class SetEndMultiplicityDto implements SetEndMultiplicityRequest {
   @IsInt()
   @Min(0)
+  @IsInt32Range()
   lowerBound!: number;
 
   @ValidateIf((o: SetEndMultiplicityDto) => o.upperBound !== null && o.upperBound !== undefined)
   @IsInt()
+  @IsInt32Range()
   upperBound!: number | null;
 }

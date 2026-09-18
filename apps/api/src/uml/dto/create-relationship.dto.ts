@@ -1,6 +1,8 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Min, ValidateIf, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, Min, ValidateIf, ValidateNested } from 'class-validator';
 import type { AggregationKind, CreateRelationshipEndRequest, CreateRelationshipRequest, RelationshipKind } from '@umlive/contracts';
+import { IsInt32Range } from './int32-range.decorator';
+import { NoNulBytes } from './no-nul-bytes.decorator';
 
 const RELATIONSHIP_KINDS: RelationshipKind[] = ['ASSOCIATION', 'GENERALIZATION', 'INTERFACE_REALIZATION', 'DEPENDENCY', 'USAGE'];
 const AGGREGATION_KINDS: AggregationKind[] = ['NONE', 'SHARED', 'COMPOSITE'];
@@ -17,14 +19,18 @@ const AGGREGATION_KINDS: AggregationKind[] = ['NONE', 'SHARED', 'COMPOSITE'];
 export class CreateRelationshipEndDto implements CreateRelationshipEndRequest {
   @IsOptional()
   @IsString()
+  @MaxLength(120)
+  @NoNulBytes()
   roleName?: string | null;
 
   @IsInt()
   @Min(0)
+  @IsInt32Range()
   lowerBound!: number;
 
   @ValidateIf((o: CreateRelationshipEndDto) => o.upperBound !== null && o.upperBound !== undefined)
   @IsInt()
+  @IsInt32Range()
   upperBound!: number | null;
 
   @IsBoolean()
@@ -52,6 +58,8 @@ export class CreateRelationshipDto implements CreateRelationshipRequest {
 
   @IsOptional()
   @IsString()
+  @MaxLength(120)
+  @NoNulBytes()
   name?: string | null;
 
   @IsOptional()

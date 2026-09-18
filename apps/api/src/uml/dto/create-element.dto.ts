@@ -1,5 +1,7 @@
-import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, Min, MinLength, ValidateIf } from 'class-validator';
+import { IsBoolean, IsIn, IsInt, IsOptional, IsString, IsUUID, MaxLength, Min, MinLength, ValidateIf } from 'class-validator';
 import type { CreateElementRequest, ElementKind } from '@umlive/contracts';
+import { IsInt32Range } from './int32-range.decorator';
+import { NoNulBytes } from './no-nul-bytes.decorator';
 
 const ELEMENT_KINDS: ElementKind[] = ['PACKAGE', 'CLASS', 'INTERFACE', 'ENUMERATION', 'DATATYPE', 'PRIMITIVE_TYPE', 'COMMENT'];
 
@@ -20,6 +22,8 @@ export class CreateElementDto implements CreateElementRequest {
   @ValidateIf((o: CreateElementDto) => o.name !== null)
   @IsString()
   @MinLength(1)
+  @MaxLength(120)
+  @NoNulBytes()
   name!: string | null;
 
   @ValidateIf((o: CreateElementDto) => o.parentId !== null)
@@ -32,23 +36,34 @@ export class CreateElementDto implements CreateElementRequest {
 
   @IsOptional()
   @IsString()
+  @MaxLength(200)
+  @NoNulBytes()
   stereotype?: string;
 
   @IsOptional()
   @IsString()
+  @MaxLength(2000)
+  @NoNulBytes()
   body?: string;
 
+  // RW-4 (verify-report 2026-09-18): `int4` es el tipo real de la columna
+  // (`Int` de Prisma) — `@IsInt()` solo (sin cota) deja pasar `3e9`/`1e308`
+  // y revienta en la escritura con `P2020`, nunca con un `400`/`MALFORMED`.
   @IsInt()
+  @IsInt32Range()
   x!: number;
 
   @IsInt()
+  @IsInt32Range()
   y!: number;
 
   @IsInt()
   @Min(1)
+  @IsInt32Range()
   width!: number;
 
   @IsInt()
   @Min(1)
+  @IsInt32Range()
   height!: number;
 }
