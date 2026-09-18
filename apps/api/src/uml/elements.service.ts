@@ -3,6 +3,7 @@ import { UML_ERROR, type ElementLayoutView, type IncidentRelationshipView, type 
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { assertElementInDiagram } from './diagram-scope';
+import { collectSubtreeIds } from './element-subtree';
 import type { CreateElementDto } from './dto/create-element.dto';
 import type { MoveElementDto } from './dto/move-element.dto';
 import type { RenameElementDto } from './dto/rename-element.dto';
@@ -103,25 +104,38 @@ export class ElementsService {
    * (design.md D6, tasks.md 3.1).
    *
    * Comprobación previa AUTORITATIVA, dentro de la misma transacción que el
-   * `delete()`: si hay ≥1 relación incidente, `409 { code, count,
+   * `delete()`: si hay ≥1 relación incidente **en el elemento o en
+   * cualquiera de sus descendientes por `parent_id`**, `409 { code, count,
    * relationships }` sin borrar nada. **Nunca una cascada manual** — el
    * bloque de `DATA-MODEL.md:895-906` arranca con "the service has already
    * verified in-memory locks": es M4 bajo FR-C07, no esta unidad (design.md
    * D6 lo rechaza explícitamente).
    *
+   * **Corrección de `uml-validation` (Hallazgo 1, design.md D2, tasks.md
+   * 0.2)** — la bomba: la comprobación previa miraba SOLO el elemento
+   * suelto. `parent_id` es `CASCADE`; las FK de relación son `RESTRICT`.
+   * Borrar un `PACKAGE` que contiene una clase con relaciones: el
+   * pre-chequeo del elemento suelto encontraba cero incidencias → `DELETE`
+   * → Postgres cascadeaba a los hijos → `RESTRICT` → `23503` → la red de
+   * `P2003` relistaba incidencias **del paquete**, volvía vacía, y
+   * relanzaba → `500`. Ahora la comprobación (y su red de `P2003`) recorren
+   * `collectSubtreeIds(tx, elementId)` — el elemento y TODO su subárbol.
+   *
    * El `catch` de `P2003` de abajo es solo red de CARRERA (no la fuente del
    * `409`): si entre la comprobación previa y el `DELETE` alguien más crea
    * una relación incidente, la base rechaza el borrado igual, se reconsulta
-   * una vez, y se responde `409` si ahora sí aparece algo. Si la relectura
-   * sigue vacía, se relanza el error tal cual — un `P2003` sin incidentes
-   * visibles es un bug real, no algo para disfrazar de `409` genérico.
+   * una vez **sobre el mismo subárbol**, y se responde `409` si ahora sí
+   * aparece algo. Si la relectura sigue vacía, se relanza el error tal cual
+   * — un `P2003` sin incidentes visibles es un bug real, no algo para
+   * disfrazar de `409` genérico.
    */
   async deleteElement(diagramId: string, elementId: string): Promise<void> {
     try {
       await this.prisma.$transaction(async (tx) => {
         await assertElementInDiagram(tx, elementId, diagramId);
 
-        const incidents = await this.findIncidentRelationships(tx, elementId);
+        const subtreeIds = await collectSubtreeIds(tx, elementId);
+        const incidents = await this.findIncidentRelationships(tx, subtreeIds);
         if (incidents.length > 0) {
           throw new ConflictException({
             code: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
@@ -135,7 +149,8 @@ export class ElementsService {
     } catch (err) {
       if (err instanceof ConflictException) throw err;
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2003') {
-        const incidents = await this.findIncidentRelationships(this.prisma, elementId);
+        const subtreeIds = await collectSubtreeIds(this.prisma, elementId);
+        const incidents = await this.findIncidentRelationships(this.prisma, subtreeIds);
         if (incidents.length > 0) {
           throw new ConflictException({
             code: UML_ERROR.ELEMENT_HAS_RELATIONSHIPS,
@@ -149,19 +164,33 @@ export class ElementsService {
   }
 
   /**
-   * Relaciones incidentes por `sourceElementId OR targetElementId OR
-   * ends.elementId`, unificadas por `relationshipId` (D6). La unificación es
-   * por construcción, no por un `Set`/`distinct` manual: la consulta filtra
+   * Relaciones incidentes sobre CUALQUIER elemento de `elementIds` (el
+   * subárbol completo desde `uml-validation`, antes solo el elemento
+   * suelto), por `sourceElementId OR targetElementId OR ends.elementId`,
+   * unificadas por `relationshipId` (D6). La unificación es por
+   * construcción, no por un `Set`/`distinct` manual: la consulta filtra
    * `UmlRelationship` (no `UmlRelationshipEnd`), así que cada relación
    * aparece como máximo una fila sin importar cuántas de las tres
-   * condiciones cumpla a la vez (p. ej. una `ASSOCIATION` cumple `source`/
-   * `target` Y `ends.elementId` para el mismo `elementId`). Orden
+   * condiciones cumpla a la vez, e incluso si ambas puntas caen dentro del
+   * mismo subárbol (relación interna al paquete — design.md D2). Orden
    * `createdAt` (design.md D6).
+   *
+   * `viaElementId`/`viaElementName` (design.md D2): qué elemento del
+   * subárbol sostiene la relación — `sourceElementId` si está en el
+   * subárbol, si no `targetElementId` (garantizado que al menos uno lo está
+   * por la cláusula `OR` de arriba, y `ends.elementId` es espejo de
+   * source/target, nunca aporta un tercer elemento). `otherElementName` se
+   * calcula RELATIVO a `viaElementId`, no al elemento borrado.
    */
-  private async findIncidentRelationships(tx: Tx, elementId: string): Promise<IncidentRelationshipView[]> {
+  private async findIncidentRelationships(tx: Tx, elementIds: string[]): Promise<IncidentRelationshipView[]> {
+    const subtreeIds = new Set(elementIds);
     const incidents = await tx.umlRelationship.findMany({
       where: {
-        OR: [{ sourceElementId: elementId }, { targetElementId: elementId }, { ends: { some: { elementId } } }],
+        OR: [
+          { sourceElementId: { in: elementIds } },
+          { targetElementId: { in: elementIds } },
+          { ends: { some: { elementId: { in: elementIds } } } },
+        ],
       },
       orderBy: { createdAt: 'asc' },
       include: {
@@ -171,11 +200,15 @@ export class ElementsService {
     });
 
     return incidents.map((r) => {
-      const other = r.sourceElementId === elementId ? r.targetElement : r.sourceElement;
+      const viaIsSource = subtreeIds.has(r.sourceElementId);
+      const via = viaIsSource ? r.sourceElement : r.targetElement;
+      const other = viaIsSource ? r.targetElement : r.sourceElement;
       return {
         relationshipId: r.id,
         kind: r.kind,
         name: r.name,
+        viaElementId: via.id,
+        viaElementName: via.name,
         otherElementId: other.id,
         otherElementName: other.name,
       };

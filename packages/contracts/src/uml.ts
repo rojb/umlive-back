@@ -352,11 +352,22 @@ export interface RelationshipLayoutView {
  * `deleteElement` (D6). El endpoint que la produce es fase 3
  * (`elements.service.ts`, tasks.md 3.1) — el tipo vive acá porque es parte
  * del contrato compartido de esta rebanada, no porque fase 1 lo consuma.
+ *
+ * `viaElementId`/`viaElementName` agregados por `uml-validation` (design.md
+ * D2, Hallazgo 1 de su propuesta, tasks.md 0.2): qué elemento del SUBÁRBOL
+ * sostiene la relación — igual al elemento borrado si es suya propia, o un
+ * descendiente si el borrado es de un `PACKAGE`. `otherElementName` pasa a
+ * calcularse RELATIVO a `viaElementId`, no al elemento borrado — si no,
+ * borrar un paquete devolvía «la otra punta» de una relación que el paquete
+ * no tiene.
  */
 export interface IncidentRelationshipView {
   relationshipId: string;
   kind: RelationshipKind;
   name: string | null;
+  /** Elemento del subárbol que sostiene la relación (design.md D2). */
+  viaElementId: string;
+  viaElementName: string | null;
   otherElementId: string;
   otherElementName: string | null;
 }
