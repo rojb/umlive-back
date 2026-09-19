@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsString,
   Length,
+  MaxLength,
   ValidateNested,
 } from 'class-validator';
 import type { AiModelRef, AiProviderId, UpdateAiConfigRequest } from '@umlive/contracts';
@@ -13,9 +14,10 @@ import type { AiModelRef, AiProviderId, UpdateAiConfigRequest } from '@umlive/co
 /**
  * DTO de `PUT .../ai/config` (design D6).
  *
- * Trae SOLO proveedor, modelo y cadena de reserva. La clave BYO (FR-D11) es la
- * Fase 7 y tendría su propio campo de escritura; acá no existe ninguna
- * superficie de clave (SC-D05).
+ * Trae proveedor, modelo, cadena de reserva y —desde la tarea 7.3— la clave BYO
+ * del proyecto (FR-D11). **La clave es un campo de ESCRITURA**: entra por acá y
+ * ninguna vista la devuelve; lo único que una lectura revela es
+ * `AiConfigView.hasProjectKey` (SC-D05).
  *
  * La cadena se topea en 3 eslabones: es el mismo tope que aplica el despacho
  * (primario + 3, design D4), así que rechazarlo temprano evita guardar una
@@ -52,4 +54,20 @@ export class UpdateAiConfigDto implements UpdateAiConfigRequest {
   @ValidateNested({ each: true })
   @Type(() => AiModelRefDto)
   fallbackChain?: AiModelRefDto[];
+
+  /**
+   * Clave BYO del proyecto. `@IsOptional()` de class-validator deja pasar
+   * también `null`, que es el borrado explícito (tarea 7.3); una cadena vacía o
+   * ausente significa "no mando clave nueva".
+   *
+   * El tope de 200 caracteres es un tope de FORMA, no una regla de formato: no
+   * se puede validar el formato de seis vendors distintos sin inventar reglas, y
+   * una regla inventada rechazaría una clave válida. El servicio ignora una
+   * cadena vacía o de solo espacios (equivale a "sin clave nueva"), así que
+   * tampoco hace falta una longitud mínima acá.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  apiKey?: string | null;
 }

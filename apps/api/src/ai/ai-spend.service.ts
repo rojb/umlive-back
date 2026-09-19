@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { AiModelView, AiSpendView } from '@umlive/contracts';
+import type { AiModelRef, AiModelView, AiSpendTurnView, AiSpendView } from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
@@ -49,6 +49,9 @@ import type { LlmMessage, ToolDefinition } from './providers/llm-provider.interf
  * reservas confirmadas antes.
  */
 export const AI_SPEND_LOCK_KEY = 418_024_001;
+
+/** Últimos turnos que expone la vista de FR-D12 (tarea 7.1). */
+const RECENT_TURNS_LIMIT = 10;
 
 /** Ventana del límite de ritmo: la última hora (FR-D15b.4). */
 const RATE_WINDOW_MS = 60 * 60 * 1000;
@@ -323,18 +326,37 @@ export class AiSpendService {
 
   /**
    * Vista de gasto (D6): el gasto del entorno y el del proyecto contra el
-   * techo. `ceilingUsd: null` NO es "sin techo", es "techo ausente" — con él
-   * todo turno se rechaza.
+   * techo, más los últimos 10 turnos del proyecto (tarea 7.1).
    *
-   * `recentTurns` queda vacío: los últimos 10 turnos del proyecto son la tarea
-   * 7.1 (`Fase 7`, fuera de alcance de esta corrida).
+   * `ceilingUsd: null` NO es "sin techo", es "techo ausente" — con él todo
+   * turno se rechaza.
+   *
+   * `recentTurns` sale de `ai_turns` con el mismo join a `diagrams` que usa el
+   * agregado del proyecto, ordenado por `createdAt` descendente. `reserved` es
+   * `status === 'PENDING'`: la fila que todavía es una reserva sin liquidar
+   * (design D3). No se filtra por estado — el turno rechazado que nunca se
+   * escribió no existe, y el fallido sí gastó su reserva.
    */
   async spendView(projectId: string): Promise<AiSpendView> {
-    const [environment, project] = await Promise.all([
+    const [environment, project, turns] = await Promise.all([
       this.prisma.aiTurn.aggregate({ _sum: { costUsd: true } }),
       this.prisma.aiTurn.aggregate({
         where: { diagram: { projectId } },
         _sum: { costUsd: true },
+      }),
+      this.prisma.aiTurn.findMany({
+        where: { diagram: { projectId } },
+        orderBy: { createdAt: 'desc' },
+        take: RECENT_TURNS_LIMIT,
+        select: {
+          id: true,
+          createdAt: true,
+          costUsd: true,
+          status: true,
+          provider: true,
+          model: true,
+          diagram: { select: { name: true } },
+        },
       }),
     ]);
 
@@ -342,7 +364,17 @@ export class AiSpendService {
       ceilingUsd: this.ceilingUsd === null ? null : this.ceilingUsd.toString(),
       environmentSpentUsd: (environment._sum.costUsd ?? new Prisma.Decimal(0)).toString(),
       projectSpentUsd: (project._sum.costUsd ?? new Prisma.Decimal(0)).toString(),
-      recentTurns: [],
+      recentTurns: turns.map(
+        (turn): AiSpendTurnView => ({
+          turnId: turn.id,
+          createdAt: turn.createdAt.toISOString(),
+          diagramName: turn.diagram.name,
+          model: { provider: turn.provider as AiModelRef['provider'], model: turn.model },
+          costUsd: turn.costUsd.toString(),
+          status: turn.status,
+          reserved: turn.status === 'PENDING',
+        }),
+      ),
     };
   }
 

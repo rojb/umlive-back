@@ -88,11 +88,16 @@ export interface AiModelView extends AiModelRef {
  *   seleccionable (FR-D02 menos FR-D03, PO-2/tarea 0.2).
  * - `missing_configuration`: al endpoint OpenAI-compatible le falta base URL,
  *   modelo o precios.
+ * - `byo_key_unreadable`: el proyecto guardó una clave propia (FR-D11) y el
+ *   ciphertext no se puede descifrar — clave de cifrado ausente, rotada o
+ *   ciphertext alterado. Se degrada a no disponible en vez de llamar con una
+ *   credencial que no se pudo leer (design D8, tarea 7.4).
  */
 export type AiProviderUnavailableReason =
   | 'missing_api_key'
   | 'price_unverified'
-  | 'missing_configuration';
+  | 'missing_configuration'
+  | 'byo_key_unreadable';
 
 export interface AiProviderView {
   readonly id: AiProviderId;
@@ -118,13 +123,26 @@ export interface AiConfigView {
 /**
  * Cuerpo de `PUT .../ai/config`.
  *
- * Trae a propósito SOLO el proveedor, el modelo y la cadena de respaldo. La
- * clave propia (FR-D11) escribe un campo propio cuando esa fase exista; no se
- * declara acá para no dejar ninguna superficie de clave en este contrato.
+ * ── Por qué `apiKey` SÍ está acá y sigue sin romper SC-D05 ─────────────────
+ *
+ * Es un campo de ESCRITURA: viaja del cliente al servidor y nunca vuelve. Las
+ * vistas (`AiConfigView`, `AiSpendView`, `AiModelView`) siguen sin tener ningún
+ * campo de clave — lo único que una lectura revela es `hasProjectKey`. Que este
+ * tipo declare `apiKey` es lo que permite que el cliente lo mande sin inventar
+ * una forma paralela; que ninguna vista lo declare es lo que hace que no pueda
+ * volver (FR-D11, SC-D05).
+ *
+ * Semántica (design D8, tarea 7.3):
+ * - una cadena no vacía se cifra y reemplaza la clave guardada;
+ * - `null` borra la clave guardada;
+ * - `undefined` (o cadena vacía) no manda clave nueva: se conserva la anterior
+ *   SOLO si el proveedor primario no cambió, y se borra si cambió, porque una
+ *   clave de Anthropic guardada bajo un primario Gemini ya no aplica a nada.
  */
 export interface UpdateAiConfigRequest {
   readonly primary: AiModelRef;
   readonly fallbackChain?: readonly AiModelRef[];
+  readonly apiKey?: string | null;
 }
 
 /** Una fila de `ai_turns` para la vista de FR-D12 (máximo 10, las últimas). */
@@ -181,6 +199,12 @@ export const AI_ERROR = {
   SPEND_CEILING_REACHED: 'ai_spend_ceiling_reached',
   RATE_LIMITED: 'rate_limited',
   HEALTH_CHECK_NEEDS_DIAGRAM: 'ai_health_check_needs_diagram',
+  /**
+   * Se pidió guardar una clave BYO (FR-D11) y el servidor no tiene clave de
+   * cifrado configurada, o la que tiene no son 32 bytes en base64. Guardar en
+   * claro NO es una opción: se rechaza el `PUT` (design D5/D8).
+   */
+  BYO_KEY_UNAVAILABLE: 'ai_byo_key_unavailable',
 } as const;
 
 export type AiErrorCode = (typeof AI_ERROR)[keyof typeof AI_ERROR];
