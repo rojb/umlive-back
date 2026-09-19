@@ -19,12 +19,13 @@
  *   los métodos de `Object`.
  * - **Nombres** (D3): NFC sin plegar para Java/SQL; la ruta es la única que
  *   pliega a ASCII, y lo declara con `route_ascii_folded`.
- * - **Relaciones** (D3, D10): cada `ASSOCIATION` se resuelve a campos JPA, columnas
- *   FK, join tables y restricciones según la multiplicidad (y, en la fase de
- *   agregación, la del TODO). `DEPENDENCY`/`USAGE` y los extremos sobre
- *   no-entidad quedan declarados con `relationship_not_emitted`; la herencia y
- *   las interfaces las cubre la Fase 4 de la misma rebanada y hasta entonces
- *   también se declaran con esa nota. `relationship_deferred` ya no existe (D1).
+ * - **Relaciones** (D3, D4, D10): cada `ASSOCIATION` se resuelve a campos JPA, columnas
+ *   FK, join tables y restricciones según la multiplicidad y la agregación (cascada
+ *   del TODO); `DEPENDENCY`/`USAGE` y los extremos sobre no-entidad quedan declarados
+ *   con `relationship_not_emitted`. La herencia y las interfaces las cubren las pasadas
+ *   D2 de esta rebanada; `relationship_deferred` ya no existe (D1). El grafo de
+ *   referencias obligatorias (D9) cierra con `fixturePlan` o con un bloqueo, y nunca
+ *   con un ZIP que no arranque.
  * - **Orden de los hallazgos** (D6): primero los de validación en el orden del
  *   servicio, después los del generador en el orden de esta construcción.
  */
@@ -32,6 +33,7 @@
 import {
   isBlockingRule,
   qualifiedName,
+  type CodegenBlockCode,
   type CodegenElementRef,
   type CodegenFinding,
   type CodegenNote,
@@ -67,6 +69,7 @@ import type {
   IrEnum,
   IrField,
   IrForeignKey,
+  IrInterface,
   IrJoinTable,
   IrOperation,
   IrParameter,
@@ -132,6 +135,43 @@ interface RelationshipSide {
   otherBuild: EntityBookkeeping;
 }
 
+/** Rol de una clase en la jerarquía de generalizaciones (D2). */
+type ClassRole = 'entity' | 'mappedSuperclass' | 'skipped';
+
+/**
+ * Nodo de la jerarquía de `GENERALIZATION` (D2). El sentido es
+ * `source` = hija, `target` = padre, así que `childrenElementIds` se llena
+ * desde el padre.
+ */
+interface ClassNode {
+  elementId: string;
+  rawName: string;
+  role: ClassRole;
+  isAbstract: boolean;
+  /** Clase Java resuelta (`typeName`); `null` si el nombre no es representable. */
+  javaName: string | null;
+  /** Generalizaciones con un padre clasificado (clase/UML), en orden del modelo. */
+  parents: { elementId: string; relationship: UmlRelationshipView }[];
+  /** Padre emitido elegido: el primero de `parents` que se emite, o `null`. */
+  parentElementId: string | null;
+  childrenElementIds: string[];
+  /** `true` si algún hijo directo se emite. */
+  hasEmittedChild: boolean;
+  /** `true` si algún descendiente es una clase concreta emitible. */
+  hasConcreteDescendant: boolean;
+  /** `true` si la clase pasa la clasificación y la decisión de emisión (D6). */
+  emitted: boolean;
+}
+
+/** Arista del grafo de referencias obligatorias (D9): una FK `NOT NULL`. */
+interface MandatoryEdge {
+  fromElementId: string;
+  toElementId: string;
+  relationship: UmlRelationshipView;
+  elements: CodegenElementRef[];
+  relationships: CodegenRelationshipRef[];
+}
+
 function groupBy<T>(items: readonly T[], key: (item: T) => string): Map<string, T[]> {
   const map = new Map<string, T[]>();
   for (const item of items) {
@@ -150,7 +190,7 @@ const byPosition = <T extends { position: number }>(items: readonly T[]): T[] =>
 const sortedUnique = (values: readonly string[]): string[] => [...new Set(values)].sort();
 
 function blocker(
-  code: 'name_collision' | 'name_unrepresentable' | 'pk_type_invalid' | 'operation_signature_collision',
+  code: CodegenBlockCode,
   elements: CodegenElementRef[],
   detail: string | null,
   relationships: CodegenRelationshipRef[] = [],
@@ -174,6 +214,211 @@ function relationshipLabel(relationship: UmlRelationshipView, ctx: BuildContext)
   const source = ctx.ref(relationship.sourceElementId).qualifiedName ?? relationship.sourceElementId;
   const target = ctx.ref(relationship.targetElementId).qualifiedName ?? relationship.targetElementId;
   return `${source} — ${target} (${relationship.kind})`;
+}
+
+/** Referencia a una arista, para los bloqueos que apuntan a relaciones (D10). */
+function relationshipRef(relationship: UmlRelationshipView, ctx: BuildContext): CodegenRelationshipRef {
+  return { id: relationship.id, label: relationshipLabel(relationship, ctx) };
+}
+
+/** Motivo de `classifier_skipped` para una clase que la jerarquía no emite (D6). */
+function skipDetail(el: UmlElementView, node: ClassNode | undefined): string {
+  const rawName = el.name ?? '';
+  const stereotype = (el.stereotype ?? '').trim();
+  if (node !== undefined && node.role === 'skipped' && stereotype.toLowerCase() === 'mappedsuperclass') {
+    return `${rawName}: estereotipo «${stereotype}» en una clase concreta`;
+  }
+  if (el.isAbstract) return `${rawName}: clase abstracta sin hijas emitidas`;
+  if (stereotype !== '') return `${rawName}: estereotipo «${stereotype}»`;
+  return `${rawName}: no es una clase emitible`;
+}
+
+/** Resultado de mapear las operaciones de una clase o interfaz (D5). */
+interface MappedOperations {
+  operations: IrOperation[];
+  imports: string[];
+  registered: { signature: string; label: string }[];
+}
+
+/**
+ * Mapea las operaciones de un clasificador a stubs Java (contradicción 2 de la
+ * propuesta, D5). Compartido por las clases y por las interfaces (D2): la firma
+ * es el nombre más los tipos Java de los parámetros después de mapear, sin el
+ * retorno, así que `foo(int)` y `foo(Integer)` comparten clave y bloquean.
+ */
+function mapOperations(
+  ownerId: string,
+  ctx: BuildContext,
+  blockers: CodegenFinding[],
+  notes: CodegenNote[],
+): MappedOperations {
+  const operations: IrOperation[] = [];
+  const imports: string[] = [];
+  const registered: { signature: string; label: string }[] = [];
+  for (const operation of ctx.operationsByOwner.get(ownerId) ?? []) {
+    const operationName = operation.name;
+    const ownParameters = ctx.parametersByOperation.get(operation.id) ?? [];
+    const parameters = ownParameters.filter((p) => p.direction !== 'RETURN');
+    const returnParameter = ownParameters.find((p) => p.direction === 'RETURN');
+
+    const parameterResults: IrParameter[] = [];
+    let skippedParameter = false;
+    for (const parameter of parameters) {
+      const resolvedType = resolveType(parameter.typeElementId, parameter.typeName, ctx);
+      if (resolvedType.status !== 'ok') {
+        skippedParameter = true;
+        break;
+      }
+      parameterResults.push({
+        name: memberName(parameter.name).name || 'p',
+        type: resolvedType.type as IrTypeRef,
+      });
+    }
+    if (skippedParameter) {
+      notes.push(note('operation_skipped', [ctx.ref(ownerId)], `${operationName}: parámetro de tipo no emitido`));
+      continue;
+    }
+
+    let returns = 'void';
+    let returnImports: string[] = [];
+    if (returnParameter) {
+      const resolvedReturn = resolveType(returnParameter.typeElementId, returnParameter.typeName, ctx);
+      if (resolvedReturn.status !== 'ok') {
+        notes.push(note('operation_skipped', [ctx.ref(ownerId)], `${operationName}: retorno de tipo no emitido`));
+        continue;
+      }
+      const returnType = resolvedReturn.type as IrTypeRef;
+      returns = returnType.java;
+      returnImports = returnType.imports;
+    }
+
+    const member = memberName(operationName);
+    if (member.unrepresentable) {
+      blockers.push(blocker('name_unrepresentable', [ctx.ref(ownerId)], operationName));
+      continue;
+    }
+    const signature = `${member.name}(${parameterResults.map((p) => p.type.java).join(',')})`;
+    const operationImports = sortedUnique([...parameterResults.flatMap((p) => p.type.imports), ...returnImports]);
+    imports.push(...operationImports);
+    registered.push({ signature, label: operationName });
+    operations.push({
+      elementId: operation.id,
+      name: member.name,
+      signature,
+      parameters: parameterResults,
+      returns,
+      imports: operationImports,
+    });
+    if (member.escaped) {
+      notes.push(note('name_escaped', [ctx.ref(ownerId)], `${operationName} → ${member.name}`));
+    }
+  }
+  return { operations, imports, registered };
+}
+
+/**
+ * Clasifica las clases y resuelve la jerarquía de `GENERALIZATION` (D2, tareas
+ * 4.1 y 4.2) ANTES de la Fase B: quién se emite, quién es la raíz, quién cuelga
+ * de quién y qué relaciones lo bloquean. `source` = hija, `target` = padre.
+ */
+function buildClassNodes(
+  content: DiagramContent,
+  ctx: BuildContext,
+  blockers: CodegenFinding[],
+  notes: CodegenNote[],
+): Map<string, ClassNode> {
+  const nodes = new Map<string, ClassNode>();
+  for (const el of content.elements) {
+    if (el.kind !== 'CLASS') continue;
+    const rawName = el.name ?? '';
+    const stereotype = (el.stereotype ?? '').trim().toLowerCase();
+    const resolved = typeName(rawName);
+    let role: ClassRole = 'skipped';
+    if (stereotype === 'mappedsuperclass') role = el.isAbstract ? 'mappedSuperclass' : 'skipped';
+    else if (stereotype === '' || stereotype === 'entity') role = 'entity';
+    nodes.set(el.id, {
+      elementId: el.id,
+      rawName,
+      role,
+      isAbstract: el.isAbstract,
+      javaName: resolved.unrepresentable ? null : resolved.name,
+      parents: [],
+      parentElementId: null,
+      childrenElementIds: [],
+      hasEmittedChild: false,
+      hasConcreteDescendant: false,
+      emitted: false,
+    });
+  }
+  for (const rel of content.relationships) {
+    if (rel.kind !== 'GENERALIZATION') continue;
+    const child = nodes.get(rel.sourceElementId);
+    const parent = nodes.get(rel.targetElementId);
+    if (child === undefined || parent === undefined) continue;
+    child.parents.push({ elementId: parent.elementId, relationship: rel });
+    parent.childrenElementIds.push(child.elementId);
+  }
+
+  const hasConcreteDescendant = (id: string, seen: Set<string>): boolean => {
+    if (seen.has(id)) return false;
+    seen.add(id);
+    const node = nodes.get(id);
+    if (node === undefined) return false;
+    if (node.role === 'entity' && !node.isAbstract) return true;
+    return node.childrenElementIds.some((child) => hasConcreteDescendant(child, seen));
+  };
+  const emits = (node: ClassNode): boolean => {
+    if (node.role === 'mappedSuperclass') return true;
+    if (node.role === 'entity') return !node.isAbstract || node.hasConcreteDescendant;
+    return false;
+  };
+
+  for (const node of nodes.values()) {
+    node.hasConcreteDescendant = hasConcreteDescendant(node.elementId, new Set());
+  }
+  for (const node of nodes.values()) {
+    node.hasEmittedChild = node.childrenElementIds.some((child) => {
+      const c = nodes.get(child);
+      return c !== undefined && emits(c);
+    });
+    node.emitted = emits(node);
+  }
+
+  for (const node of nodes.values()) {
+    if (!node.emitted) continue;
+    // Padres EMITIBLES: solo ellos hacen jerarquía. Un padre omitido o una
+    // interfaz dejan a la hija sin `extends` (D2).
+    const emittedParents = node.parents.filter((parent) => {
+      const p = nodes.get(parent.elementId);
+      return p !== undefined && p.emitted && (p.role === 'entity' || p.role === 'mappedSuperclass');
+    });
+    if (emittedParents.length > 1) {
+      blockers.push(
+        blocker(
+          'multiple_inheritance',
+          [ctx.ref(node.elementId)],
+          `${node.rawName}: ${emittedParents.length} padres emitibles`,
+          emittedParents.map((parent) => relationshipRef(parent.relationship, ctx)),
+        ),
+      );
+    }
+    node.parentElementId = emittedParents[0]?.elementId ?? null;
+    const parentNode = node.parentElementId === null ? null : (nodes.get(node.parentElementId) ?? null);
+    if (node.role === 'mappedSuperclass' && parentNode !== null && parentNode.role === 'entity' && parentNode.emitted) {
+      blockers.push(
+        blocker('mapped_superclass_not_root', [ctx.ref(node.elementId)], `${node.rawName}: @MappedSuperclass con un ancestro entidad`),
+      );
+    }
+    if (parentNode !== null && parentNode.emitted) {
+      const declaresId = (ctx.attributesByOwner.get(node.elementId) ?? []).some((a) => a.name.toLowerCase() === 'id');
+      if (declaresId) {
+        blockers.push(
+          blocker('pk_in_subclass', [ctx.ref(node.elementId)], `${node.rawName}: declara id y no es la raíz de su jerarquía`),
+        );
+      }
+    }
+  }
+  return nodes;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +536,63 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     typeSets.push({ elementId: el.id, label: `enumeración ${rawName}`, keys: new Map([[collisionKey(resolved.name), resolved.name]]) });
   }
 
+  // ── Fase A.2: interfaces (D2, tarea 4.3) ─────────────────────────────────
+  //
+  // Un `INTERFACE` con operaciones mapeables se emite como `interface` Java en
+  // `entity/`, con sus firmas ya resueltas: son las que después usan los stubs
+  // de las clases que lo realizan. Antes de esta fase, `INTERFACE` se omitía y
+  // toda `INTERFACE_REALIZATION` quedaba declarada como `relationship_not_emitted`
+  // (decisión de alcance de la Fase 2).
+  const interfaces: IrInterface[] = [];
+  const interfaceByElementId = new Map<string, IrInterface>();
+  for (const el of content.elements) {
+    if (el.kind !== 'INTERFACE') continue;
+    const rawName = el.name ?? '';
+    const resolvedName = typeName(rawName);
+    if (resolvedName.unrepresentable) {
+      generatorBlockers.push(blocker('name_unrepresentable', [ctx.ref(el.id)], rawName));
+      continue;
+    }
+    if (resolvedName.escaped) {
+      generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `${rawName} → ${resolvedName.name}`));
+    }
+    const mapped = mapOperations(el.id, ctx, generatorBlockers, generatorNotes);
+    const irInterface: IrInterface = {
+      elementId: el.id,
+      name: resolvedName.name,
+      extends: [],
+      methods: mapped.operations,
+    };
+    interfaces.push(irInterface);
+    interfaceByElementId.set(el.id, irInterface);
+    typeSets.push({
+      elementId: el.id,
+      label: `interfaz ${rawName}`,
+      keys: new Map([[collisionKey(resolvedName.name), resolvedName.name]]),
+    });
+  }
+  // `extends` de una interfaz: generalización entre interfaces. Java admite
+  // herencia múltiple de interfaces, así que el costo es cero (D2).
+  for (const el of content.elements) {
+    if (el.kind !== 'INTERFACE') continue;
+    const irInterface = interfaceByElementId.get(el.id);
+    if (irInterface === undefined) continue;
+    const parents: string[] = [];
+    for (const rel of content.relationships) {
+      if (rel.kind !== 'GENERALIZATION' || rel.sourceElementId !== el.id) continue;
+      const parent = interfaceByElementId.get(rel.targetElementId);
+      if (parent) parents.push(parent.name);
+    }
+    irInterface.extends = sortedUnique(parents);
+  }
+
+  // ── Fase A.3: jerarquías de generalización (D2, tareas 4.1 y 4.2) ────────
+  const classNodes = buildClassNodes(content, ctx, generatorBlockers, generatorNotes);
+  const realizationsBySource = groupBy(
+    content.relationships.filter((rel) => rel.kind === 'INTERFACE_REALIZATION'),
+    (rel) => rel.sourceElementId,
+  );
+
   // ── Fase B: entidades ─────────────────────────────────────────────────────
   const entities: IrEntity[] = [];
   const tableOwners = new Map<string, { name: string; ids: string[]; labels: string[] }>();
@@ -310,16 +612,14 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
   for (const el of content.elements) {
     if (el.kind !== 'CLASS') continue;
     const rawName = el.name ?? '';
-
-    if (el.isAbstract) {
-      generatorNotes.push(note('classifier_skipped', [ctx.ref(el.id)], `${rawName}: clase abstracta`));
+    const node = classNodes.get(el.id);
+    if (node === undefined || !node.emitted) {
+      generatorNotes.push(note('classifier_skipped', [ctx.ref(el.id)], skipDetail(el, node)));
       continue;
     }
-    const stereotype = (el.stereotype ?? '').trim().toLowerCase();
-    if (stereotype !== '' && stereotype !== 'entity') {
-      generatorNotes.push(note('classifier_skipped', [ctx.ref(el.id)], `${rawName}: estereotipo «${el.stereotype}»`));
-      continue;
-    }
+    const parentNode = node.parentElementId === null ? null : (classNodes.get(node.parentElementId) ?? null);
+    const parentMappedSuperclass = parentNode !== null && parentNode.role === 'mappedSuperclass';
+    const hasParent = parentNode !== null;
 
     const resolvedName = typeName(rawName);
     if (resolvedName.unrepresentable) {
@@ -357,10 +657,16 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       else dtoOwners.set(key, [name]);
     };
 
-    // PK declarada o inyectada (D5).
+    // PK declarada o inyectada (D5). En una jerarquía la PK vive en la clase
+    // más alta (D2): una hija no la inyecta ni la declara —si la declara,
+    // bloquea `pk_in_subclass`— y la hereda del ancestro.
     const idAttr = attributes.find((a) => a.name.toLowerCase() === 'id');
     let idInjected = false;
-    if (idAttr) {
+    if (hasParent) {
+      // La PK vive en la clase más alta de la jerarquía (D2): una hija no la
+      // inyecta ni la declara, la hereda. Si la declara, la Fase A.3 ya emitió
+      // `pk_in_subclass`; acá solo se omite el campo propio.
+    } else if (idAttr) {
       const idField = resolveIdField(idAttr, resolvedName.name, ctx, generatorBlockers, generatorNotes);
       if (idField) {
         fields.push(idField);
@@ -412,6 +718,7 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         nullable: attribute.lowerBound < 1,
         isId: false,
         generation: null,
+        inherited: false,
       });
       registerMember(member.name);
       registerColumn(column.name);
@@ -451,63 +758,12 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       registerMethod(`${field.setter}(${field.type.java})`, `accesor ${field.setter}`, false);
     }
 
-    for (const operation of operations) {
-      const operationName = operation.name;
-      const parameters = (ctx.parametersByOperation.get(operation.id) ?? []).filter((p) => p.direction !== 'RETURN');
-      const returnParameter = (ctx.parametersByOperation.get(operation.id) ?? []).find((p) => p.direction === 'RETURN');
-
-      const parameterResults: IrParameter[] = [];
-      let skippedParameter = false;
-      for (const parameter of parameters) {
-        const resolvedType = resolveType(parameter.typeElementId, parameter.typeName, ctx);
-        if (resolvedType.status !== 'ok') {
-          skippedParameter = true;
-          break;
-        }
-        parameterResults.push({
-          name: memberName(parameter.name).name || 'p',
-          type: resolvedType.type as IrTypeRef,
-        });
-      }
-      if (skippedParameter) {
-        generatorNotes.push(note('operation_skipped', [ctx.ref(el.id)], `${operationName}: parámetro de tipo no emitido`));
-        continue;
-      }
-
-      let returns = 'void';
-      let returnImports: string[] = [];
-      if (returnParameter) {
-        const resolvedReturn = resolveType(returnParameter.typeElementId, returnParameter.typeName, ctx);
-        if (resolvedReturn.status !== 'ok') {
-          generatorNotes.push(note('operation_skipped', [ctx.ref(el.id)], `${operationName}: retorno de tipo no emitido`));
-          continue;
-        }
-        const returnType = resolvedReturn.type as IrTypeRef;
-        returns = returnType.java;
-        returnImports = returnType.imports;
-      }
-
-      const member = memberName(operationName);
-      if (member.unrepresentable) {
-        generatorBlockers.push(blocker('name_unrepresentable', [ctx.ref(el.id)], operationName));
-        continue;
-      }
-      const signature = `${member.name}(${parameterResults.map((p) => p.type.java).join(',')})`;
-      const operationImports = sortedUnique([...parameterResults.flatMap((p) => p.type.imports), ...returnImports]);
-      imports.push(...operationImports);
-      registerMethod(signature, `operación ${operationName}`, true);
-      irOperations.push({
-        elementId: operation.id,
-        name: member.name,
-        signature,
-        parameters: parameterResults,
-        returns,
-        imports: operationImports,
-      });
-      if (member.escaped) {
-        generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `${operationName} → ${member.name}`));
-      }
+    const mappedOperations = mapOperations(el.id, ctx, generatorBlockers, generatorNotes);
+    for (const registered of mappedOperations.registered) {
+      registerMethod(registered.signature, `operación ${registered.label}`, true);
     }
+    irOperations.push(...mappedOperations.operations);
+    imports.push(...mappedOperations.imports);
     for (const [, owners] of methodOwners) {
       if (owners.length > 1 && owners.some((o) => o.operation)) {
         const labels = owners.filter((o) => o.operation || o.label !== 'Object').map((o) => o.label);
@@ -522,39 +778,90 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       }
     }
 
-    // Tabla, entidad JPA y ruta.
+    // Realización de interfaces (D2, tarea 4.3): `implements` más un stub por
+    // cada método que la clase no declare. Un método declarado con la misma
+    // firma y el mismo retorno ya satisface la interfaz (`@Override`); con
+    // retorno distinto, bloquea.
+    const implementsInterfaces: string[] = [];
+    for (const rel of realizationsBySource.get(el.id) ?? []) {
+      const target = interfaceByElementId.get(rel.targetElementId);
+      if (target === undefined) continue;
+      implementsInterfaces.push(target.name);
+      for (const method of target.methods) {
+        const declared = irOperations.find((op) => op.signature === method.signature);
+        if (declared !== undefined) {
+          if (declared.returns !== method.returns) {
+            generatorBlockers.push(
+              blocker(
+                'inherited_member_collision',
+                [ctx.ref(el.id)],
+                `${resolvedName.name}.${method.signature}: retorno distinto al declarado por ${target.name}`,
+              ),
+            );
+          }
+          continue;
+        }
+        const clash = methodOwners.get(collisionKey(method.signature));
+        if (clash !== undefined && clash.some((owner) => owner.label !== 'Object')) {
+          generatorBlockers.push(
+            blocker('inherited_member_collision', [ctx.ref(el.id)], `${resolvedName.name}.${method.signature}: choca con un miembro existente`),
+          );
+          continue;
+        }
+        irOperations.push(method);
+        registerMethod(method.signature, `interfaz ${target.name}`, true);
+        imports.push(...method.imports);
+      }
+    }
+
+    // Tabla, entidad JPA y ruta. Un `@MappedSuperclass` no tiene tabla propia
+    // ni ruta: sus atributos y su PK bajan a la tabla de cada hija, que pasa a
+    // ser raíz de su propia tabla (D2).
     const table = tableName(rawName);
     const hql = hqlEntityName(rawName);
     const route = routeSegment(rawName);
-    if (route.unrepresentable) {
-      generatorBlockers.push(blocker('name_unrepresentable', [ctx.ref(el.id)], rawName));
-      continue;
-    }
-    if (table.escaped) {
-      const detail = table.truncated
-        ? `tabla ${rawName} → ${table.name} (recortada a 63 bytes UTF-8)`
-        : `tabla ${rawName} → ${table.name}`;
-      generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], detail));
-    }
-    if (hql.escaped) {
-      generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `entidad JPA ${rawName} → ${hql.name}`));
-    }
-    if (route.escaped) {
-      generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `ruta ${rawName} → /${route.name}`));
-    }
-    if (route.asciiFolded) {
-      generatorNotes.push(note('route_ascii_folded', [ctx.ref(el.id)], `${rawName} → /${route.name}`));
+    if (node.role !== 'mappedSuperclass') {
+      if (route.unrepresentable) {
+        generatorBlockers.push(blocker('name_unrepresentable', [ctx.ref(el.id)], rawName));
+        continue;
+      }
+      if (table.escaped) {
+        const detail = table.truncated
+          ? `tabla ${rawName} → ${table.name} (recortada a 63 bytes UTF-8)`
+          : `tabla ${rawName} → ${table.name}`;
+        generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], detail));
+      }
+      if (hql.escaped) {
+        generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `entidad JPA ${rawName} → ${hql.name}`));
+      }
+      if (route.escaped) {
+        generatorNotes.push(note('name_escaped', [ctx.ref(el.id)], `ruta ${rawName} → /${route.name}`));
+      }
+      if (route.asciiFolded) {
+        generatorNotes.push(note('route_ascii_folded', [ctx.ref(el.id)], `${rawName} → /${route.name}`));
+      }
     }
 
     const derivedTypeNames = buildDerivedTypeNames(resolvedName.name);
-    const jpaImports = [
-      'jakarta.persistence.Column',
-      'jakarta.persistence.Entity',
-      'jakarta.persistence.GeneratedValue',
-      'jakarta.persistence.GenerationType',
-      'jakarta.persistence.Id',
-      'jakarta.persistence.Table',
-    ];
+    // La raíz `JOINED` es la clase con hijas emitidas que no cuelga de otra
+    // entidad: la que lleva `@Inheritance(strategy = JOINED)` y la PK (D2).
+    const inheritanceRoot = node.role !== 'mappedSuperclass' && node.hasEmittedChild && (!hasParent || parentMappedSuperclass);
+    const hasOwnId = fields.some((field) => field.isId);
+    const jpaImports = ['jakarta.persistence.Column'];
+    if (node.role === 'mappedSuperclass') {
+      jpaImports.push('jakarta.persistence.MappedSuperclass');
+    } else {
+      jpaImports.push('jakarta.persistence.Entity', 'jakarta.persistence.Table');
+    }
+    if (hasOwnId) {
+      jpaImports.push('jakarta.persistence.GeneratedValue', 'jakarta.persistence.GenerationType', 'jakarta.persistence.Id');
+    }
+    if (inheritanceRoot) {
+      jpaImports.push('jakarta.persistence.Inheritance', 'jakarta.persistence.InheritanceType');
+    }
+    if (hasParent && !parentMappedSuperclass) {
+      jpaImports.push('jakarta.persistence.PrimaryKeyJoinColumn');
+    }
     if (fields.some((f) => f.enumerated)) {
       jpaImports.push('jakarta.persistence.EnumType', 'jakarta.persistence.Enumerated');
     }
@@ -567,13 +874,13 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       route: route.name,
       fields,
       operations: irOperations,
-      // Campos de la IR que llena otra pasada: la herencia y las interfaces
-      // son de la Fase 4 y las asociaciones de la Fase D de acá abajo (D1).
-      superclass: null,
-      inheritanceRoot: false,
-      isAbstract: false,
-      mappedSuperclass: false,
-      implementsInterfaces: [],
+      // Herencia e interfaces, resueltas en la Fase A.3 y acá arriba (D1, D2).
+      superclass: parentNode === null ? null : parentNode.javaName,
+      inheritanceRoot,
+      isAbstract: el.isAbstract,
+      mappedSuperclass: node.role === 'mappedSuperclass',
+      parentMappedSuperclass,
+      implementsInterfaces: sortedUnique(implementsInterfaces),
       relations: [],
       dtoFields,
       derivedTypeNames,
@@ -594,9 +901,20 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     for (const derived of derivedTypeNames) keys.set(collisionKey(derived), derived);
     typeSets.push({ elementId: el.id, label: `clase ${rawName}`, keys });
 
-    registerNamespace(tableOwners, table.name, el.id, `tabla de ${resolvedName.name}`);
-    registerNamespace(routeOwners, route.name, el.id, `ruta de ${resolvedName.name}`);
+    if (node.role !== 'mappedSuperclass') {
+      registerNamespace(tableOwners, table.name, el.id, `tabla de ${resolvedName.name}`);
+      registerNamespace(routeOwners, route.name, el.id, `ruta de ${resolvedName.name}`);
+    }
   }
+
+  // ── Fase B.2: aplanado de campos heredados (D2) ───────────────────────────
+  //
+  // La PK y los atributos bajan del ancestro al descendiente: el DTO los ve
+  // (los `record` no heredan) y el mapper los escribe con el accesor heredado.
+  // `entity.ts` NO los vuelve a declarar y `flyway.ts` materializa solo los que
+  // corresponden —la PK de una hija `JOINED`, o todos los atributos si el
+  // ancestro es un `@MappedSuperclass`—.
+  flattenInheritedFields(entities, classNodes);
 
   // ── Fase C: colisiones de tipos ───────────────────────────────────────────
   // Se comparan CONJUNTOS de tipos, no nombres sueltos: `Order` y `order`
@@ -625,16 +943,19 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       );
     }
   }
-  // ── Fase D: asociaciones sin agregación (D3, D8, D9) ─────────────────────
+  // ── Fase D: asociaciones, agregación, herencia y grafo obligatorio (D3, D4, D8, D9) ──
   //
-  // La agregación (D4) llega en la Fase 3 de esta misma rebanada: hasta
-  // entonces `cascade` queda en `NONE` y la cascada del TODO no se emite. Todo
-  // lo demás —forma, dueño, `mappedBy`, nulabilidad, columnas, join tables y
-  // restricciones— ya se decide acá, así que la Fase 3 solo cambiará el valor
-  // de `cascade`/`orphanRemoval`.
+  // Acá se decide la forma (simple–múltiple, simple–simple, múltiple–múltiple), el
+  // lado dueño, el `mappedBy`, la nulabilidad, las columnas FK, las join tables y
+  // las restricciones; y —con la agregación ya resuelta— la cascada del lado TODO
+  // (D4). `GENERALIZATION` e `INTERFACE_REALIZATION` se emiten: los atendieron la
+  // Fase A.2/A.3 y el aplanado de las fases B.2 y D.2. Lo único que queda sin
+  // emitir son los extremos sobre no-entidad y `DEPENDENCY`/`USAGE`.
   const joinTables: IrJoinTable[] = [];
   const foreignKeys: IrForeignKey[] = [];
   const uniques: IrUnique[] = [];
+  // Aristas del grafo de referencias obligatorias (D9): una por FK `NOT NULL`.
+  const mandatoryEdges: MandatoryEdge[] = [];
   const endsByRelationship = groupBy(content.relationshipEnds, (end) => end.relationshipId);
 
   const shortenSql = (
@@ -702,6 +1023,18 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
   const collectionOf = (relation: IrRelationField): boolean =>
     relation.kind === 'OneToMany' || relation.kind === 'ManyToMany';
 
+  /**
+   * Cascada del lado TODO según su agregación (D4). `aggregation` marca el
+   * extremo que ES el TODO: `SHARED` → `{PERSIST, MERGE}`; `COMPOSITE` → `ALL`
+   * más `orphanRemoval` sobre el `mappedBy` del TODO; sin agregación, `NONE`.
+   */
+  const cascadeFor = (end: UmlRelationshipEndView): Pick<IrRelationField, 'cascade' | 'orphanRemoval'> =>
+    end.aggregation === 'SHARED'
+      ? { cascade: 'PERSIST_MERGE', orphanRemoval: false }
+      : end.aggregation === 'COMPOSITE'
+        ? { cascade: 'ALL', orphanRemoval: true }
+        : { cascade: 'NONE', orphanRemoval: false };
+
   /** Agrega el campo a su entidad, registra sus nombres e importaciones y suma el componente de DTO. */
   const addRelation = (side: RelationshipSide, relation: IrRelationField): void => {
     const build = side.build;
@@ -731,17 +1064,36 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       continue;
     }
 
+    if (relationship.kind === 'GENERALIZATION') {
+      const parent = classNodes.get(relationship.targetElementId);
+      if (parent === undefined || !parent.emitted || (parent.role !== 'entity' && parent.role !== 'mappedSuperclass')) {
+        generatorNotes.push(
+          note('relationship_not_emitted', elements, `${label}: el padre no se emite y la hija queda sin extends`, relRefs),
+        );
+      }
+      continue;
+    }
+
     if (relationship.kind !== 'ASSOCIATION') {
-      // GENERALIZATION e INTERFACE_REALIZATION los emite la Fase 4 de esta
-      // rebanada (D2). Hasta que esa pasada exista, declararlos acá es lo que
-      // evita una pérdida silenciosa: la nota `relationship_deferred` de core
-      // ya no existe (D1) y la spec exige que toda relación quede emitida o
-      // declarada como `relationship_not_emitted`.
-      generatorNotes.push(
-        note(
-          'relationship_not_emitted',
+      // INTERFACE_REALIZATION se emite como `implements` cuando la interfaz se
+      // emite (Fase A.2); si no, se declara acá. Nunca se pierde en silencio
+      // (D2) y `relationship_deferred` ya no existe (D1).
+      if (relationship.kind !== 'INTERFACE_REALIZATION' || !interfaceByElementId.has(relationship.targetElementId)) {
+        generatorNotes.push(
+          note('relationship_not_emitted', elements, `${label}: ${relationship.kind} no produce código`, relRefs),
+        );
+      }
+      continue;
+    }
+
+    // Un `@MappedSuperclass` no tiene tabla: no puede ser extremo de una
+    // asociación (D2, bloqueo `mapped_superclass_as_association_end`).
+    if ([relationship.sourceElementId, relationship.targetElementId].some((id) => classNodes.get(id)?.role === 'mappedSuperclass')) {
+      generatorBlockers.push(
+        blocker(
+          'mapped_superclass_as_association_end',
           elements,
-          `${label}: ${relationship.kind}, pendiente de la Fase 4 (herencia e interfaces)`,
+          `${label}: un extremo es un @MappedSuperclass y no tiene tabla`,
           relRefs,
         ),
       );
@@ -754,6 +1106,25 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     const sourceBuild = entityBuilds.get(relationship.sourceElementId);
     const targetBuild = entityBuilds.get(relationship.targetElementId);
     if (!end0 || !end1 || !sourceBuild || !targetBuild) {
+      // D9: un destino obligatorio que sea una clase abstracta sin descendiente
+      // concreto no se puede instanciar para el fixture → bloqueo, no nota.
+      for (const endpointId of [relationship.sourceElementId, relationship.targetElementId]) {
+        const node = classNodes.get(endpointId);
+        if (node === undefined || node.role !== 'entity' || !node.isAbstract || node.hasConcreteDescendant) continue;
+        // La FK es `NOT NULL` si el extremo SOBRE el destino ausente tiene
+        // `lower ≥ 1` (D3): es el destino obligatorio inalcanzable (D9).
+        const targetEnd = endpointId === relationship.sourceElementId ? end0 : end1;
+        if (targetEnd !== undefined && targetEnd.lowerBound >= 1) {
+          generatorBlockers.push(
+            blocker(
+              'unsatisfiable_mandatory_reference',
+              elements,
+              `${label}: destino abstracto sin descendiente concreto`,
+              relRefs,
+            ),
+          );
+        }
+      }
       generatorNotes.push(
         note('relationship_not_emitted', elements, `${label}: un extremo no se emite como entidad`, relRefs),
       );
@@ -768,8 +1139,18 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         ? { build: sourceBuild, end: end0, other: end1, otherBuild: targetBuild }
         : { build: targetBuild, end: end1, other: end0, otherBuild: sourceBuild };
 
+    // Agregación marcada en los DOS extremos: no hay TODO determinista (D4).
+    const aggregationConflict = end0.aggregation !== 'NONE' && end1.aggregation !== 'NONE';
+
     if (simple0 !== simple1) {
       // ── simple — múltiple: la FK vive en la tabla del extremo múltiple ────
+      // D4: con agregación en los dos extremos no hay TODO determinista.
+      if (aggregationConflict) {
+        generatorBlockers.push(
+          blocker('ambiguous_aggregation', elements, `${label}: agregación declarada en los dos extremos`, relRefs),
+        );
+        continue;
+      }
       const owner = simple0 ? sideOf(false) : sideOf(true);
       const inverse = simple0 ? sideOf(true) : sideOf(false);
       const ownerBase = fieldBase(owner);
@@ -781,17 +1162,29 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       const targetPk = pkField(owner.otherBuild);
       const column = shortenSql(`${snakeCase(ownerBase)}_id`, elements, relRefs, 'columna FK');
       const nullable = owner.other.lowerBound < 1;
+      // El TODO es el extremo marcado; su campo hacia la parte lleva la
+      // cascada. En `simple—múltiple` la FK cae siempre en el extremo múltiple,
+      // así que si el TODO es el extremo simple su campo es el INVERSO: se
+      // emite igual aunque no sea navegable (D4, `navigability_widened`).
+      const ownerIsSource = !simple0;
+      const todoEnd = end0.aggregation !== 'NONE' ? end0 : end1.aggregation !== 'NONE' ? end1 : null;
+      const todoIsOwner = todoEnd !== null && (todoEnd.endIndex === 0) === ownerIsSource;
+      const ownerCascade =
+        todoEnd !== null && todoIsOwner ? cascadeFor(todoEnd) : { cascade: 'NONE' as const, orphanRemoval: false };
+      const inverseCascade =
+        todoEnd !== null && !todoIsOwner ? cascadeFor(todoEnd) : { cascade: 'NONE' as const, orphanRemoval: false };
       const ownerRelation: IrRelationField = {
         name: ownerBase,
         target: owner.otherBuild.entity.name,
         kind: 'ManyToOne',
         owning: true,
         mappedBy: null,
-        cascade: 'NONE',
-        orphanRemoval: false,
+        cascade: ownerCascade.cascade,
+        orphanRemoval: ownerCascade.orphanRemoval,
         joinColumn: { name: column, nullable, unique: false },
         joinTable: null,
         dto: { name: `${ownerBase}Id`, inRequest: true, required: !nullable, idType: targetPk.type.java },
+        inherited: false,
       };
       addRelation(owner, ownerRelation);
       if (!owner.other.isNavigable) {
@@ -817,8 +1210,17 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         refColumns: [targetPk.column],
         onDeleteCascade: false,
       });
+      if (!nullable) {
+        mandatoryEdges.push({
+          fromElementId: owner.build.entity.elementId,
+          toElementId: owner.otherBuild.entity.elementId,
+          relationship,
+          elements,
+          relationships: relRefs,
+        });
+      }
 
-      if (owner.end.isNavigable) {
+      if (owner.end.isNavigable || inverseCascade.cascade !== 'NONE') {
         const ownerPk = pkField(owner.build);
         addRelation(inverse, {
           name: `${inverseBase}List`,
@@ -826,12 +1228,23 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
           kind: 'OneToMany',
           owning: false,
           mappedBy: ownerRelation.name,
-          cascade: 'NONE',
-          orphanRemoval: false,
+          cascade: inverseCascade.cascade,
+          orphanRemoval: inverseCascade.orphanRemoval,
           joinColumn: null,
           joinTable: null,
           dto: { name: `${inverseBase}Ids`, inRequest: false, required: false, idType: ownerPk.type.java },
+          inherited: false,
         });
+        if (!owner.end.isNavigable) {
+          generatorNotes.push(
+            note(
+              'navigability_widened',
+              [ctx.ref(inverse.build.entity.elementId)],
+              `${label}: ${inverseBase}List se emite con la cascada de la agregación aunque su extremo no sea navegable`,
+              relRefs,
+            ),
+          );
+        }
         if (owner.end.upperBound !== null && owner.end.upperBound > 1) {
           generatorNotes.push(
             note(
@@ -858,9 +1271,17 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
 
     if (simple0 && simple1) {
       // ── simple — simple: FK `UNIQUE` en el lado dependiente ───────────────
-      // Dependiente = la clase cuyo extremo OPUESTO es obligatorio (así el
-      // `NOT NULL` dice algo); empate → `source` (spec de la rebanada).
-      const ownerIsSource = !(end0.lowerBound >= 1 && end1.lowerBound < 1);
+      if (aggregationConflict) {
+        generatorBlockers.push(
+          blocker('ambiguous_aggregation', elements, `${label}: agregación declarada en los dos extremos`, relRefs),
+        );
+        continue;
+      }
+      // Dependiente = la PARTE si hay agregación; si no, la clase cuyo extremo
+      // OPUESTO es obligatorio (así el `NOT NULL` dice algo); empate → `source`.
+      const todoEnd = end0.aggregation !== 'NONE' ? end0 : end1.aggregation !== 'NONE' ? end1 : null;
+      const ownerIsSource =
+        todoEnd !== null ? todoEnd.endIndex !== 0 : !(end0.lowerBound >= 1 && end1.lowerBound < 1);
       const owner = sideOf(ownerIsSource);
       const inverse = sideOf(!ownerIsSource);
       const ownerBase = fieldBase(owner);
@@ -872,17 +1293,25 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       const targetPk = pkField(owner.otherBuild);
       const column = shortenSql(`${snakeCase(ownerBase)}_id`, elements, relRefs, 'columna FK');
       const nullable = owner.other.lowerBound < 1;
+      // Con agregación, el TODO es el lado INVERSO (`mappedBy`): su campo
+      // `@OneToOne` lleva la cascada y se emite siempre (D4).
+      const todoIsOwner = todoEnd !== null && (todoEnd.endIndex === 0) === ownerIsSource;
+      const ownerCascade =
+        todoEnd !== null && todoIsOwner ? cascadeFor(todoEnd) : { cascade: 'NONE' as const, orphanRemoval: false };
+      const inverseCascade =
+        todoEnd !== null && !todoIsOwner ? cascadeFor(todoEnd) : { cascade: 'NONE' as const, orphanRemoval: false };
       const ownerRelation: IrRelationField = {
         name: ownerBase,
         target: owner.otherBuild.entity.name,
         kind: 'OneToOne',
         owning: true,
         mappedBy: null,
-        cascade: 'NONE',
-        orphanRemoval: false,
+        cascade: ownerCascade.cascade,
+        orphanRemoval: ownerCascade.orphanRemoval,
         joinColumn: { name: column, nullable, unique: true },
         joinTable: null,
         dto: { name: `${ownerBase}Id`, inRequest: true, required: !nullable, idType: targetPk.type.java },
+        inherited: false,
       };
       addRelation(owner, ownerRelation);
       if (!owner.other.isNavigable) {
@@ -919,7 +1348,17 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         onDeleteCascade: false,
       });
 
-      if (owner.end.isNavigable) {
+      if (!nullable) {
+        mandatoryEdges.push({
+          fromElementId: owner.build.entity.elementId,
+          toElementId: owner.otherBuild.entity.elementId,
+          relationship,
+          elements,
+          relationships: relRefs,
+        });
+      }
+
+      if (owner.end.isNavigable || inverseCascade.cascade !== 'NONE') {
         const ownerPk = pkField(owner.build);
         addRelation(inverse, {
           name: `${inverseBase}`,
@@ -927,12 +1366,23 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
           kind: 'OneToOne',
           owning: false,
           mappedBy: ownerRelation.name,
-          cascade: 'NONE',
-          orphanRemoval: false,
+          cascade: inverseCascade.cascade,
+          orphanRemoval: inverseCascade.orphanRemoval,
           joinColumn: null,
           joinTable: null,
           dto: { name: `${inverseBase}Id`, inRequest: false, required: false, idType: ownerPk.type.java },
+          inherited: false,
         });
+        if (!owner.end.isNavigable) {
+          generatorNotes.push(
+            note(
+              'navigability_widened',
+              [ctx.ref(inverse.build.entity.elementId)],
+              `${label}: ${inverseBase} se emite con la cascada de la agregación aunque su extremo no sea navegable`,
+              relRefs,
+            ),
+          );
+        }
         if (inverse.other.lowerBound >= 1) {
           generatorNotes.push(
             note(
@@ -948,7 +1398,17 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     }
 
     // ── múltiple — múltiple: tabla intermedia con PK compuesta ──────────────
-    const ownerIsSource = !(end0.isNavigable && !end1.isNavigable);
+    if (aggregationConflict) {
+      generatorBlockers.push(
+        blocker('ambiguous_aggregation', elements, `${label}: agregación declarada en los dos extremos`, relRefs),
+      );
+      continue;
+    }
+    // Dueño: el TODO si hay agregación; si no, el extremo navegable; empate o
+    // ambos navegables → `source` (D3).
+    const todoEnd = end0.aggregation !== 'NONE' ? end0 : end1.aggregation !== 'NONE' ? end1 : null;
+    const ownerIsSource = todoEnd !== null ? todoEnd.endIndex === 0 : !(end0.isNavigable && !end1.isNavigable);
+    const todoIsOwner = todoEnd !== null && (todoEnd.endIndex === 0) === ownerIsSource;
     const owner = sideOf(ownerIsSource);
     const inverse = sideOf(!ownerIsSource);
     const ownerBase = fieldBase(owner);
@@ -980,17 +1440,20 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
 
     const ownerPk = pkField(owner.build);
     const targetPk = pkField(owner.otherBuild);
+    const ownerCascade =
+      todoEnd !== null && todoIsOwner ? cascadeFor(todoEnd) : { cascade: 'NONE' as const, orphanRemoval: false };
     const ownerRelation: IrRelationField = {
       name: `${ownerBase}List`,
       target: owner.otherBuild.entity.name,
       kind: 'ManyToMany',
       owning: true,
       mappedBy: null,
-      cascade: 'NONE',
-      orphanRemoval: false,
+      cascade: ownerCascade.cascade,
+      orphanRemoval: ownerCascade.orphanRemoval,
       joinColumn: null,
       joinTable: { name: joinTableName, ownerColumn, targetColumn },
       dto: { name: `${ownerBase}Ids`, inRequest: true, required: false, idType: targetPk.type.java },
+      inherited: false,
     };
     addRelation(owner, ownerRelation);
     joinTables.push(ownerRelation.joinTable as IrJoinTable);
@@ -1063,6 +1526,7 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         joinColumn: null,
         joinTable: null,
         dto: { name: `${inverseBase}Ids`, inRequest: false, required: false, idType: ownerPk.type.java },
+        inherited: false,
       });
       if (inverse.other.upperBound !== null && inverse.other.upperBound > 1) {
         generatorNotes.push(
@@ -1086,6 +1550,38 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       }
     }
   }
+
+  // ── Fase D.2: FK hija→padre de `JOINED`, aplanado y grafo obligatorio (D2, D9) ──
+  //
+  // La tabla de una hija `JOINED` lleva su PK —que es la FK a la PK del
+  // padre— como una restricción más del bloque 3 (D9). El aplanado copia los
+  // campos y relaciones del ancestro al descendiente —marcados `inherited`—
+  // para que el DTO y el mapper los vean sin que la clase vuelva a mapearlos.
+  for (const entity of entities) {
+    if (entity.mappedSuperclass || entity.superclass === null || entity.parentMappedSuperclass) continue;
+    const parent = entities.find((candidate) => candidate.name === entity.superclass);
+    if (parent === undefined) continue;
+    const id = entity.fields.find((field) => field.isId);
+    const parentId = parent.fields.find((field) => field.isId);
+    if (id === undefined || parentId === undefined) continue;
+    foreignKeys.push({
+      name: registerConstraint(
+        `fk_${entity.table}_${id.column}`,
+        [ctx.ref(entity.elementId)],
+        [],
+        `${entity.name}: FK de herencia JOINED`,
+      ),
+      table: entity.table,
+      columns: [id.column],
+      refTable: parent.table,
+      refColumns: [parentId.column],
+      onDeleteCascade: false,
+    });
+  }
+  flattenInheritedRelations(entities, classNodes);
+  rebuildDtoFields(entities);
+  detectInheritedMemberCollisions(entities, classNodes, ctx, generatorBlockers);
+  const fixturePlan = buildFixturePlan(entities, classNodes, mandatoryEdges, generatorBlockers);
 
   // ── Fase E: colisiones de nombres (D3, D8) ────────────────────────────────
   // Corre DESPUÉS de las asociaciones porque los campos de relación, las
@@ -1156,12 +1652,11 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     diagramName: content.diagram.name,
     entities,
     enums,
-    interfaces: [],
+    interfaces,
     joinTables,
     foreignKeys,
     uniques,
-    // La clausura de fixtures obligatorios es de la Fase 5 (D9).
-    fixturePlan: {},
+    fixturePlan,
     blockers: [...blocking, ...generatorBlockers],
     notes: [...warnings, ...generatorNotes],
   };
@@ -1286,6 +1781,7 @@ function injectedIdField(): IrField {
     nullable: false,
     isId: true,
     generation: 'IDENTITY',
+    inherited: false,
   };
 }
 
@@ -1335,6 +1831,7 @@ function resolveIdField(
     nullable: false,
     isId: true,
     generation: type.java === 'UUID' ? 'UUID' : 'IDENTITY',
+    inherited: false,
   };
 }
 
@@ -1353,4 +1850,328 @@ function buildDerivedTypeNames(entityName: string): string[] {
 function artifactIdFor(content: DiagramContent): string {
   const kebab = routeSegment(content.diagram.name).name;
   return kebab === '' ? FALLBACK_ARTIFACT_ID : kebab;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Herencia: aplanado y colisiones (D2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const relationIsCollection = (relation: IrRelationField): boolean =>
+  relation.kind === 'OneToMany' || relation.kind === 'ManyToMany';
+
+/** Profundidad en la jerarquía, para aplanar de la raíz hacia abajo. */
+function entityDepth(elementId: string, classNodes: Map<string, ClassNode>): number {
+  let depth = 0;
+  let cur = classNodes.get(elementId)?.parentElementId ?? null;
+  const seen = new Set<string>();
+  while (cur !== null && !seen.has(cur)) {
+    seen.add(cur);
+    depth += 1;
+    cur = classNodes.get(cur)?.parentElementId ?? null;
+  }
+  return depth;
+}
+
+/**
+ * Copia al descendiente los campos del ancestro, marcados `inherited` (D2).
+ * La PK heredada de una hija `JOINED` pierde la identidad —su columna es FK a
+ * la PK del padre—; la de un `@MappedSuperclass` la conserva, porque la tabla
+ * de la hija es su propia raíz (golden 0.5 y 0.7).
+ */
+function flattenInheritedFields(entities: IrEntity[], classNodes: Map<string, ClassNode>): void {
+  const byId = new Map(entities.map((entity) => [entity.elementId, entity]));
+  const ordered = [...entities].sort(
+    (a, b) => entityDepth(a.elementId, classNodes) - entityDepth(b.elementId, classNodes),
+  );
+  for (const entity of ordered) {
+    const parentId = classNodes.get(entity.elementId)?.parentElementId ?? null;
+    if (parentId === null) continue;
+    const parent = byId.get(parentId);
+    if (parent === undefined) continue;
+    const inherited = parent.fields.map((field) => ({
+      ...field,
+      inherited: true,
+      generation: field.isId && !parent.mappedSuperclass ? null : field.generation,
+    }));
+    entity.fields = [...inherited, ...entity.fields];
+  }
+}
+
+/** Copia al descendiente los campos de relación del ancestro, marcados `inherited` (D2). */
+function flattenInheritedRelations(entities: IrEntity[], classNodes: Map<string, ClassNode>): void {
+  const byId = new Map(entities.map((entity) => [entity.elementId, entity]));
+  const ordered = [...entities].sort(
+    (a, b) => entityDepth(a.elementId, classNodes) - entityDepth(b.elementId, classNodes),
+  );
+  for (const entity of ordered) {
+    const parentId = classNodes.get(entity.elementId)?.parentElementId ?? null;
+    if (parentId === null) continue;
+    const parent = byId.get(parentId);
+    if (parent === undefined) continue;
+    entity.relations = [...parent.relations.map((relation) => ({ ...relation, inherited: true })), ...entity.relations];
+  }
+}
+
+/**
+ * Rearma `dtoFields` con TODOS los campos y relaciones, ancestros primero
+ * (D1): un `record` no hereda componentes, así que el DTO del descendiente
+ * tiene que listarlos. El orden es el mismo que recorre `emitMapper`, para que
+ * los argumentos del constructor coincidan con las componentes del `record`.
+ */
+function rebuildDtoFields(entities: IrEntity[]): void {
+  for (const entity of entities) {
+    entity.dtoFields = [
+      ...entity.fields.map((field) => ({
+        name: field.name,
+        type: field.type.java,
+        imports: field.type.imports,
+        inRequest: !field.isId,
+      })),
+      ...entity.relations.map((relation) => {
+        const collection = relationIsCollection(relation);
+        return {
+          name: relation.dto.name,
+          type: collection ? `List<${relation.dto.idType}>` : relation.dto.idType,
+          imports: [
+            ...(collection ? ['java.util.List'] : []),
+            ...(relation.dto.idType === 'UUID' ? ['java.util.UUID'] : []),
+          ],
+          inRequest: relation.dto.inRequest,
+        };
+      }),
+    ];
+  }
+}
+
+/**
+ * `inherited_member_collision` (D2): un miembro propio que choca —en
+ * minúsculas— con uno de un ancestro. Una operación con la misma firma y el
+ * mismo retorno es `@Override`, no colisión; con retorno distinto, bloquea.
+ */
+function detectInheritedMemberCollisions(
+  entities: IrEntity[],
+  classNodes: Map<string, ClassNode>,
+  ctx: BuildContext,
+  blockers: CodegenFinding[],
+): void {
+  const byId = new Map(entities.map((entity) => [entity.elementId, entity]));
+  for (const entity of entities) {
+    let cur = classNodes.get(entity.elementId)?.parentElementId ?? null;
+    if (cur === null) continue;
+    const memberKeys = new Set<string>();
+    const operationReturns = new Map<string, string>();
+    const seen = new Set<string>();
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      const ancestor = byId.get(cur);
+      if (ancestor !== undefined) {
+        for (const field of ancestor.fields) if (!field.inherited) memberKeys.add(collisionKey(field.name));
+        for (const relation of ancestor.relations) if (!relation.inherited) memberKeys.add(collisionKey(relation.name));
+        for (const operation of ancestor.operations) operationReturns.set(operation.signature, operation.returns);
+      }
+      cur = classNodes.get(cur)?.parentElementId ?? null;
+    }
+    for (const field of entity.fields) {
+      if (!field.inherited && memberKeys.has(collisionKey(field.name))) {
+        blockers.push(
+          blocker('inherited_member_collision', [ctx.ref(entity.elementId)], `${entity.name}.${field.name}: choca con un miembro heredado`),
+        );
+      }
+    }
+    for (const relation of entity.relations) {
+      if (!relation.inherited && memberKeys.has(collisionKey(relation.name))) {
+        blockers.push(
+          blocker('inherited_member_collision', [ctx.ref(entity.elementId)], `${entity.name}.${relation.name}: choca con un miembro heredado`),
+        );
+      }
+    }
+    for (const operation of entity.operations) {
+      const ancestorReturn = operationReturns.get(operation.signature);
+      if (ancestorReturn !== undefined && ancestorReturn !== operation.returns) {
+        blockers.push(
+          blocker(
+            'inherited_member_collision',
+            [ctx.ref(entity.elementId)],
+            `${entity.name}.${operation.signature}: retorno distinto al del ancestro`,
+          ),
+        );
+      }
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grafo de referencias obligatorias (D9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Nodo por jerarquía colapsada a su raíz y arista por FK `NOT NULL` (D9).
+ * Detecta el ciclo —incluido el lazo propio— y el destino abstracto sin
+ * descendiente concreto; sin ninguno de los dos, arma `fixturePlan` como la
+ * clausura topológica por entidad concreta, con los empates resueltos por `<`.
+ */
+function buildFixturePlan(
+  entities: IrEntity[],
+  classNodes: Map<string, ClassNode>,
+  mandatoryEdges: MandatoryEdge[],
+  blockers: CodegenFinding[],
+): Record<string, string[]> {
+  const byId = new Map(entities.map((entity) => [entity.elementId, entity]));
+  const concrete = entities.filter((entity) => !entity.isAbstract && !entity.mappedSuperclass);
+  const concreteByName = new Map(concrete.map((entity) => [entity.name, entity]));
+
+  const rootOf = (elementId: string): string => {
+    let cur = elementId;
+    for (;;) {
+      const parentId = classNodes.get(cur)?.parentElementId ?? null;
+      if (parentId === null) return cur;
+      const parent = byId.get(parentId);
+      if (parent === undefined || parent.mappedSuperclass) return cur;
+      cur = parentId;
+    }
+  };
+  const nameOfRoot = (root: string): string => byId.get(root)?.name ?? root;
+  const byName = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+  const adjacency = new Map<string, { node: string; edge: MandatoryEdge }[]>();
+  for (const edge of mandatoryEdges) {
+    const from = rootOf(edge.fromElementId);
+    const to = rootOf(edge.toElementId);
+    const bucket = adjacency.get(from);
+    if (bucket) bucket.push({ node: to, edge });
+    else adjacency.set(from, [{ node: to, edge }]);
+  }
+  const neighbors = (id: string): { node: string; edge: MandatoryEdge }[] =>
+    [...(adjacency.get(id) ?? [])].sort((a, b) => byName(nameOfRoot(a.node), nameOfRoot(b.node)));
+
+  // DFS de tres colores: cada arista hacia un nodo gris define un ciclo.
+  const color = new Map<string, 0 | 1 | 2>();
+  const nodeStack: string[] = [];
+  const edgeStack: MandatoryEdge[] = [];
+  const cycles: MandatoryEdge[][] = [];
+  const roots = [...new Set(entities.map((entity) => rootOf(entity.elementId)))].sort((a, b) =>
+    byName(nameOfRoot(a), nameOfRoot(b)),
+  );
+  for (const root of roots) {
+    if ((color.get(root) ?? 0) !== 0) continue;
+    color.set(root, 1);
+    nodeStack.length = 0;
+    edgeStack.length = 0;
+    nodeStack.push(root);
+    const stack: { id: string; next: number }[] = [{ id: root, next: 0 }];
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1] as { id: string; next: number };
+      const list = neighbors(top.id);
+      if (top.next >= list.length) {
+        color.set(top.id, 2);
+        stack.pop();
+        nodeStack.pop();
+        if (edgeStack.length > 0 && edgeStack.length >= nodeStack.length) edgeStack.pop();
+        continue;
+      }
+      const nb = list[top.next] as { node: string; edge: MandatoryEdge };
+      top.next += 1;
+      const state = color.get(nb.node) ?? 0;
+      if (state === 1) {
+        const startIndex = nodeStack.indexOf(nb.node);
+        cycles.push(startIndex >= 0 ? [...edgeStack.slice(startIndex), nb.edge] : [nb.edge]);
+      } else if (state === 0) {
+        color.set(nb.node, 1);
+        edgeStack.push(nb.edge);
+        nodeStack.push(nb.node);
+        stack.push({ id: nb.node, next: 0 });
+      }
+    }
+  }
+
+  const seenCycles = new Set<string>();
+  for (const cycle of cycles) {
+    const key = cycle.map((edge) => edge.relationship.id).sort().join('|');
+    if (seenCycles.has(key)) continue;
+    seenCycles.add(key);
+    const elements = [...new Map(cycle.flatMap((edge) => edge.elements).map((ref) => [ref.id, ref])).values()];
+    const relationships = [
+      ...new Map(cycle.flatMap((edge) => edge.relationships).map((ref) => [ref.id, ref])).values(),
+    ];
+    blockers.push(
+      blocker(
+        'mandatory_reference_cycle',
+        elements,
+        `${relationships.map((ref) => ref.label).join(' → ')}: ciclo de referencias obligatorias`,
+        relationships,
+      ),
+    );
+  }
+
+  const concreteDescendantsOf = (elementId: string): IrEntity[] => {
+    const out: IrEntity[] = [];
+    const walk = (id: string, seen: Set<string>): void => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      const entity = byId.get(id);
+      if (entity !== undefined && !entity.isAbstract && !entity.mappedSuperclass) out.push(entity);
+      for (const child of classNodes.get(id)?.childrenElementIds ?? []) walk(child, seen);
+    };
+    walk(elementId, new Set());
+    return out;
+  };
+  /** Destino concreto de una referencia: la clase misma, o su primer descendiente concreto con `<` (D9). */
+  const resolveConcrete = (elementId: string): string | null => {
+    const target = byId.get(elementId);
+    if (target !== undefined && !target.isAbstract && !target.mappedSuperclass) return target.name;
+    const descendants = concreteDescendantsOf(elementId).sort((a, b) => byName(a.name, b.name));
+    return descendants[0]?.name ?? null;
+  };
+
+  let unsatisfiable = false;
+  for (const edge of mandatoryEdges) {
+    const target = byId.get(edge.toElementId);
+    if (target !== undefined && target.isAbstract && !target.mappedSuperclass && resolveConcrete(edge.toElementId) === null) {
+      unsatisfiable = true;
+      blockers.push(
+        blocker(
+          'unsatisfiable_mandatory_reference',
+          edge.elements,
+          `${edge.relationships[0]?.label ?? ''}: destino abstracto sin descendiente concreto`,
+          edge.relationships,
+        ),
+      );
+    }
+  }
+  if (cycles.length > 0 || unsatisfiable) return {};
+
+  const directDeps = (elementId: string): string[] => {
+    const names = new Set<string>();
+    const seen = new Set<string>();
+    let cur: string | null = elementId;
+    while (cur !== null && !seen.has(cur)) {
+      seen.add(cur);
+      for (const edge of mandatoryEdges) {
+        if (edge.fromElementId !== cur) continue;
+        const resolved = resolveConcrete(edge.toElementId);
+        if (resolved !== null && resolved !== (byId.get(elementId)?.name ?? elementId)) names.add(resolved);
+      }
+      cur = classNodes.get(cur)?.parentElementId ?? null;
+    }
+    return [...names].sort(byName);
+  };
+
+  const plan: Record<string, string[]> = {};
+  for (const entity of concrete) {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const depsOf = (name: string): string[] => {
+      const target = concreteByName.get(name);
+      return target === undefined ? [] : directDeps(target.elementId);
+    };
+    const visit = (name: string): void => {
+      if (seen.has(name)) return;
+      seen.add(name);
+      for (const dep of depsOf(name)) visit(dep);
+      out.push(name);
+    };
+    for (const dep of directDeps(entity.elementId)) visit(dep);
+    plan[entity.name] = out;
+  }
+  return plan;
 }

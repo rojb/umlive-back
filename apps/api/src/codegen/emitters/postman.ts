@@ -27,7 +27,7 @@
  * se insertan siempre en el mismo orden. Sin reloj, sin azar, sin locale.
  */
 
-import type { CodegenIr, IrEntity } from '../codegen-ir';
+import type { CodegenIr, IrEntity, IrRelationField } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
 
 /** Puerto HTTP del proyecto emitido; tiene que coincidir con `application.yml` (D8). */
@@ -61,12 +61,43 @@ function statusAssertion(expected: number): string[] {
   ];
 }
 
-/** Cuerpo de ejemplo del `POST`/`PUT`: los campos de la petición, sin la PK (D11). */
-function exampleBody(entity: IrEntity): Record<string, string | number | boolean> {
-  const body: Record<string, string | number | boolean> = {};
+/** Cuerpo de una petición JSON: los valores salen de la tabla de tipos (FR-F04). */
+type PostmanBody = Record<string, string | number | boolean | null>;
+
+/** `true` si el campo de relación es una colección (`cursoIds`). */
+function relationIsCollection(relation: IrRelationField): boolean {
+  return relation.kind === 'OneToMany' || relation.kind === 'ManyToMany';
+}
+
+/** Un fixture obligatorio ya creado en la carpeta y su variable de colección (D9). */
+interface FixtureState {
+  /** Entidades de fixture, en orden de creación. */
+  created: string[];
+  /** Variable de colección por entidad creada. */
+  variableByName: Map<string, string>;
+}
+
+/** Variable de colección del fixture `<Entidad>` dentro de la carpeta `<Carpeta>` (D9). */
+function fixtureVariable(folder: string, entity: string): string {
+  return `fx_${folder}_${entity}Id`;
+}
+
+/**
+ * Cuerpo de ejemplo del `POST`/`PUT` (D9): los campos de la petición, sin la PK,
+ * más cada referencia dueña. Una referencia obligatoria viaja con el id del
+ * fixture creado antes en la misma carpeta; las opcionales —y las colecciones—
+ * viajan `null`.
+ */
+function requestBody(entity: IrEntity, resolveReference: (relation: IrRelationField) => string | null): PostmanBody {
+  const body: PostmanBody = {};
   for (const field of entity.fields) {
     if (field.isId) continue;
     body[field.name] = field.type.example;
+  }
+  for (const relation of entity.relations) {
+    if (!relation.dto.inRequest) continue;
+    body[relation.dto.name] =
+      relation.dto.required && !relationIsCollection(relation) ? resolveReference(relation) : null;
   }
   return body;
 }
@@ -104,7 +135,7 @@ function jsonRequest(
   method: string,
   url: PostmanUrl,
   exec: string[],
-  body: Record<string, string | number | boolean> | null,
+  body: PostmanBody | null,
   description: string,
 ): PostmanRequest {
   const request: PostmanRequest['request'] = { method, url, description };
@@ -121,60 +152,135 @@ function jsonRequest(
 }
 
 /**
- * Las cinco operaciones encadenadas de una entidad (FR-F07). El `POST` guarda
- * la PK en la variable de colección que los otros tres requests referencian;
- * `DELETE` es el último, así la secuencia deja el estado limpio.
+ * Resuelve la variable del fixture que satisface una referencia obligatoria.
+ * Si el destino es una clase abstracta, el fixture creado es su primer
+ * descendiente concreto con `<` (D9), así que se acepta tanto el nombre exacto
+ * como cualquier ancestro del fixture ya creado.
  */
-function entityFolder(entity: IrEntity): { name: string; item: PostmanRequest[] } {
+function referenceResolver(
+  entityByName: Map<string, IrEntity>,
+  fixtures: FixtureState,
+): (relation: IrRelationField) => string | null {
+  const ancestorNames = (name: string): Set<string> => {
+    const names = new Set<string>();
+    let current: string | null = name;
+    while (current !== null) {
+      names.add(current);
+      current = entityByName.get(current)?.superclass ?? null;
+    }
+    return names;
+  };
+  return (relation) => {
+    for (const created of fixtures.created) {
+      if (created !== relation.target && !ancestorNames(created).has(relation.target)) continue;
+      const variable = fixtures.variableByName.get(created);
+      if (variable !== undefined) return `{{${variable}}}`;
+    }
+    return null;
+  };
+}
+
+/**
+ * Una carpeta Postman (D9): primero los fixtures de la clausura obligatoria
+ * —`POST` de cada uno, asserta `201` y guarda `fx_<Carpeta>_<Entidad>Id`—,
+ * después las cinco operaciones CRUD con las referencias en el cuerpo, y al
+ * final el `DELETE` de los fixtures en orden inverso, que asserta `204`.
+ */
+function entityFolder(
+  ir: CodegenIr,
+  entity: IrEntity,
+  entityByName: Map<string, IrEntity>,
+): { name: string; item: PostmanRequest[] } {
   const idVar = `{{${createdIdVariable(entity)}}}`;
+  const fixtures: FixtureState = { created: [], variableByName: new Map() };
+  const items: PostmanRequest[] = [];
+
+  for (const fixtureName of ir.fixturePlan[entity.name] ?? []) {
+    const fixture = entityByName.get(fixtureName);
+    if (fixture === undefined) continue;
+    const variable = fixtureVariable(entity.name, fixtureName);
+    items.push(
+      jsonRequest(
+        `Crear fixture ${fixture.name} de ${entity.name}`,
+        'POST',
+        urlFor(fixture, null),
+        [
+          ...statusAssertion(201),
+          `pm.collectionVariables.set("${variable}", pm.response.json().id);`,
+        ],
+        requestBody(fixture, referenceResolver(entityByName, fixtures)),
+        `Crea el ${fixture.name} que la carpeta ${entity.name} necesita como referencia obligatoria.`,
+      ),
+    );
+    fixtures.created.push(fixtureName);
+    fixtures.variableByName.set(fixtureName, variable);
+  }
+
   const createExec = [
     ...statusAssertion(201),
     // El id lo devuelve el servidor: el cliente nunca lo inventa. Se guarda
     // como variable de colección para los tres requests siguientes.
     `pm.collectionVariables.set("${createdIdVariable(entity)}", pm.response.json().id);`,
   ];
-  return {
-    name: entity.name,
-    item: [
+  const subjectBody = requestBody(entity, referenceResolver(entityByName, fixtures));
+  items.push(
+    jsonRequest(
+      `Crear ${entity.name}`,
+      'POST',
+      urlFor(entity, null),
+      createExec,
+      subjectBody,
+      `Crea un ${entity.name} y guarda su id en ${createdIdVariable(entity)}.`,
+    ),
+    jsonRequest(`Listar ${entity.name}`, 'GET', urlFor(entity, null), statusAssertion(200), null, `Lista todos los ${entity.name}.`),
+    jsonRequest(
+      `Obtener ${entity.name}`,
+      'GET',
+      urlFor(entity, idVar),
+      statusAssertion(200),
+      null,
+      `Obtiene el ${entity.name} creado por el request anterior.`,
+    ),
+    jsonRequest(
+      `Actualizar ${entity.name}`,
+      'PUT',
+      urlFor(entity, idVar),
+      statusAssertion(200),
+      subjectBody,
+      `Actualiza el ${entity.name} creado por el primer request de la carpeta.`,
+    ),
+    jsonRequest(
+      `Eliminar ${entity.name}`,
+      'DELETE',
+      urlFor(entity, idVar),
+      statusAssertion(204),
+      null,
+      `Elimina el ${entity.name} creado por el primer request de la carpeta.`,
+    ),
+  );
+
+  for (const fixtureName of [...fixtures.created].reverse()) {
+    const fixture = entityByName.get(fixtureName);
+    const variable = fixtures.variableByName.get(fixtureName);
+    if (fixture === undefined || variable === undefined) continue;
+    items.push(
       jsonRequest(
-        `Crear ${entity.name}`,
-        'POST',
-        urlFor(entity, null),
-        createExec,
-        exampleBody(entity),
-        `Crea un ${entity.name} y guarda su id en ${createdIdVariable(entity)}.`,
-      ),
-      jsonRequest(`Listar ${entity.name}`, 'GET', urlFor(entity, null), statusAssertion(200), null, `Lista todos los ${entity.name}.`),
-      jsonRequest(
-        `Obtener ${entity.name}`,
-        'GET',
-        urlFor(entity, idVar),
-        statusAssertion(200),
-        null,
-        `Obtiene el ${entity.name} creado por el request anterior.`,
-      ),
-      jsonRequest(
-        `Actualizar ${entity.name}`,
-        'PUT',
-        urlFor(entity, idVar),
-        statusAssertion(200),
-        exampleBody(entity),
-        `Actualiza el ${entity.name} creado por el primer request de la carpeta.`,
-      ),
-      jsonRequest(
-        `Eliminar ${entity.name}`,
+        `Eliminar fixture ${fixture.name} de ${entity.name}`,
         'DELETE',
-        urlFor(entity, idVar),
+        urlFor(fixture, `{{${variable}}}`),
         statusAssertion(204),
         null,
-        `Elimina el ${entity.name} creado por el primer request de la carpeta.`,
+        `Borra el fixture ${fixture.name} en orden inverso al de creación.`,
       ),
-    ],
-  };
+    );
+  }
+
+  return { name: entity.name, item: items };
 }
 
-/** La colección v2.1 completa (D11). */
+/** La colección v2.1 completa (D11, D9). */
 function buildCollection(ir: CodegenIr): Record<string, unknown> {
+  const entityByName = new Map(ir.entities.map((entity) => [entity.name, entity]));
   return {
     info: {
       _postman_id: ir.diagramId,
@@ -182,7 +288,11 @@ function buildCollection(ir: CodegenIr): Record<string, unknown> {
       description: `CRUD generado por UMLive para el diagrama del proyecto ${ir.artifactId}. Se corre con npx newman contra el proyecto levantado.`,
       schema: 'https://schema.getpostman.com/json/collection/v2.1.0/collection.json',
     },
-    item: ir.entities.map(entityFolder),
+    // Las clases abstractas y los `@MappedSuperclass` no tienen controller: no
+    // hay carpeta Postman para ellas (D2).
+    item: ir.entities
+      .filter((entity) => !entity.isAbstract && !entity.mappedSuperclass)
+      .map((entity) => entityFolder(ir, entity, entityByName)),
     variable: [{ key: 'baseUrl', value: BASE_URL, type: 'string' }],
   };
 }

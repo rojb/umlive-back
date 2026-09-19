@@ -91,9 +91,15 @@ function createTable(
   entityByName: Map<string, IrEntity>,
   uniques: readonly IrUnique[],
 ): string {
-  const lines = entity.fields.map(columnDefinition);
+  // D2: de los campos heredados, una hija `JOINED` solo materializa la PK —sus
+  // atributos viven en la tabla del ancestro—; una hija de `@MappedSuperclass`
+  // los materializa todos, porque su tabla es su propia raíz.
+  const fields = entity.fields.filter(
+    (field) => !field.inherited || field.isId || entity.parentMappedSuperclass,
+  );
+  const lines = fields.map(columnDefinition);
   for (const relation of entity.relations) {
-    if (relation.joinColumn === null) continue;
+    if (relation.inherited || relation.joinColumn === null) continue;
     const target = entityByName.get(relation.target);
     if (target === undefined) {
       throw new Error(`la IR de ${entity.name} referencia a ${relation.target} y esa entidad no está en la IR`);
@@ -159,7 +165,7 @@ export function emitFlywayMigration(ir: CodegenIr): string {
   ];
   const entityByName = new Map(ir.entities.map((entity) => [entity.name, entity]));
   const entityByTable = new Map(ir.entities.map((entity) => [entity.table, entity]));
-  const tables = ir.entities.map((entity) => createTable(entity, entityByName, ir.uniques));
+  const tables = ir.entities.filter((entity) => !entity.mappedSuperclass).map((entity) => createTable(entity, entityByName, ir.uniques));
   const joinTables = ir.joinTables.map((table) => createJoinTable(table, entityByTable, ir.foreignKeys));
   const keys = ir.foreignKeys.map(addForeignKey);
   return `${[...header, ...tables, ...joinTables, ...keys].join('\n\n')}\n`;

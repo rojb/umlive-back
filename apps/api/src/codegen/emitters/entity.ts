@@ -156,25 +156,34 @@ function renderField(field: IrField): string {
 }
 
 /**
- * Campo de relación (tarea 2.3, D3). El emisor NO decide acá nada del modelo:
- * `kind`, `owning`, `mappedBy`, nulabilidad y los nombres de las columnas ya
- * vienen resueltos en la IR. Lo único que hace es traducirlos a anotaciones.
+ * Campo de relación (tarea 2.3, D3; tarea 3.1, D4). El emisor NO decide acá
+ * nada del modelo: `kind`, `owning`, `mappedBy`, nulabilidad, cascada y los
+ * nombres de las columnas ya vienen resueltos en la IR. Lo único que hace es
+ * traducirlos a anotaciones.
+ *
+ * La cascada y `orphanRemoval` son del lado TODO (D4): `SHARED` →
+ * `{PERSIST, MERGE}`; `COMPOSITE` → `ALL` más `orphanRemoval`, siempre sobre el
+ * `mappedBy` de la colección del TODO.
  */
 function renderRelationField(relation: IrRelationField): string {
   const lines: string[] = [];
-  const optional = relation.joinColumn !== null && !relation.joinColumn.nullable ? ', optional = false' : '';
+  const attributes: string[] = [];
+  const optional = relation.joinColumn !== null && !relation.joinColumn.nullable ? 'optional = false' : null;
+  if (relation.cascade === 'PERSIST_MERGE') attributes.push('cascade = {CascadeType.PERSIST, CascadeType.MERGE}');
+  else if (relation.cascade === 'ALL') attributes.push('cascade = CascadeType.ALL');
+  if (relation.orphanRemoval) attributes.push('orphanRemoval = true');
+
   if (relation.kind === 'ManyToOne') {
-    lines.push(`@ManyToOne(fetch = FetchType.LAZY${optional})`);
+    lines.push(`@ManyToOne(fetch = FetchType.LAZY${optional === null ? '' : `, ${optional}`}${attributes.length === 0 ? '' : `, ${attributes.join(', ')}`})`);
   } else if (relation.kind === 'OneToOne') {
-    lines.push(
-      relation.owning
-        ? `@OneToOne(fetch = FetchType.LAZY${optional})`
-        : `@OneToOne(fetch = FetchType.LAZY, mappedBy = "${relation.mappedBy}")`,
-    );
+    const head = relation.owning ? `fetch = FetchType.LAZY${optional === null ? '' : `, ${optional}`}` : `fetch = FetchType.LAZY, mappedBy = "${relation.mappedBy}"`;
+    lines.push(`@OneToOne(${head}${attributes.length === 0 ? '' : `, ${attributes.join(', ')}`})`);
   } else if (relation.kind === 'OneToMany') {
-    lines.push(`@OneToMany(mappedBy = "${relation.mappedBy}")`);
+    lines.push(`@OneToMany(mappedBy = "${relation.mappedBy}"${attributes.length === 0 ? '' : `, ${attributes.join(', ')}`})`);
   } else {
-    lines.push(relation.owning ? '@ManyToMany' : `@ManyToMany(mappedBy = "${relation.mappedBy}")`);
+    const head = relation.owning ? '' : `mappedBy = "${relation.mappedBy}"`;
+    const all = [head, ...attributes].filter((part) => part !== '');
+    lines.push(all.length === 0 ? '@ManyToMany' : `@ManyToMany(${all.join(', ')})`);
   }
   if (relation.joinColumn !== null) {
     const unique = relation.joinColumn.unique ? ', unique = true' : '';
@@ -221,23 +230,51 @@ function renderAccessors(field: IrField): string {
   ].join('\n');
 }
 
-/** Entidad JPA: campos con `@Column` explícito, campos de relación, accesores y los stubs de las operaciones UML. */
+/** Declaración `extends`, o cadena vacía si la clase es raíz (D2). */
+function extendsClause(entity: IrEntity): string {
+  return entity.superclass === null ? '' : ` extends ${entity.superclass}`;
+}
+
+/** Declaración `implements`, o cadena vacía si no realiza interfaces (D2). */
+function implementsClause(entity: IrEntity): string {
+  return entity.implementsInterfaces.length === 0 ? '' : ` implements ${entity.implementsInterfaces.join(', ')}`;
+}
+
+/**
+ * Entidad JPA: campos con `@Column` explícito, campos de relación, accesores y
+ * los stubs de las operaciones UML.
+ *
+ * D2: un `@MappedSuperclass` no lleva `@Entity` ni `@Table`; la raíz `JOINED`
+ * lleva `@Inheritance(strategy = InheritanceType.JOINED)`; una hija de entidad,
+ * `extends` más `@PrimaryKeyJoinColumn(name = "id")`. Los campos y relaciones
+ * heredados NO se vuelven a declarar: el descendiente los hereda (por eso el
+ * emisor los salta y solo el DTO los lista).
+ */
 export function emitEntity(entity: IrEntity): string {
   const blocks: string[] = [];
-  for (const field of entity.fields) blocks.push(renderField(field));
-  for (const relation of entity.relations) blocks.push(renderRelationField(relation));
-  for (const field of entity.fields) blocks.push(renderAccessors(field));
-  for (const relation of entity.relations) blocks.push(renderRelationAccessors(relation));
+  for (const field of entity.fields) {
+    if (!field.inherited) blocks.push(renderField(field));
+  }
+  for (const relation of entity.relations) {
+    if (!relation.inherited) blocks.push(renderRelationField(relation));
+  }
+  for (const field of entity.fields) {
+    if (!field.inherited) blocks.push(renderAccessors(field));
+  }
+  for (const relation of entity.relations) {
+    if (!relation.inherited) blocks.push(renderRelationAccessors(relation));
+  }
   for (const operation of entity.operations) blocks.push(emitOperationStub(operation));
 
-  const body = [
-    entityAnnotation(entity),
-    `@Table(name = "${entity.table}")`,
-    `public class ${entity.name} {`,
-    '',
-    blocks.join('\n\n'),
-    '}',
-  ].join('\n');
+  const annotations: string[] = [entity.mappedSuperclass ? '@MappedSuperclass' : entityAnnotation(entity)];
+  if (!entity.mappedSuperclass) annotations.push(`@Table(name = "${entity.table}")`);
+  if (entity.inheritanceRoot) annotations.push('@Inheritance(strategy = InheritanceType.JOINED)');
+  if (entity.superclass !== null && !entity.parentMappedSuperclass) {
+    annotations.push('@PrimaryKeyJoinColumn(name = "id")');
+  }
+  const declaration = `public ${entity.isAbstract ? 'abstract ' : ''}class ${entity.name}${extendsClause(entity)}${implementsClause(entity)} {`;
+
+  const body = [...annotations, declaration, '', blocks.join('\n\n'), '}'].join('\n');
 
   return renderFile(ENTITY_PACKAGE, entity.imports, body);
 }
@@ -680,16 +717,29 @@ export function emitMapper(entity: IrEntity): string {
 // Los ocho archivos, con su ruta en el ZIP
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Los ocho archivos de una entidad, ya ordenados por ruta para el ZIP (D11). */
+/** Los archivos de cada entidad, ya ordenados por ruta para el ZIP (D11).
+ *
+ * D2: un `@MappedSuperclass` solo emite su clase; una clase abstracta con hijas
+ * emite clase y repositorio —lo usan las referencias—, sin controller, servicio,
+ * DTO ni carpeta Postman. La entidad concreta emite las ocho piezas.
+ */
 export function emitEntityFiles(entity: IrEntity): GeneratedFile[] {
-  return [
+  const files: GeneratedFile[] = [
     { path: `${JAVA_SOURCE_ROOT}/entity/${entity.name}.java`, content: emitEntity(entity) },
-    { path: `${JAVA_SOURCE_ROOT}/repository/${derivedName(entity, 'Repository')}.java`, content: emitRepository(entity) },
+  ];
+  if (entity.mappedSuperclass) return files;
+  files.push({
+    path: `${JAVA_SOURCE_ROOT}/repository/${derivedName(entity, 'Repository')}.java`,
+    content: emitRepository(entity),
+  });
+  if (entity.isAbstract) return files;
+  files.push(
     { path: `${JAVA_SOURCE_ROOT}/service/${derivedName(entity, 'Service')}.java`, content: emitServiceInterface(entity) },
     { path: `${JAVA_SOURCE_ROOT}/service/${derivedName(entity, 'ServiceImpl')}.java`, content: emitServiceImpl(entity) },
     { path: `${JAVA_SOURCE_ROOT}/controller/${derivedName(entity, 'Controller')}.java`, content: emitController(entity) },
     { path: `${JAVA_SOURCE_ROOT}/dto/${derivedName(entity, 'Request')}.java`, content: emitRequestDto(entity) },
     { path: `${JAVA_SOURCE_ROOT}/dto/${derivedName(entity, 'Response')}.java`, content: emitResponseDto(entity) },
     { path: `${JAVA_SOURCE_ROOT}/mapper/${derivedName(entity, 'Mapper')}.java`, content: emitMapper(entity) },
-  ];
+  );
+  return files;
 }

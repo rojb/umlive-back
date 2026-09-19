@@ -50,6 +50,14 @@ export interface IrField {
   isId: boolean;
   /** Estrategia de generación de la PK; `null` si el campo no es la PK. */
   generation: 'IDENTITY' | 'UUID' | null;
+  /**
+   * `true` si el campo lo hereda de un ancestro emitido (D2): la clase NO lo
+   * redeclara ni lo mapea (`entity.ts` lo salta) y su tabla solo lo materializa
+   * cuando corresponde (la PK de una hija `JOINED`, o todos los atributos si el
+   * ancestro es un `@MappedSuperclass`). El DTO y el mapper sí lo ven, porque el
+   * descendiente hereda el accesor.
+   */
+  inherited: boolean;
 }
 
 /** Parámetro ya mapeado de una operación. Los `RETURN` no llegan acá (son el retorno). */
@@ -108,6 +116,12 @@ export interface IrEntity {
   isAbstract: boolean;
   /** `true` si el estereotipo la convirtió en `@MappedSuperclass`: sin `@Entity` y sin tabla propia (D2). */
   mappedSuperclass: boolean;
+  /**
+   * `true` si la superclase emitida es un `@MappedSuperclass` (D2): sus
+   * atributos y su PK bajan a la tabla de esta clase —«que pasa a ser raíz»—,
+   * y la clase NO lleva `@PrimaryKeyJoinColumn` porque no hay tabla padre.
+   */
+  parentMappedSuperclass: boolean;
   /** Interfaces Java que la clase declara con `implements`, ordenadas con `<` (D2). */
   implementsInterfaces: string[];
   /**
@@ -161,6 +175,11 @@ export interface IrRelationField {
   joinTable: IrJoinTable | null;
   /** Componente correspondiente en los `record` DTO (D5): `cursoIds`, no `cursoList`. */
   dto: { name: string; inRequest: boolean; required: boolean; idType: string };
+  /**
+   * `true` si el campo lo hereda de un ancestro emitido (D2): el descendiente
+   * lo lee y lo escribe por el accesor heredado, pero no vuelve a mapear la FK.
+   */
+  inherited: boolean;
 }
 
 /** Tabla intermedia de una asociación `* — *` (D3, D8, D9). */

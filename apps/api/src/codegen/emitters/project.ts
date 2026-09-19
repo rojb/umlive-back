@@ -38,6 +38,7 @@ import type { GeneratedFile } from '../zip';
 import { JAVA_SOURCE_ROOT, emitEntityFiles } from './entity';
 import { emitErrorAdviceFile } from './error-advice';
 import { emitFlywayFile } from './flyway';
+import { emitInterfaceFile } from './interface';
 import { emitEnumFile } from './layers';
 import { emitPostmanFiles } from './postman';
 import { emitWrapperFiles } from './wrapper';
@@ -276,10 +277,22 @@ ${endpointRows(ir.entities)}
 - Las referencias se exponen por id (\`clienteId\`, \`cursoIds\`): ningún DTO contiene
   una entidad, así que no hay ciclos en el JSON ni \`@JsonIgnore\`. Un id que no
   existe responde \`400\`, y borrar un registro referenciado, \`409\`.
+- La herencia se emite con \`@Inheritance(strategy = JOINED)\`: la PK vive en la
+  clase más alta y cada hija la comparte por FK (\`@PrimaryKeyJoinColumn\`). Una
+  clase abstracta con hijas genera entidad y repositorio, sin controller,
+  servicio, DTO ni carpeta Postman.
+- Un estereotipo \`mappedsuperclass\` se emite como \`@MappedSuperclass\`, sin tabla
+  propia; sus atributos y su PK bajan a la tabla de cada hija.
+- Un \`INTERFACE\` se emite como \`interface\` Java y una \`INTERFACE_REALIZATION\`
+  como \`implements\`, con un stub por cada método no implementado.
+- La agregación decide la cascada del lado TODO: \`SHARED\` → \`{PERSIST, MERGE}\`;
+  \`COMPOSITE\` → \`ALL\` más \`orphanRemoval\`, sobre el \`mappedBy\` del TODO. Una
+  agregación marcada en los dos extremos bloquea con \`ambiguous_aggregation\`.
+- Antes del CRUD, cada carpeta de la colección Postman crea las referencias
+  obligatorias (los fixtures), las usa por id y las borra al final en orden
+  inverso. Un ciclo de referencias obligatorias bloquea la generación.
 - Las relaciones \`DEPENDENCY\` y \`USAGE\` no producen código: quedan listadas como
   \`relationship_not_emitted\` en el reporte de generación.
-- Las jerarquías (\`GENERALIZATION\`), las interfaces y las cascadas de agregación
-  todavía no se emiten; el reporte las declara con \`relationship_not_emitted\`.
 - Las operaciones UML se emiten como métodos que lanzan
   \`UnsupportedOperationException\`: la firma está, el cuerpo todavía no.
 - El proyecto no trae tests: la suite ejecutable es la colección Postman que
@@ -316,6 +329,7 @@ export function emitProject(ir: CodegenIr): GeneratedFile[] {
   files.push(emitErrorAdviceFile());
   files.push(...emitPostmanFiles(ir));
   for (const irEnum of ir.enums) files.push(emitEnumFile(irEnum));
+  for (const irInterface of ir.interfaces) files.push(emitInterfaceFile(irInterface));
   for (const entity of ir.entities) files.push(...emitEntityFiles(entity));
 
   files.push(...emitWrapperFiles());
