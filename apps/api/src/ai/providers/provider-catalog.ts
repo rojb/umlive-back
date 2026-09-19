@@ -304,13 +304,18 @@ export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
       {
         id: 'deepseek-flash',
         label: 'DeepSeek V4.1 Flash',
-        // El modelo del catálogo es `deepseek-flash`; su visión vive en el
-        // endpoint experimental `deepseek-v4-flash-vision-exp`, que no está
-        // acá. Por eso `vision: false` (matriz de `PRD.md` Apéndice D, fila
-        // DeepSeek: "vision only on the experimental endpoint").
+        // Visión NATIVA desde DeepSeek V4.1 Flash (2026-09-10): se llama con
+        // `deepseek-flash` y no con el endpoint experimental
+        // `deepseek-v4-flash-vision-exp`, que quedó superado. Acepta JPEG, PNG,
+        // GIF y WebP, hasta 8192 px por lado y 32 MiB, y reescala a ~1300x1300
+        // (no a los 800x800 del experimental). Verificado 2026-09-19 en
+        // https://api-docs.deepseek.com/guides/vision/ y contra el proveedor
+        // instalado, @ai-sdk/deepseek 3.0.44, que soporta esos cuatro formatos.
+        // Los límites siguen en null como en todo el catálogo estático: los fija
+        // `ai-image-input` (D1), no este cambio.
         capabilities: {
           text: true,
-          vision: false,
+          vision: true,
           toolCalling: true,
           structuredOutput: true,
           ...VISION_LIMITS_UNSET,
