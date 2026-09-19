@@ -1,10 +1,12 @@
 import { Logger } from '@nestjs/common';
 import type {
+  AiAudioMediaType,
   AiCapabilities,
   AiModelPrice,
   AiModelView,
   AiProviderId,
   AiProviderUnavailableReason,
+  AiTranscriptionLanguage,
 } from '@umlive/contracts';
 import { createAnthropic } from '@ai-sdk/anthropic';
 import { createDeepSeek } from '@ai-sdk/deepseek';
@@ -12,7 +14,8 @@ import { createGoogle } from '@ai-sdk/google';
 import { createMoonshotAI } from '@ai-sdk/moonshotai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import type { LanguageModel } from 'ai';
+import type { LanguageModel, TranscriptionModel } from 'ai';
+import type { TranscriptionProviderOptions } from './ai-sdk.transcriber';
 
 /**
  * El catálogo ES la tabla de precios (design D1).
@@ -47,6 +50,33 @@ export type CatalogModel = {
   readonly price: AiModelPrice;
 };
 
+/**
+ * Un modelo de transcripción del catálogo (D1).
+ *
+ * `pricePerMinuteUsd: null` NO es "gratis": es un precio NO verificado, y por
+ * la regla de esta rebanada un modelo sin precio verificado no es seleccionable.
+ * `acceptedMediaTypes` solo lleva los formatos DOCUMENTADOS del modelo.
+ */
+export type CatalogTranscriptionModel = {
+  readonly id: string;
+  readonly pricePerMinuteUsd: string | null;
+  readonly acceptedMediaTypes: readonly AiAudioMediaType[];
+};
+
+/**
+ * La capacidad de transcripción de un proveedor (D1). Es un bloque OPcional:
+ * solo `gemini` y `openai` lo declaran.
+ *
+ * La diferencia entre vendors vive acá y no en un `if` del servicio: `model()`
+ * construye el modelo del AI SDK v7 y `providerOptions()` traduce el idioma al
+ * dialecto del proveedor. Ningún tipo del SDK sale de `providers/`.
+ */
+export type CatalogTranscription = {
+  readonly models: readonly CatalogTranscriptionModel[];
+  model(settings: ProviderSettings, modelId: string): TranscriptionModel;
+  providerOptions(lang: AiTranscriptionLanguage): TranscriptionProviderOptions;
+};
+
 export type CatalogProvider = {
   readonly id: AiProviderId;
   readonly label: string;
@@ -58,6 +88,8 @@ export type CatalogProvider = {
    */
   readonly unavailableReason: AiProviderUnavailableReason | null;
   readonly models: readonly CatalogModel[];
+  /** Capacidad hermana de transcripción de voz (FR-D20, D1). Opcional. */
+  readonly transcription?: CatalogTranscription;
   buildModel(settings: ProviderSettings, modelId: string): LanguageModel;
 };
 
@@ -89,6 +121,19 @@ const ANTHROPIC_PRICE_VERIFIED_AT = '2026-09-18';
 const DEEPSEEK_PRICE_SOURCE = 'https://api-docs.deepseek.com/quick_start/pricing';
 const DEEPSEEK_PRICE_VERIFIED_AT = '2026-09-18';
 
+/**
+ * ── Constantes de la transcripción de voz (D1/D3) ──────────────────────────
+ *
+ * `WORST_CASE_AUDIO_BPS` es el piso de bitrate de Opus documentado y la base de
+ * la reserva por bytes: se asume el PEOR bitrate para que la reserva no quede
+ * corta aunque el cliente esté adulterado. `AUDIO_MAX_BYTES` es el tope de la
+ * subida (PO-A baja los 2 MB de la propuesta a 1 MiB) y `MAX_AUDIO_SECONDS` el
+ * corte de la captura del cliente.
+ */
+export const WORST_CASE_AUDIO_BPS = 6000;
+export const AUDIO_MAX_BYTES = 1024 * 1024;
+export const MAX_AUDIO_SECONDS = 60;
+
 export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
   {
     id: 'gemini',
@@ -117,6 +162,36 @@ export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
     ],
     buildModel: (settings, modelId) =>
       createGoogle({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+    //
+    // ── Transcripción (D1, V0) ───────────────────────────────────────────
+    //
+    // `gemini-3.5-transcribe` con el precio BLENDED documentado:
+    // `https://ai.google.dev/gemini-api/docs/pricing` — entrada $2.00/1M o
+    // $0.003/min de audio, salida $12.00/1M o $0.002/min de texto, y el precio
+    // efectivo combinado ≈$0.005/min. Se toma la SUMA de los dos por-minuto
+    // ($0.003 + $0.002 = $0.005), que es la opción conservadora y coincide con
+    // el blended: una reserva que sobreestima nunca deja el libro corto.
+    //
+    // Formatos: Gemini documenta OGG Vorbis entre sus audios y NO documenta
+    // WebM. Solo entra `audio/ogg`; el resto queda sin fuente y por lo tanto
+    // fuera. La verificación empírica por formato (V0) NO pudo correr: no hay
+    // clave configurada y `apps/api/.env*` está fuera de alcance.
+    transcription: {
+      models: [
+        {
+          id: 'gemini-3.5-transcribe',
+          pricePerMinuteUsd: '0.005',
+          acceptedMediaTypes: ['audio/ogg'],
+        },
+      ],
+      model: (settings, modelId) =>
+        createGoogle({ apiKey: settings.apiKey, baseURL: settings.baseURL }).transcription(modelId),
+      // `languageCodes` (plural) es la opción de Google; se manda el idioma
+      // elegido tal cual. Que la API lo acepte en `gemini-3.5-transcribe` (y no
+      // solo en la Live API) es exactamente lo que V0 no pudo verificar: queda
+      // anotado como incógnita, y el diseño eligió mandarlo igual.
+      providerOptions: (lang) => ({ google: { languageCodes: [lang] } }),
+    },
   },
   {
     id: 'openai',
@@ -145,6 +220,36 @@ export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
     ],
     buildModel: (settings, modelId) =>
       createOpenAI({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+    //
+    // ── Transcripción (D1, V0) ───────────────────────────────────────────
+    //
+    // `gpt-transcribe` es el modelo recomendado
+    // (`https://platform.openai.com/docs/guides/speech-to-text`), con archivos
+    // de hasta 25 MB y formatos aceptados mp3, mp4, mpeg, mpga, m4a, wav y
+    // webm — WebM SÍ, ogg NO. De la lista de esta rebanada (webm/ogg/mp4)
+    // quedan `audio/webm` y `audio/mp4`.
+    //
+    // Precio por minuto: NULO a propósito. La página oficial no publica una
+    // tarifa por minuto de transcripción y `PRD.md` Apéndice D.2 tampoco trae
+    // una fila de STT. Rige la misma regla del catálogo: un precio sin fuente
+    // es un precio inventado, así que la entrada queda NO seleccionable con
+    // `price_unverified` en vez de adivinar un número.
+    transcription: {
+      models: [
+        {
+          id: 'gpt-transcribe',
+          pricePerMinuteUsd: null,
+          acceptedMediaTypes: ['audio/webm', 'audio/mp4'],
+        },
+      ],
+      model: (settings, modelId) =>
+        createOpenAI({ apiKey: settings.apiKey, baseURL: settings.baseURL }).transcription(modelId),
+      // `@ai-sdk/openai@7.0.99` solo serializa `language` (singular) y lo fija
+      // en `'es'`: OpenAI documenta `languages` (plural) y no acepta `es-ES`.
+      // El catálogo resuelve la diferencia acá, no en el servicio, y manda el
+      // código base documentado sin importar la variante regional elegida.
+      providerOptions: () => ({ openai: { language: 'es' } }),
+    },
   },
   {
     id: 'anthropic',

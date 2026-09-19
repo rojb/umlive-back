@@ -1,13 +1,24 @@
 import { Logger, type Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import type { AiModelRef, AiModelView, AiProviderId, AiProviderView } from '@umlive/contracts';
+import type {
+  AiModelRef,
+  AiModelView,
+  AiProviderId,
+  AiProviderView,
+  AiTranscriptionUnavailableReason,
+  AiTranscriptionView,
+} from '@umlive/contracts';
 import { AiSdkLlmProvider } from './ai-sdk.provider';
+import { AiSdkTranscriber } from './ai-sdk.transcriber';
 import type { LlmProvider } from './llm-provider.interface';
 import {
+  AUDIO_MAX_BYTES,
+  MAX_AUDIO_SECONDS,
   PROVIDER_CATALOG,
   toModelView,
   type CatalogModel,
   type CatalogProvider,
+  type ProviderSettings,
 } from './provider-catalog';
 
 /**
@@ -64,6 +75,11 @@ export type AiEnvironment = {
   readonly primary: AiModelRef;
   readonly fallbackChain: readonly AiModelRef[];
   /**
+   * La capacidad hermana de transcripción de voz (FR-D20, D1): su vista para
+   * el panel, su precio por minuto y el transcriptor ya construido.
+   */
+  readonly transcription: AiTranscriptionEnvironment;
+  /**
    * Construye el adaptador de un modelo del catálogo. La credencial es
    * OBLIGATORIA: quien llama tiene que declarar de dónde sale la clave —la del
    * entorno o la del proyecto— y `unreadable` no construye nada.
@@ -75,8 +91,30 @@ export type AiEnvironment = {
   createProvider(ref: AiModelRef, credential: ProviderCredential): LlmProvider | null;
 };
 
+/**
+ * La transcripción de servidor resuelta al arrancar (D1).
+ *
+ * `view` es lo que ve el cliente; `pricePerMinuteUsd` y `transcriber` son
+ * SERVIDOR: el precio calcula la reserva por bytes y el transcriptor es la
+ * única instancia construida. Cuando la capacidad no está disponible, los tres
+ * van en `null`/vacío y `view.reason` dice por qué.
+ */
+export type AiTranscriptionEnvironment = {
+  readonly view: AiTranscriptionView;
+  readonly pricePerMinuteUsd: string | null;
+  readonly transcriber: AiSdkTranscriber | null;
+  /** Límite de ritmo propio de la transcripción, distinto del de turnos (D4). */
+  readonly transcriptionsPerHour: number;
+};
+
 const DEFAULT_PROVIDER: AiProviderId = 'gemini';
 const DEFAULT_MODEL = 'gemini-3.8-flash';
+
+/** Proveedor de transcripción por defecto si `AI_STT_PROVIDER` no está puesto (D1). */
+const DEFAULT_STT_PROVIDER: AiProviderId = 'gemini';
+
+/** Default de `AI_RATE_LIMIT_TRANSCRIPTIONS_PER_HOUR` (D4, tarea 1.3). */
+const DEFAULT_TRANSCRIPTIONS_PER_HOUR = 20;
 
 const log = new Logger('AiProviderFactory');
 
@@ -282,8 +320,138 @@ export function createAiEnvironment(config: ConfigService): AiEnvironment {
     providers: PROVIDER_CATALOG.map((entry) => buildView(entry, config)),
     primary: resolvePrimary(config),
     fallbackChain: resolveFallbackChain(config),
+    transcription: resolveTranscription(config),
     createProvider: buildProviderFactory(config),
   };
+}
+
+/**
+ * La transcripción de servidor, resuelta UNA vez al arrancar (tarea 1.3, D1).
+ *
+ * Reglas:
+ *
+ * - `AI_STT_PROVIDER` elige la entrada del catálogo (default `gemini`).
+ * - `AI_STT_MODEL` elige el modelo dentro de su bloque (default el primero).
+ * - `AI_STT_BASE_URL` re-apunta el transcriptor a otro host — el falso de la
+ *   verificación. Es una decisión que alguien debería ver, así que se deja un
+ *   `Logger.warn` al arrancar.
+ * - `AI_RATE_LIMIT_TRANSCRIPTIONS_PER_HOUR` (default 20) es la única fuente del
+ *   límite propio de transcripción; lo consume `AiSpendService`.
+ *
+ * Un proveedor o modelo sin bloque `transcription`, con precio nulo, sin
+ * formatos verificados o sin clave queda NO disponible con su motivo — jamás
+ * revienta el arranque, y nunca adivina un precio.
+ */
+function resolveTranscription(config: ConfigService): AiTranscriptionEnvironment {
+  const transcriptionsPerHour = readPositiveInt(
+    config,
+    'AI_RATE_LIMIT_TRANSCRIPTIONS_PER_HOUR',
+    DEFAULT_TRANSCRIPTIONS_PER_HOUR,
+  );
+  const baseURL = readSetting(config, 'AI_STT_BASE_URL');
+  if (baseURL !== undefined) {
+    log.warn(
+      `AI_STT_BASE_URL configurado: el transcriptor se construye contra "${baseURL}", no contra el host oficial del proveedor`,
+    );
+  }
+
+  const requestedProvider = readSetting(config, 'AI_STT_PROVIDER');
+  let providerId: AiProviderId = DEFAULT_STT_PROVIDER;
+  if (requestedProvider !== undefined) {
+    if (isProviderId(requestedProvider)) providerId = requestedProvider;
+    else log.error(`AI_STT_PROVIDER inválido: "${requestedProvider}"; se usa ${DEFAULT_STT_PROVIDER}`);
+  }
+
+  const entry = PROVIDER_CATALOG.find((candidate) => candidate.id === providerId);
+  const block = entry?.transcription;
+  if (entry === undefined || block === undefined) {
+    log.warn(`transcripción: el proveedor ${providerId} no declara bloque de transcripción`);
+    return unavailableTranscription('not_in_catalog', transcriptionsPerHour);
+  }
+
+  const requestedModel = readSetting(config, 'AI_STT_MODEL');
+  const modelId = requestedModel ?? block.models[0]?.id;
+  const model = modelId === undefined ? undefined : block.models.find((candidate) => candidate.id === modelId);
+  if (model === undefined) {
+    log.error(
+      `AI_STT_MODEL fuera del catálogo de ${providerId}: "${requestedModel ?? '(sin default)'}"; la transcripción queda no disponible`,
+    );
+    return unavailableTranscription('not_in_catalog', transcriptionsPerHour);
+  }
+
+  // El orden importa: primero el precio, después el formato y por último la
+  // clave, para que el motivo reportado sea el más fundamental que falta.
+  if (model.pricePerMinuteUsd === null) {
+    log.warn(
+      `${providerId}:${model.id} no tiene precio por minuto verificado; la transcripción queda no disponible (nunca se adivina un precio)`,
+    );
+    return unavailableTranscription('price_unverified', transcriptionsPerHour);
+  }
+  if (model.acceptedMediaTypes.length === 0) {
+    return unavailableTranscription('no_verified_format', transcriptionsPerHour);
+  }
+
+  const envApiKey = entry.envKey === null ? undefined : readSetting(config, entry.envKey);
+  if (entry.envKey !== null && envApiKey === undefined) {
+    return unavailableTranscription('missing_api_key', transcriptionsPerHour);
+  }
+
+  const settings: ProviderSettings = {
+    ...(envApiKey === undefined ? {} : { apiKey: envApiKey }),
+    ...(baseURL === undefined ? {} : { baseURL }),
+  };
+
+  return {
+    view: {
+      available: true,
+      reason: null,
+      provider: entry.id,
+      model: model.id,
+      acceptedMediaTypes: [...model.acceptedMediaTypes],
+      maxBytes: AUDIO_MAX_BYTES,
+      maxSeconds: MAX_AUDIO_SECONDS,
+    },
+    pricePerMinuteUsd: model.pricePerMinuteUsd,
+    transcriber: new AiSdkTranscriber(block.model(settings, model.id), block.providerOptions),
+    transcriptionsPerHour,
+  };
+}
+
+/** La transcripción no disponible con su motivo, el mismo tope y el límite ya leído. */
+function unavailableTranscription(
+  reason: AiTranscriptionUnavailableReason,
+  transcriptionsPerHour: number,
+): AiTranscriptionEnvironment {
+  return {
+    view: {
+      available: false,
+      reason,
+      provider: null,
+      model: null,
+      acceptedMediaTypes: [],
+      maxBytes: AUDIO_MAX_BYTES,
+      maxSeconds: MAX_AUDIO_SECONDS,
+    },
+    pricePerMinuteUsd: null,
+    transcriber: null,
+    transcriptionsPerHour,
+  };
+}
+
+/** Entero positivo. Ausente → default; mal formado → `Logger.error` y default (mismo criterio que D5). */
+function readPositiveInt(config: ConfigService, key: string, fallback: number): number {
+  const raw = readSetting(config, key);
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw)) {
+    log.error(`${key} inválida: "${raw}"; se usa el default ${fallback}`);
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    log.error(`${key} inválida: "${raw}"; se usa el default ${fallback}`);
+    return fallback;
+  }
+  return parsed;
 }
 
 /** El custom provider de NestJS que lee el entorno una vez. */

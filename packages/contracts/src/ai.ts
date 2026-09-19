@@ -123,6 +123,13 @@ export interface AiConfigView {
   /** FR-D11: hay una clave propia guardada. Es lo máximo que se revela. */
   readonly hasProjectKey: boolean;
   readonly providers: readonly AiProviderView[];
+  /**
+   * La capacidad de transcripción del servidor (M6, rebanada 4/4). Es una
+   * capacidad HERMANA del chat, no una interfaz nueva (FR-D20): el cliente la
+   * lee del mismo `GET .../ai/config` para decidir si puede grabar y qué
+   * formatos acepta el modelo activo.
+   */
+  readonly transcription: AiTranscriptionView;
 }
 
 /**
@@ -210,6 +217,16 @@ export const AI_ERROR = {
    * claro NO es una opción: se rechaza el `PUT` (design D5/D8).
    */
   BYO_KEY_UNAVAILABLE: 'ai_byo_key_unavailable',
+  /** No hay modelo de transcripción disponible (sin precio, sin clave, fuera de catálogo). */
+  AI_TRANSCRIPTION_UNAVAILABLE: 'ai_transcription_unavailable',
+  /** El audio supera el tope de bytes de la ruta de transcripción: `413`, con `limitBytes`. */
+  AI_AUDIO_TOO_LARGE: 'ai_audio_too_large',
+  /** La firma de los bytes no es la del MIME declarado, o no es un audio aceptado: `415`. */
+  AI_AUDIO_UNSUPPORTED_TYPE: 'ai_audio_unsupported_type',
+  /** El proveedor no reconoció texto, o el texto vino vacío: `422`. */
+  AI_TRANSCRIPTION_EMPTY: 'ai_transcription_empty',
+  /** El proveedor falló o se agotó el plazo de la transcripción: `502`. */
+  AI_TRANSCRIPTION_FAILED: 'ai_transcription_failed',
 } as const;
 
 export type AiErrorCode = (typeof AI_ERROR)[keyof typeof AI_ERROR];
@@ -450,3 +467,70 @@ export type AiImageConfirmResult = AiTurnResult & {
   readonly excludedClosure: readonly number[];
   readonly alreadyConfirmed?: true;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Transcripción de servidor (M6, rebanada 4/4 — `ai-voice-server-fallback`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Especificación: `.../ai-voice-server-fallback-backend/spec.md` (FR-D20) y
+// `.../ai-voice-server-fallback-frontend/spec.md`. Diseño: `design.md` D1-D4.
+//
+// El respaldo de servidor de la voz es una capacidad hermana del catálogo, no
+// una interfaz nueva: el mismo `GET .../ai/config` que el panel ya lee expone su
+// disponibilidad y los formatos que el modelo activo acepta. Ningún tipo de acá
+// lleva clave ni credencial, y ningún monto viaja como `number`.
+
+/** Los contenedores de audio que el servidor sabe verificar por firma (D2). */
+export type AiAudioMediaType = 'audio/webm' | 'audio/ogg' | 'audio/mp4';
+
+/** El idioma de dictado que el usuario elige y que viaja al proveedor (D3/D4). */
+export type AiTranscriptionLanguage = 'es-ES' | 'es-419';
+
+/**
+ * Motivo por el que la transcripción de servidor no está disponible (D1).
+ *
+ * - `not_in_catalog`: el proveedor configurado no declara bloque `transcription`.
+ * - `price_unverified`: no hay precio por minuto verificado — no se adivina.
+ * - `no_verified_format`: el modelo no declara ningún tipo de audio verificado.
+ * - `missing_api_key`: falta la variable de entorno de la clave del proveedor.
+ */
+export type AiTranscriptionUnavailableReason =
+  | 'not_in_catalog'
+  | 'price_unverified'
+  | 'no_verified_format'
+  | 'missing_api_key';
+
+/**
+ * La vista de transcripción de servidor que lee el panel (FR-D04).
+ *
+ * `acceptedMediaTypes` son SOLO los formatos documentados del modelo activo: el
+ * cliente elige el primero de su lista de grabación que esté acá, y el servidor
+ * vuelve a verificarlo por firma de bytes. `maxBytes` y `maxSeconds` son los
+ * topes del servidor y de la captura, no promesas del proveedor.
+ */
+export interface AiTranscriptionView {
+  readonly available: boolean;
+  /** `null` si y solo si `available` es `true`. */
+  readonly reason: AiTranscriptionUnavailableReason | null;
+  readonly provider: AiProviderId | null;
+  readonly model: string | null;
+  readonly acceptedMediaTypes: readonly AiAudioMediaType[];
+  readonly maxBytes: number;
+  readonly maxSeconds: number;
+}
+
+/**
+ * Resultado de `POST .../ai/transcriptions` (D4).
+ *
+ * `text` es el único lugar por donde sale el transcript: no se guarda ni se
+ * loguea, y la fila de `ai_turns` lleva `'[transcription]'` en su lugar.
+ * `costUsd` es `string` decimal, la MISMA regla de dinero que el resto del
+ * contrato.
+ */
+export interface AiTranscriptionResult {
+  readonly turnId: string;
+  readonly text: string;
+  readonly costUsd: string;
+  readonly provider: AiProviderId;
+  readonly model: string;
+}

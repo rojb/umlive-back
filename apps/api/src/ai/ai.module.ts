@@ -7,6 +7,8 @@ import { AiController } from './ai.controller';
 import { AiPreviewStore } from './ai-preview.store';
 import { AiSpendService } from './ai-spend.service';
 import { AiToolsService } from './ai-tools';
+import { AiTranscriptionService } from './ai-transcription.service';
+import { AiTranscriptionsController } from './ai-transcriptions.controller';
 import { AiTurnService } from './ai-turn.service';
 import { AiTurnsController } from './ai-turns.controller';
 import { AI_ENV, aiEnvProvider } from './providers/llm-provider.factory';
@@ -20,7 +22,8 @@ import { AI_ENV, aiEnvProvider } from './providers/llm-provider.factory';
  * `AiConfigService` con sus rutas (fase 5) y, desde `ai-text-instructions`,
  * `AiTurnService` con las dos rutas del turno (D9). Desde `ai-image-input`,
  * `AiPreviewStore` guarda en memoria el plan del turno de foto hasta que el
- * humano lo confirma o vence (D8).
+ * humano lo confirma o vence (D8). Desde `ai-voice-server-fallback`,
+ * `AiTranscriptionService` sirve la ruta de transcripción de voz (FR-D20).
  *
  * `AiToolsService` se registra para que su `onModuleInit` corra: la guarda de
  * palabras clave del catálogo (D6 de `ai-text-instructions`) audita los siete
@@ -38,8 +41,8 @@ import { AI_ENV, aiEnvProvider } from './providers/llm-provider.factory';
  */
 @Module({
   imports: [CollaborationModule, UmlModule],
-  controllers: [AiController, AiTurnsController],
-  providers: [aiEnvProvider, AiSpendService, AiConfigService, AiCallService, AiToolsService, AiTurnService, AiPreviewStore],
+  controllers: [AiController, AiTurnsController, AiTranscriptionsController],
+  providers: [aiEnvProvider, AiSpendService, AiConfigService, AiCallService, AiToolsService, AiTurnService, AiPreviewStore, AiTranscriptionService],
   exports: [AI_ENV, AiSpendService, AiConfigService, AiCallService, AiToolsService],
 })
 export class AiModule {}

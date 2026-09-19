@@ -151,6 +151,7 @@ export class AiConfigService {
           fallbackChain: this.toChain(this.env.fallbackChain),
           hasProjectKey: false,
           providers: this.env.providers,
+          transcription: this.env.transcription.view,
         },
         credentialFor: () => ENVIRONMENT_CREDENTIAL,
       };
@@ -167,6 +168,10 @@ export class AiConfigService {
         fallbackChain: this.toChain(this.readStoredChain(row.fallbackChain)),
         hasProjectKey: row.apiKeyCipher !== null,
         providers: this.providersForRow(row, projectKey),
+        // La transcripción no tiene clave BYO por proyecto en esta rebanada: el
+        // transcriptor se construye una vez con el entorno (D1), así que su
+        // vista no cambia con la fila del proyecto.
+        transcription: this.env.transcription.view,
       },
       credentialFor: (provider: AiProviderId): ProviderCredential =>
         projectKey !== null && provider === row.provider ? projectKey : ENVIRONMENT_CREDENTIAL,

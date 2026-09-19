@@ -1,10 +1,11 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { AiModelRef, AiModelView, AiSpendTurnView, AiSpendView } from '@umlive/contracts';
 import { Prisma } from '../generated/prisma/client';
 import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { MAX_OUTPUT_TOKENS } from './providers/ai-sdk.provider';
+import { AI_ENV, type AiEnvironment } from './providers/llm-provider.factory';
 import type { LlmImage, LlmMessage, ToolDefinition } from './providers/llm-provider.interface';
 
 /**
@@ -55,6 +56,36 @@ const RECENT_TURNS_LIMIT = 10;
 
 /** Ventana del límite de ritmo: la última hora (FR-D15b.4). */
 const RATE_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * `prompt_text` de toda fila de transcripción (PO-3, D4). Es el marcador con el
+ * que el libro distingue una transcripción de un turno: NUNCA guarda el texto
+ * reconocido. El servicio lo escribe y el conteo de turnos lo EXCLUYE.
+ */
+export const TRANSCRIPTION_PROMPT_TEXT = '[transcription]';
+
+/**
+ * No-transcripción, con el `null` explícito.
+ *
+ * El `OR` NO es adorno: en SQL `prompt_text <> '[transcription]'` es NULL para
+ * las filas con `prompt_text` nulo, así que un `{ not: ... }` a secas las
+ * descartaría de los dos conteos. Con el `OR` una fila sin texto sigue contando
+ * como turno, que es su lugar.
+ */
+const NOT_TRANSCRIPTION_WHERE: Prisma.AiTurnWhereInput = {
+  OR: [{ promptText: null }, { promptText: { not: TRANSCRIPTION_PROMPT_TEXT } }],
+};
+
+/** Qué cuenta una reserva: un turno normal o una transcripción de voz (D4). */
+export type SpendKind = 'turn' | 'transcription';
+
+/** Las dimensiones del límite de ritmo, sin arrastrar toda la fila a reservar. */
+interface RateLimitSubject {
+  readonly kind: SpendKind;
+  readonly projectId: string;
+  readonly userId: string;
+  readonly inputMode: AiInputMode;
+}
 
 /** Un millón de tokens, como `Decimal`: nunca como `number` en la aritmética. */
 const MTOK = new Prisma.Decimal(1_000_000);
@@ -168,8 +199,20 @@ export interface OpenTurnInput {
   readonly userId: string;
   readonly inputMode: AiInputMode;
   readonly promptText: string | null;
-  readonly model: AiModelView;
+  /**
+   * El proveedor/modelo de la fila. Es `AiModelRef` y no `AiModelView` porque
+   * una transcripción no tiene una vista de tokens: la fila solo necesita los
+   * dos nombres. Un `AiModelView` sigue encajando (es un superconjunto).
+   */
+  readonly model: AiModelRef;
   readonly estimate: Prisma.Decimal;
+  /**
+   * Qué cuenta esta reserva (D4). `transcription` cuenta contra su límite
+   * propio y solo las filas con `prompt_text = '[transcription]'`; el conteo de
+   * `turn` las excluye. Por defecto `turn`, así que los llamadores anteriores
+   * no cambian.
+   */
+  readonly kind?: SpendKind;
 }
 
 export interface ReserveCallInput {
@@ -217,14 +260,37 @@ export class AiSpendService {
   private readonly ceilingUsd: Prisma.Decimal | null;
   private readonly turnsPerHour: number;
   private readonly imageTurnsPerHour: number;
+  /** Límite propio de la transcripción, resuelto por el entorno al arrancar (tarea 1.3). */
+  private readonly transcriptionsPerHour: number;
 
   constructor(
     private readonly prisma: PrismaService,
     config: ConfigService,
+    @Inject(AI_ENV) env: AiEnvironment,
   ) {
     this.ceilingUsd = this.readCeiling(config);
     this.turnsPerHour = this.readLimit(config, 'AI_RATE_LIMIT_TURNS_PER_HOUR', 20);
     this.imageTurnsPerHour = this.readLimit(config, 'AI_RATE_LIMIT_IMAGE_TURNS_PER_HOUR', 5);
+    // Única fuente del límite (tarea 1.3): lo leyó el entorno de IA al arrancar.
+    this.transcriptionsPerHour = env.transcription.transcriptionsPerHour;
+  }
+
+  /**
+   * Pre-chequeo del límite de ritmo PROPIO de la transcripción (D4).
+   *
+   * Es ADVISORY: el chequeo autoritativo vuelve a correr dentro de `openTurn`,
+   * junto con el lock y la reserva, así que dos pedidos simultáneos no pueden
+   * pasar los dos. Existe para que la guarda de ritmo corra ANTES de la
+   * disponibilidad y de la firma de bytes, que es el orden que fija la spec: un
+   * 429 no debe costar una lectura de bytes ni una consulta al proveedor.
+   */
+  async transcriptionRateLimit(projectId: string, userId: string): Promise<SpendRejection | null> {
+    const windowStart = new Date(Date.now() - RATE_WINDOW_MS);
+    return this.checkRateLimit(
+      this.prisma,
+      { kind: 'transcription', projectId, userId, inputMode: 'VOICE' },
+      windowStart,
+    );
   }
 
   /**
@@ -248,7 +314,16 @@ export class AiSpendService {
           });
         }
 
-        const limited = await this.checkRateLimit(tx, input, windowStart);
+        const limited = await this.checkRateLimit(
+          tx,
+          {
+            kind: input.kind ?? 'turn',
+            projectId: input.projectId,
+            userId: input.userId,
+            inputMode: input.inputMode,
+          },
+          windowStart,
+        );
         if (limited !== null) return limited;
 
         const spent = await this.spentTotal(tx);
@@ -514,44 +589,69 @@ export class AiSpendService {
   }
 
   /**
-   * Límite de ritmo por usuario Y por proyecto, con las de imagen contadas
-   * aparte (FR-D15b.4). `retryAt` es la fila más vieja de la ventana más una
-   * hora: el momento en que ese turno sale de la ventana.
+   * Límite de ritmo por usuario Y por proyecto (FR-D15b.4, D4).
+   *
+   * Tres cuentas sobre la MISMA tabla, sin pisarse:
+   *
+   * | `kind` | Filas contadas | Límite |
+   * |---|---|---|
+   * | `transcription` | solo `prompt_text = '[transcription]'` | `transcriptionsPerHour` |
+   * | `turn` + `IMAGE` | imagen, excluyendo transcripciones | `imageTurnsPerHour` |
+   * | `turn` + texto/voz | no-imagen, excluyendo transcripciones | `turnsPerHour` |
+   *
+   * El filtro de `turn` excluye las transcripciones a propósito: sin eso, cada
+   * dictado consumiría una cuota de turno de texto y el techo declarado mentiría.
+   * `retryAt` es la fila más vieja de la ventana más una hora.
    */
   private async checkRateLimit(
     tx: Prisma.TransactionClient,
-    input: OpenTurnInput,
+    subject: RateLimitSubject,
     windowStart: Date,
   ): Promise<SpendRejection | null> {
-    const isImage = input.inputMode === 'IMAGE';
-    const limit = isImage ? this.imageTurnsPerHour : this.turnsPerHour;
-    const modeFilter = isImage ? { inputMode: 'IMAGE' as const } : { inputMode: { not: 'IMAGE' as const } };
+    const limit = this.limitFor(subject);
+    const filter = this.rateFilterFor(subject);
 
-    const userWhere = { ...modeFilter, userId: input.userId, createdAt: { gte: windowStart } };
+    const userWhere = { ...filter, userId: subject.userId, createdAt: { gte: windowStart } };
     const userCount = await tx.aiTurn.count({ where: userWhere });
     if (userCount >= limit) {
       return this.reject('rate_limited', {
         turnId: null,
-        detail: `usuario ${input.userId}: ${userCount} turno(s) en la última hora (límite ${limit})`,
+        detail: `usuario ${subject.userId}: ${userCount} ${subject.kind}(s) en la última hora (límite ${limit})`,
         retryAt: await this.retryAtFor(tx, userWhere, windowStart),
       });
     }
 
     const projectWhere = {
-      ...modeFilter,
-      diagram: { projectId: input.projectId },
+      ...filter,
+      diagram: { projectId: subject.projectId },
       createdAt: { gte: windowStart },
     };
     const projectCount = await tx.aiTurn.count({ where: projectWhere });
     if (projectCount >= limit) {
       return this.reject('rate_limited', {
         turnId: null,
-        detail: `proyecto ${input.projectId}: ${projectCount} turno(s) en la última hora (límite ${limit})`,
+        detail: `proyecto ${subject.projectId}: ${projectCount} ${subject.kind}(s) en la última hora (límite ${limit})`,
         retryAt: await this.retryAtFor(tx, projectWhere, windowStart),
       });
     }
 
     return null;
+  }
+
+  /** El tope que aplica a esta reserva. */
+  private limitFor(subject: RateLimitSubject): number {
+    if (subject.kind === 'transcription') return this.transcriptionsPerHour;
+    return subject.inputMode === 'IMAGE' ? this.imageTurnsPerHour : this.turnsPerHour;
+  }
+
+  /** El filtro de filas que cuenta esta reserva. */
+  private rateFilterFor(subject: RateLimitSubject): Prisma.AiTurnWhereInput {
+    if (subject.kind === 'transcription') return { promptText: TRANSCRIPTION_PROMPT_TEXT };
+    const isImage = subject.inputMode === 'IMAGE';
+    return {
+      ...(isImage ? { inputMode: 'IMAGE' as const } : { inputMode: { not: 'IMAGE' as const } }),
+      ...NOT_TRANSCRIPTION_WHERE,
+    };
   }
 
   private async retryAtFor(
