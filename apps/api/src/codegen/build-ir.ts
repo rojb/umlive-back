@@ -1131,6 +1131,130 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       continue;
     }
 
+    // ── D7: clase asociación (tarea 7.2) ───────────────────────────────────
+    //
+    // `C` ligada a `A — B` NO se emite como la asociación: se emite C como
+    // entidad con dos `@ManyToOne(LAZY, optional = false)` `NOT NULL` y un
+    // `UNIQUE` derivado de la multiplicidad del extremo simple (D7). `A` y `B`
+    // no reciben ningún campo —ni hacia C ni entre sí—: el vínculo lo
+    // representa la fila de C, que es lo que el usuario modeló. Se corta acá,
+    // antes de las tres formas de D3, así ninguna de ellas toca esta arista ni
+    // le agrega campos a los extremos.
+    if (relationship.associationClassId !== null) {
+      const assocId = relationship.associationClassId;
+      const assocBuild = entityBuilds.get(assocId);
+      if (assocBuild === undefined || assocBuild.entity.mappedSuperclass) {
+        generatorNotes.push(
+          note('relationship_not_emitted', elements, `${label}: la clase asociación no se emite como entidad`, relRefs),
+        );
+        continue;
+      }
+      const simple0 = end0.upperBound !== null && end0.upperBound <= 1;
+      const simple1 = end1.upperBound !== null && end1.upperBound <= 1;
+      // Columna `<rol ?? snake(Clase)>_id` (D7): el rol del extremo referenciado,
+      // el MISMO criterio de D8 que usa la FK de una asociación común.
+      const baseFor = (end: UmlRelationshipEndView, targetBuild: EntityBookkeeping): string | null => {
+        const declared = (end.roleName ?? '').trim();
+        const resolved = memberName(declared === '' ? targetBuild.entity.name : declared);
+        return resolved.unrepresentable || resolved.name === '' ? null : resolved.name;
+      };
+      const base0 = baseFor(end0, sourceBuild);
+      const base1 = baseFor(end1, targetBuild);
+      if (base0 === null || base1 === null) {
+        generatorBlockers.push(blocker('name_unrepresentable', elements, `${label}: nombre de rol vacío`));
+        continue;
+      }
+      const column0 = shortenSql(`${snakeCase(base0)}_id`, elements, relRefs, 'columna FK');
+      const column1 = shortenSql(`${snakeCase(base1)}_id`, elements, relRefs, 'columna FK');
+      if (collisionKey(column0) === collisionKey(column1)) {
+        // Autoasociación sin roles: las dos columnas de la clase asociación
+        // salen del mismo nombre y no se pueden distinguir (D7).
+        generatorBlockers.push(
+          blocker(
+            'name_collision',
+            elements,
+            `${label}: las dos columnas de ${assocBuild.entity.table} se llaman ${column0}`,
+          ),
+        );
+        continue;
+      }
+      const addAssocField = (
+        base: string,
+        column: string,
+        targetBuild: EntityBookkeeping,
+        end: UmlRelationshipEndView,
+        otherEnd: UmlRelationshipEndView,
+      ): void => {
+        const targetPk = pkField(targetBuild);
+        addRelation(
+          { build: assocBuild, end, other: otherEnd, otherBuild: targetBuild },
+          {
+            name: base,
+            target: targetBuild.entity.name,
+            kind: 'ManyToOne',
+            owning: true,
+            mappedBy: null,
+            cascade: 'NONE',
+            orphanRemoval: false,
+            joinColumn: { name: column, nullable: false, unique: false },
+            joinTable: null,
+            dto: { name: `${base}Id`, inRequest: true, required: true, idType: targetPk.type.java },
+            inherited: false,
+          },
+        );
+        foreignKeys.push({
+          name: registerConstraint(
+            `fk_${assocBuild.entity.table}_${column}`,
+            elements,
+            relRefs,
+            `${label}: FK de ${base}`,
+          ),
+          table: assocBuild.entity.table,
+          columns: [column],
+          refTable: targetBuild.entity.table,
+          refColumns: [targetPk.column],
+          onDeleteCascade: false,
+        });
+        // Las dos FK son `NOT NULL`: son aristas del grafo obligatorio (D9), y
+        // de ahí salen los fixtures de la carpeta de la clase asociación.
+        mandatoryEdges.push({
+          fromElementId: assocBuild.entity.elementId,
+          toElementId: targetBuild.entity.elementId,
+          relationship,
+          elements,
+          relationships: relRefs,
+        });
+      };
+      addAssocField(base0, column0, sourceBuild, end0, end1);
+      addAssocField(base1, column1, targetBuild, end1, end0);
+      // `UNIQUE` derivado de la multiplicidad del extremo simple (D7): si el
+      // extremo de `A` es simple, cada `B` ve a lo sumo un `A` y `b_id` ya es
+      // única; si lo es el de `B`, `a_id`; si ninguno lo es, el par.
+      const uniqueColumns = simple0 ? [column1] : simple1 ? [column0] : [column0, column1];
+      uniques.push({
+        name: registerConstraint(
+          `uk_${assocBuild.entity.table}_${uniqueColumns.join('_')}`,
+          elements,
+          relRefs,
+          `${label}: UNIQUE de la clase asociación`,
+        ),
+        table: assocBuild.entity.table,
+        columns: uniqueColumns,
+      });
+      const assocRefs = [ctx.ref(assocId), ...elements].filter(
+        (ref, index, all) => all.findIndex((other) => other.id === ref.id) === index,
+      );
+      generatorNotes.push(
+        note(
+          'association_class_as_entity',
+          assocRefs,
+          `${label}: ${assocBuild.entity.name} se emite como entidad con dos FK NOT NULL; las cotas inferiores no se aplican`,
+          relRefs,
+        ),
+      );
+      continue;
+    }
+
     // «Simple» = `upper ≤ 1`; «múltiple» = `upper` nulo o `> 1` (D3).
     const simple0 = end0.upperBound !== null && end0.upperBound <= 1;
     const simple1 = end1.upperBound !== null && end1.upperBound <= 1;
