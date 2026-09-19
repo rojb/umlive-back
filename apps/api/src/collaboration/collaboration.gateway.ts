@@ -33,6 +33,7 @@ import type { CurrentUserPayload } from '../auth/current-user.decorator';
 import { SocketAuthService } from '../auth/socket-auth.service';
 import { ProjectAccessResolver, type ProjectAccessResult } from '../projects/project-access.resolver';
 import { LocksService } from './locks.service';
+import { logLockLatency, logOpLatency } from './latency-log';
 import { OperationsService } from './operations.service';
 import { buildRoster, pickColor } from './presence';
 import { ReconnectService } from './reconnect.service';
@@ -214,6 +215,16 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // liberaciones dejan de llegar a la sala.
     this.locks.setReleaseListener((diagramId, elementId, cause) => {
       this.emitTo(diagramId, 'lock:released', { elementId, cause });
+      // D7: la liberación también deja rastro. Sin `ms` — no hay una petición
+      // del cliente que medir — y sin actor: el oyente no lo conoce.
+      logLockLatency(null, {
+        corr: '-',
+        actor: '-',
+        diagram: diagramId,
+        type: 'lock.release',
+        outcome: cause,
+        elementId,
+      });
     });
   }
 
@@ -388,6 +399,9 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    */
   @SubscribeMessage('lock:request')
   onLockRequest(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementId: string }): void {
+    // D7: `t0` antes de tocar el registro y log DESPUÉS de emitir — lo que el
+    // usuario espera incluye la difusión, no solo la decisión.
+    const t0 = process.hrtime.bigint();
     if (typeof payload?.elementId !== 'string' || !isUUID(payload.elementId)) {
       this.logger.warn(`lock:request con elementId malformado de ${client.id}`);
       return;
@@ -399,12 +413,14 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       color: client.data.color ?? '',
     };
     const outcome = this.locks.acquire(diagramId, payload.elementId, holder);
+    let result: 'granted' | 'denied' | 'frozen';
     if (outcome.ok) {
       this.emitTo(diagramId, 'lock:granted', {
         elementId: payload.elementId,
         holder,
         expiresAt: new Date(outcome.expiresAt).toISOString(),
       });
+      result = 'granted';
     } else if ('frozen' in outcome) {
       // La compuerta está cerrada (`diagram-freeze` D4-bis): la denegación NO
       // puede nombrar un `holder`, porque no hay ninguno. Se responde igual —
@@ -412,11 +428,21 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       // esperando un `lock:granted` que nunca iba a llegar, el mismo bug que
       // el acuse frozen de `lock:requestAll` ya evitaba.
       this.emitToSocket(client, 'lock:denied', { reason: 'frozen', elementId: payload.elementId });
+      result = 'frozen';
     } else {
       // `reason: 'held'` — la otra mitad de la unión, y la que SIGUE exigiendo
       // el `holder` (FR-C04: denegar sin decir quién es el bug que evita).
       this.emitToSocket(client, 'lock:denied', { reason: 'held', elementId: payload.elementId, holder: outcome.holder });
+      result = 'denied';
     }
+    logLockLatency(t0, {
+      corr: client.id,
+      actor: client.data.user.id,
+      diagram: diagramId,
+      type: 'lock.request',
+      outcome: result,
+      elementId: payload.elementId,
+    });
   }
 
   /** `lock:release` — mismo patrón síncrono, misma autoridad exclusiva de `socket.data.diagramId`. */
@@ -452,6 +478,8 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    */
   @SubscribeMessage('lock:requestAll')
   onLockRequestAll(@ConnectedSocket() client: CollabSocket, @MessageBody() payload: { elementIds: string[] }): LockAllResult | undefined {
+    // D7: `t0` antes de `acquireAll`; el log va después de emitir cada acuse.
+    const t0 = process.hrtime.bigint();
     if (
       !Array.isArray(payload?.elementIds) ||
       payload.elementIds.length > MAX_LOCK_ALL_BATCH ||
@@ -477,13 +505,37 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       // cerrada (`diagram-freeze` D4): sin `denied`/`holder` porque no hay
       // ninguno, y con `ok: false` igual para que el Inspector no quede colgado
       // esperando un acuse que nunca llega.
-      return 'frozen' in outcome
-        ? { ok: false, frozen: true }
-        : { ok: false, denied: { reason: 'held', elementId: outcome.elementId, holder: outcome.holder } };
+      if ('frozen' in outcome) {
+        logLockLatency(t0, {
+          corr: client.id,
+          actor: client.data.user.id,
+          diagram: diagramId,
+          type: 'lock.requestAll',
+          outcome: 'frozen',
+        });
+        return { ok: false, frozen: true };
+      }
+      logLockLatency(t0, {
+        corr: client.id,
+        actor: client.data.user.id,
+        diagram: diagramId,
+        type: 'lock.requestAll',
+        outcome: 'denied',
+        elementId: outcome.elementId,
+      });
+      return { ok: false, denied: { reason: 'held', elementId: outcome.elementId, holder: outcome.holder } };
     }
 
     const expiresAt = new Date(outcome.expiresAt).toISOString();
     for (const elementId of ids) this.emitTo(diagramId, 'lock:granted', { elementId, holder, expiresAt });
+    // Sin `elementId`: es un lote, no una transición de un elemento.
+    logLockLatency(t0, {
+      corr: client.id,
+      actor: client.data.user.id,
+      diagram: diagramId,
+      type: 'lock.requestAll',
+      outcome: 'granted',
+    });
     return { ok: true, expiresAt };
   }
 
@@ -714,6 +766,9 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
    */
   @SubscribeMessage('op:submit')
   async onOperationSubmit(@ConnectedSocket() client: CollabSocket, @MessageBody() req: unknown): Promise<void> {
+    // D7: `t0` al ENTRAR al handler — la latencia que importa es «operación
+    // recibida → difusión emitida», y el log se escribe después de emitir.
+    const t0 = process.hrtime.bigint();
     // 0. Forma del SOBRE (verify-report 2026-09-18, RW-2). `req === null`
     // (`emit('op:submit', null)`) o un `diagramId` que no es un UUID
     // (`req.diagramId = "pepe"`) tiraban un `TypeError`/`22P02` sin atrapar
@@ -723,6 +778,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     const envelope = parseOperationEnvelope(req);
     if (!envelope.ok) {
       this.emitToSocket(client, 'op:rejected', this.rejectedOp(client, envelope.opId, 'MALFORMED', envelope.message));
+      this.logOperation(t0, client, envelope.opId, 'unknown', 'rejected:MALFORMED');
       return;
     }
 
@@ -737,18 +793,19 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
         'op:rejected',
         this.rejectedOp(client, envelope.value.opId, 'MALFORMED', 'Demasiadas operaciones en cola para este socket. Esperá a que se procesen las anteriores.'),
       );
+      this.logOperation(t0, client, envelope.value.opId, envelope.value.type, 'rejected:MALFORMED');
       return;
     }
     this.socketQueueDepth.set(client.id, depth + 1);
 
-    await this.enqueueForSocket(client, () => this.processOperationSubmit(client, envelope.value)).finally(() => {
+    await this.enqueueForSocket(client, () => this.processOperationSubmit(client, envelope.value, t0)).finally(() => {
       const left = (this.socketQueueDepth.get(client.id) ?? 1) - 1;
       if (left <= 0) this.socketQueueDepth.delete(client.id);
       else this.socketQueueDepth.set(client.id, left);
     });
   }
 
-  private async processOperationSubmit(client: CollabSocket, req: OperationRequest): Promise<void> {
+  private async processOperationSubmit(client: CollabSocket, req: OperationRequest, t0: bigint): Promise<void> {
     const room = this.roomOf(client.data.diagramId);
 
     // 1. Membresía + permiso VIGENTES, en CADA `op:submit` (verify-report
@@ -784,6 +841,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
       // autorización para ESTE diagrama recién falló, así que no hay
       // "versión de ahora" que sea seguro revelarle a este remitente.
       this.emitToSocket(client, 'op:rejected', this.rejectedOp(client, req.opId, reason, message));
+      this.logOperation(t0, client, req.opId, req.type, `rejected:${reason}`);
       return;
     }
 
@@ -802,6 +860,7 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
         'op:rejected',
         this.rejectedOp(client, req.opId, 'MALFORMED', 'Todavía no te uniste a este diagrama. Esperá a que la sincronización termine e intentá de nuevo.', currentVersion),
       );
+      this.logOperation(t0, client, req.opId, req.type, 'rejected:MALFORMED');
       return;
     }
 
@@ -812,6 +871,31 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     // con `payload` en un índice dinámico — un solo `as`, en el sitio de
     // despacho, cero en las 32 entradas del mapa (design.md D3).
     out.route === 'room' ? this.emitTo(client.data.diagramId, out.event, out.payload as never) : this.emitToSocket(client, out.event, out.payload as never);
+    // D7: el log va EXACTAMENTE después de emitir. `op:committed` por sala es
+    // una operación nueva; por remitente es el eco idempotente de una que ya
+    // existía. `op:rejected` lleva el motivo.
+    this.logOperation(
+      t0,
+      client,
+      req.opId,
+      req.type,
+      out.event === 'op:committed' ? (out.route === 'room' ? 'committed' : 'echo') : `rejected:${out.payload.reason}`,
+    );
+  }
+
+  /**
+   * Línea de latencia de UNA operación (D7). `corr` es el `opId` (el mismo del
+   * log de operaciones), nunca `socket.id`: el dato tiene que poder cruzarse
+   * con el resto del sistema sin abrir el código.
+   */
+  private logOperation(t0: bigint, client: CollabSocket, opId: string, type: string, outcome: string): void {
+    logOpLatency(t0, {
+      corr: opId || '-',
+      actor: client.data.user.id,
+      diagram: client.data.diagramId,
+      type: type || 'unknown',
+      outcome,
+    });
   }
 
   /**

@@ -5,6 +5,7 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import cookieParser from 'cookie-parser';
 import { join } from 'node:path';
 import { AppModule } from './app.module';
+import { applyHttpSecurity } from './http-security';
 
 /**
  * ORIGEN ÚNICO (PRD §9, Apéndice B.7).
@@ -32,6 +33,19 @@ const webRoot =
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
 
+  // D2 (`nfr-verification-and-security-hardening`): `trust proxy` ANTES de
+  // cualquier middleware, porque cambia cómo Express resuelve `req.ip`,
+  // `req.protocol` y `req.secure` para TODO lo que venga después.
+  //
+  // **Tiene que ser un NÚMERO.** Express trata un string como una lista de IPs
+  // o subredes (`express/lib/utils.js`): `'1'` no significaría «un salto».
+  // Con `n`, la confianza es `(addr, i) => i < n`; sin `TRUST_PROXY_HOPS`
+  // (`0`), no se confía en nadie y `req.ip` es la del socket — el
+  // comportamiento de hoy. Sin esto, detrás del proxy de la plataforma todos
+  // los usuarios comparten la IP del proxy y un límite «por IP» pasa a ser
+  // global.
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 0));
+
   app.use(cookieParser());
 
   // D3 (xmi-import): el limite del body JSON **se declara**, no se hereda.
@@ -46,6 +60,10 @@ async function bootstrap() {
     new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
   );
   app.setGlobalPrefix('api', { exclude: ['health'] });
+
+  // Headers de seguridad (D3) ANTES de servir el bundle: la CSP tiene que
+  // viajar también en la respuesta del `index.html` y de los assets.
+  applyHttpSecurity(app);
 
   // El bundle de la web, servido desde acá. Sin CORS porque no hay otro origen.
   app.useStaticAssets(webRoot, { index: false });
@@ -62,6 +80,10 @@ async function bootstrap() {
   // misma línea (404 para `/assets/*` y `*.map`). La rebanada que se aplique
   // SEGUNDA tiene que rebasar/mergear este bloque a mano antes de commitear,
   // sin pisar el cambio de la otra.
+  //
+  // Rebajado a mano por `nfr-verification-and-security-hardening` (rebanada
+  // 3/5, 2026-09-19): se conserva la exclusión de `/health` de arriba y se
+  // agregan los dos `404` de D5/D6. Los dos intents conviven.
   app.use((req: any, res: any, next: any) => {
     if (
       req.path.startsWith('/api') ||
@@ -69,6 +91,14 @@ async function bootstrap() {
       req.path === '/health'
     ) {
       return next();
+    }
+    // D5/D6: un asset que no existe en disco —o cualquier ruta que termine en
+    // `.map`— NO puede caer en el fallback, que responde `index.html` con 200.
+    // Devolver HTML donde se pidió un `.js`/`.map` es cómo un chunk diferido
+    // falla con un error de MIME, y cómo un mapa de fuente queda alcanzable.
+    if (req.path.startsWith('/assets/') || req.path.endsWith('.map')) {
+      res.status(404).end();
+      return;
     }
     res.sendFile(join(webRoot, 'index.html'));
   });

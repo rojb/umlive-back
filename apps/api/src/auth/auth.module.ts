@@ -7,6 +7,7 @@ import { JwtAuthGuard } from './jwt-auth.guard';
 import { JwtStrategy } from './jwt.strategy';
 import { LoginAttemptsService } from './login-attempts.service';
 import { LoginThrottleGuard } from './login-throttle.guard';
+import { RegistrationThrottleGuard } from './registration-throttle.guard';
 import { SocketAuthService } from './socket-auth.service';
 import { TokensService } from './tokens.service';
 
@@ -27,6 +28,7 @@ import { TokensService } from './tokens.service';
     TokensService,
     LoginAttemptsService,
     LoginThrottleGuard,
+    RegistrationThrottleGuard,
     JwtStrategy,
     JwtAuthGuard,
     SocketAuthService,

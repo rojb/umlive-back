@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { join } from 'node:path';
 import { AiModule } from './ai/ai.module';
+import { validateEnv } from './config/env.validation';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { CodegenModule } from './codegen/codegen.module';
@@ -34,7 +35,11 @@ const envFilePath = join(__dirname, '..', '.env');
 
 @Module({
   imports: [
-    ConfigModule.forRoot({ isGlobal: true, envFilePath }),
+    // `validate: validateEnv` (D1 de `nfr-verification-and-security-hardening`):
+    // el entorno se valida ANTES de aceptar tráfico. `ConfigModule.forRoot` es
+    // async, así que un entorno inválido rechaza `NestFactory.create` y el
+    // proceso sale con código 1 sin abrir puerto ni imprimir ningún valor.
+    ConfigModule.forRoot({ isGlobal: true, envFilePath, validate: validateEnv }),
     PrismaModule,
     AuthModule,
     UsersModule,

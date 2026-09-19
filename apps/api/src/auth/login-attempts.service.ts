@@ -46,7 +46,8 @@ export class LoginAttemptsService implements OnModuleDestroy {
   private readonly sweeper: NodeJS.Timeout;
 
   constructor(config: ConfigService) {
-    this.pepper = config.get<string>('AUTH_THROTTLE_PEPPER') ?? '';
+    // `getOrThrow`: la compuerta de `validateEnv` ya garantiza el secreto (D1).
+    this.pepper = config.getOrThrow<string>('AUTH_THROTTLE_PEPPER');
     this.sweeper = setInterval(() => this.sweep(), 60_000);
     // No debe mantener vivo el proceso.
     this.sweeper.unref?.();
@@ -59,6 +60,15 @@ export class LoginAttemptsService implements OnModuleDestroy {
   /** Cubeta por IP. Sin HMAC: la IP no delata cuentas, solo origen de red. */
   ipKey(ip: string): string {
     return `ip:${ip}`;
+  }
+
+  /**
+   * Cubeta del throttle de REGISTRO (D4). Deliberadamente distinta de `ip:`
+   * (login): 30 fallos de login no pueden consumir el cupo de registro, ni al
+   * revés — son dos ritmos con dos dueños distintos.
+   */
+  registrationIpKey(ip: string): string {
+    return 'reg:ip:' + ip;
   }
 
   /**

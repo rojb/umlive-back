@@ -19,6 +19,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { LoginThrottleGuard } from './login-throttle.guard';
 import { Public } from './public.decorator';
+import { RegistrationThrottleGuard } from './registration-throttle.guard';
 
 /** Nombre y atributos fijos de la cookie de refresh (design.md §4.3). */
 const COOKIE_NAME = 'umlive_rt';
@@ -70,6 +71,7 @@ export class AuthController {
   constructor(private readonly auth: AuthService) {}
 
   @Public()
+  @UseGuards(RegistrationThrottleGuard)
   @Post('register')
   @HttpCode(HttpStatus.CREATED)
   async register(

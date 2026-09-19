@@ -35,6 +35,7 @@ que `npm run db:up` y listo. Si usás una base gestionada, cambiala.
 |---|---|---|
 | `PORT` | `3000` | Puerto único: API, WebSocket y bundle de la web |
 | `NODE_ENV` | `development` | |
+| `TRUST_PROXY_HOPS` | `0` | Cuántos saltos de proxy confiar para resolver la IP del cliente. **Se pasa como número a `app.set('trust proxy', …)`** (un string sería una lista de IPs, no un conteo). `0` = hoy: `req.ip` es la del socket. `1` = la IP más a la derecha de `X-Forwarded-For`, la que escribió el proxy de la plataforma. Techo de 3; `TRUST_PROXY_HOPS` mayor que los saltos reales deja al cliente elegir su propia IP |
 | `WEB_DIST_PATH` | *(vacío)* | Ruta al bundle compilado. Normalmente **no hace falta**: se resuelve relativa al propio archivo compilado. Solo para despliegues raros |
 
 ## Sesiones
@@ -76,6 +77,31 @@ openssl rand -base64 48
 > dejá `COOKIE_SECURE` sin definir. Cuando la API arranca con
 > `NODE_ENV=production` y `COOKIE_SECURE=false`, registra una advertencia una
 > sola vez.
+
+## Validación del arranque
+
+**Desde `nfr-verification-and-security-hardening` (2026-09-19), la API valida el entorno ANTES de aceptar tráfico.** Un valor inválido hace que el proceso **termine con código 1**, nombre **todas** las variables que fallan juntas y no imprima ninguno de sus valores. El mensaje nunca cita el valor de un secreto, porque un error que lo cita lo escribe en el log de arranque.
+
+| Variable | Regla |
+|---|---|
+| `DATABASE_URL` | No vacía |
+| `JWT_ACCESS_SECRET` | ≥ 32 caracteres |
+| `JWT_REFRESH_SECRET` | ≥ 32 caracteres, **distinta** de la anterior |
+| `AUTH_THROTTLE_PEPPER` | ≥ 32 caracteres |
+| `ACCESS_TOKEN_TTL` | Opcional (`15m` por defecto). Formato `15m`/`900s`/`30d`, entre 1 y 900 segundos |
+| `REFRESH_TOKEN_TTL` | Opcional. Mismo formato, mayor que 0 |
+| `LOCK_TTL_MS` | Opcional (default `15000`). Entero entre **6000 y 15000**. El piso existe porque el latido es cada 5 s: con un TTL menor, el lock vencería entre dos latidos |
+| `LOCK_SWEEP_INTERVAL_MS` | Opcional (default `1000`). Entero entre **100 y 1000** |
+| `TRUST_PROXY_HOPS` | Opcional. Un dígito de `0` a `3` |
+| `PORT` | Opcional. Entero entre 1 y 65535 |
+| `NODE_ENV` | Opcional. `development` o `production` |
+| `COOKIE_SECURE` | Opcional. Solo `true` o `false` |
+
+> **⚠️ Los placeholders del bloque de abajo FALLAN A PROPÓSITO.** `cambiar-esto`, `cambiar-esto-tambien` y `cambiar-esto-tambien-2` tienen entre 12 y 23 caracteres: están por debajo del mínimo de 32 **para que el arranque no pase** hasta que generes secretos reales con `openssl rand -base64 48`. Antes de esta rebanada arrancaban en silencio con un secreto adivinable.
+
+> **El override por shell también se valida.** `$env:ACCESS_TOKEN_TTL='20m'` desde PowerShell hace fallar el arranque; `'90s'` pasa.
+
+---
 
 ## Asistente de IA
 
@@ -202,8 +228,10 @@ MAX_RECONNECT_DELTA_OPS="500"
 
 Para `npm run db:up` y las migraciones alcanza con `DATABASE_URL`.
 
-Para levantar la API hace falta además que `JWT_ACCESS_SECRET` y
-`JWT_REFRESH_SECRET` tengan valores reales — con `"cambiar-esto"` arranca, pero
-cualquiera podría firmar tokens válidos.
+Para levantar la API hace falta además que `JWT_ACCESS_SECRET`,
+`JWT_REFRESH_SECRET` y `AUTH_THROTTLE_PEPPER` tengan valores reales de **al menos
+32 caracteres** (generados por separado con `openssl rand -base64 48`). Con los
+placeholders `"cambiar-esto"` la API **ya no arranca**: la validación del arranque
+(ver arriba) los rechaza a propósito.
 
 Las claves de IA no hacen falta hasta el hito M6.

@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { createHash, randomUUID } from 'node:crypto';
+import { parseTtlSeconds } from '../config/ttl';
 import { PrismaService } from '../prisma/prisma.service';
 import { JWT_ACCESS_AUDIENCE, JWT_ACCESS_ISSUER } from './jwt-access.constants';
 
@@ -29,25 +30,6 @@ import { JWT_ACCESS_AUDIENCE, JWT_ACCESS_ISSUER } from './jwt-access.constants';
 // valores, un solo lugar.
 const ISS = JWT_ACCESS_ISSUER;
 const AUD = JWT_ACCESS_AUDIENCE;
-
-/**
- * Convierte un TTL humano ("15m", "30d") o segundos crudos ("900") a
- * segundos. Sin dependencia nueva — `jsonwebtoken` tipa `expiresIn` con un
- * literal de `ms` que no vale la pena importar para esto solo.
- */
-function parseTtlSeconds(raw: string): number {
-  const match = /^(\d+)\s*(s|m|h|d)?$/.exec(raw.trim());
-  if (!match) throw new Error(`TTL inválido en la configuración: "${raw}"`);
-  const value = Number(match[1]);
-  const unit = (match[2] ?? 's') as 's' | 'm' | 'h' | 'd';
-  const secondsPerUnit: Record<'s' | 'm' | 'h' | 'd', number> = {
-    s: 1,
-    m: 60,
-    h: 3600,
-    d: 86400,
-  };
-  return value * secondsPerUnit[unit];
-}
 
 interface AccessPayload {
   sub: string;
@@ -93,8 +75,11 @@ export class TokensService {
     private readonly prisma: PrismaService,
     config: ConfigService,
   ) {
-    this.accessSecret = config.get<string>('JWT_ACCESS_SECRET') ?? '';
-    this.refreshSecret = config.get<string>('JWT_REFRESH_SECRET') ?? '';
+    // `getOrThrow` (D1 de `nfr-verification-and-security-hardening`): antes
+    // caían a `''` sin avisar. La compuerta de `validateEnv` ya corrió, así que
+    // acá un secreto ausente es un error de programación, no un default.
+    this.accessSecret = config.getOrThrow<string>('JWT_ACCESS_SECRET');
+    this.refreshSecret = config.getOrThrow<string>('JWT_REFRESH_SECRET');
     this.accessTtlSeconds = parseTtlSeconds(config.get<string>('ACCESS_TOKEN_TTL') ?? '15m');
     this.refreshTtlSeconds = parseTtlSeconds(config.get<string>('REFRESH_TOKEN_TTL') ?? '30d');
   }
