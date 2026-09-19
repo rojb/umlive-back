@@ -11,7 +11,7 @@ import {
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
-import { AI_ENV, type AiEnvironment } from './providers/llm-provider.factory';
+import { AI_ENV, ENVIRONMENT_CREDENTIAL, type AiEnvironment, type ProviderCredential } from './providers/llm-provider.factory';
 import type { UpdateAiConfigRequest } from '@umlive/contracts';
 
 /**
@@ -49,7 +49,18 @@ import type { UpdateAiConfigRequest } from '@umlive/contracts';
  *    anterior: una clave de Anthropic bajo un primario Gemini no aplica a nada.
  * 3. Si el ciphertext no se puede descifrar, el proveedor del proyecto queda
  *    `available: false` con `byo_key_unreadable` (tarea 7.4) en vez de
- *    intentar un llamado con una credencial que no se pudo leer.
+ *    intentar un llamado con una credencial que no se pudo leer. Y como esa
+ *    clave rota tampoco se sustituye por la del entorno, `resolveForCall`
+ *    devuelve la credencial `unreadable`, que la fábrica convierte en `null`
+ *    (tarea 7.10).
+ *
+ * ── La clave del proyecto en el camino del llamado (tarea 7.10) ─────────────
+ *
+ * `resolveForCall` devuelve la misma vista que `resolve` MÁS un resolutor de
+ * credencial por proveedor: `environment` (sin clave propia), `project` con el
+ * texto claro (clave legible) o `unreadable` (parada dura). La clave viaja a la
+ * fábrica como PARÁMETRO EXPLÍCITO; acá no se muta `process.env` en ningún
+ * punto. El texto claro no se loguea ni entra en ninguna vista (SC-D05).
  *
  * Especificación: `.../ai-provider-layer-backend/spec.md`, "Resolución de
  * proveedor y modelo", "Gasto y configuración visibles…" y "Clave propia por
@@ -69,6 +80,17 @@ type StoredConfig = {
   readonly model: string;
   readonly fallbackChain: Prisma.JsonValue;
   readonly apiKeyCipher: Uint8Array | null;
+};
+
+/**
+ * Lo que necesita el camino del LLAMADO (tarea 7.10): la vista de siempre más
+ * el resolutor de credencial por proveedor. `credentialFor` se congela con el
+ * turno, así que la clave que abrió la reserva es la clave que paga el
+ * llamado.
+ */
+export type ResolvedCallConfig = {
+  readonly view: AiConfigView;
+  readonly credentialFor: (provider: AiProviderId) => ProviderCredential;
 };
 
 @Injectable()
@@ -92,10 +114,30 @@ export class AiConfigService {
 
   /**
    * Configuración efectiva del proyecto, leída fresca de la base. Es la MISMA
-   * vista que devuelve `GET .../ai/config` y la que consume `AiCallService`
-   * para armar la cadena.
+   * vista que devuelve `GET .../ai/config`.
    */
   async resolve(projectId: string): Promise<AiConfigView> {
+    return (await this.resolveForCall(projectId)).view;
+  }
+
+  /**
+   * Igual que `resolve` —una sola consulta, misma vista, sin caché (SC-D01)—
+   * pero además dice de dónde sale la clave de CADA proveedor para este
+   * proyecto (FR-D11, tarea 7.10):
+   *
+   * | Estado del proyecto | `credentialFor(proveedor)` |
+   * |---|---|
+   * | sin fila, o sin clave BYO guardada | `environment` |
+   * | con clave BYO legible, para SU proveedor | `project`, con el texto claro |
+   * | con clave BYO ilegible, para SU proveedor | `unreadable` (parada dura) |
+   * | cualquier otro proveedor | `environment` |
+   *
+   * La clave del proyecto es la del proveedor PRIMARIO del proyecto (design
+   * D8): para el resto de los eslabones la credencial es la del entorno. El
+   * texto claro no sale de acá más que hacia `createProvider`: no se loguea, no
+   * se devuelve en ninguna vista y nunca pasa por `process.env` (SC-D05).
+   */
+  async resolveForCall(projectId: string): Promise<ResolvedCallConfig> {
     const row = (await this.prisma.projectAiConfig.findUnique({
       where: { projectId },
       select: { provider: true, model: true, fallbackChain: true, apiKeyCipher: true },
@@ -103,23 +145,31 @@ export class AiConfigService {
 
     if (row === null) {
       return {
-        source: 'environment',
-        primary: this.resolveEnvironmentPrimary(),
-        fallbackChain: this.toChain(this.env.fallbackChain),
-        hasProjectKey: false,
-        providers: this.env.providers,
+        view: {
+          source: 'environment',
+          primary: this.resolveEnvironmentPrimary(),
+          fallbackChain: this.toChain(this.env.fallbackChain),
+          hasProjectKey: false,
+          providers: this.env.providers,
+        },
+        credentialFor: () => ENVIRONMENT_CREDENTIAL,
       };
     }
 
+    const projectKey = this.readProjectKey(row);
     const primaryRef: AiModelRef = { provider: row.provider as AiModelRef['provider'], model: row.model };
     const primary = this.modelInCatalog(primaryRef) ?? this.rejectOutOfCatalog(primaryRef);
 
     return {
-      source: 'project',
-      primary,
-      fallbackChain: this.toChain(this.readStoredChain(row.fallbackChain)),
-      hasProjectKey: row.apiKeyCipher !== null,
-      providers: this.providersForRow(row),
+      view: {
+        source: 'project',
+        primary,
+        fallbackChain: this.toChain(this.readStoredChain(row.fallbackChain)),
+        hasProjectKey: row.apiKeyCipher !== null,
+        providers: this.providersForRow(row, projectKey),
+      },
+      credentialFor: (provider: AiProviderId): ProviderCredential =>
+        projectKey !== null && provider === row.provider ? projectKey : ENVIRONMENT_CREDENTIAL,
     };
   }
 
@@ -181,9 +231,11 @@ export class AiConfigService {
    * Se recalcula por proyecto y no se cachea porque `providers` es parte de la
    * misma vista que `resolve` lee sin caché (SC-D01).
    */
-  private providersForRow(row: StoredConfig): readonly AiProviderView[] {
-    if (row.apiKeyCipher === null) return this.env.providers;
-    if (this.decrypt(row.apiKeyCipher) !== null) return this.env.providers;
+  private providersForRow(
+    row: StoredConfig,
+    projectKey: ProviderCredential | null,
+  ): readonly AiProviderView[] {
+    if (projectKey === null || projectKey.kind === 'project') return this.env.providers;
 
     this.log.error(
       `proyecto con clave BYO ilegible para el proveedor ${row.provider}: ` +
@@ -195,6 +247,23 @@ export class AiConfigService {
         ? { ...provider, available: false, unavailableReason: 'byo_key_unreadable' as const }
         : provider,
     );
+  }
+
+  /**
+   * La clave BYO del proyecto, ya descifrada (tarea 7.10). Tres estados, y la
+   * diferencia entre los dos últimos es la que hace correcta la plata:
+   *
+   * - `null`: el proyecto NO tiene clave propia → se usa la del entorno.
+   * - `{ kind: 'project' }`: la clave se descifró y es la que va al llamado.
+   * - `{ kind: 'unreadable' }`: la clave existe y no se pudo descifrar → el
+   *   proveedor queda no disponible y NO se cae a la clave del entorno.
+   */
+  private readProjectKey(row: StoredConfig): ProviderCredential | null {
+    if (row.apiKeyCipher === null) return null;
+
+    const plain = this.decrypt(row.apiKeyCipher);
+    if (plain === null) return { kind: 'unreadable' };
+    return { kind: 'project', apiKey: plain };
   }
 
   /**

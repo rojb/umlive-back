@@ -1,10 +1,10 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { AI_ERROR, type AiHealthCheckResult, type AiHealthCheckStep, type AiHealthCheckStepKind, type AiModelRef, type AiModelView } from '@umlive/contracts';
+import { AI_ERROR, type AiHealthCheckResult, type AiHealthCheckStep, type AiHealthCheckStepKind, type AiModelRef, type AiModelView, type AiProviderId } from '@umlive/contracts';
 import type { AiInputMode } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { AiConfigService } from './ai-config.service';
 import { AiSpendService, type SpendRejection } from './ai-spend.service';
-import { AI_ENV, type AiEnvironment } from './providers/llm-provider.factory';
+import { AI_ENV, type AiEnvironment, type ProviderCredential } from './providers/llm-provider.factory';
 import type {
   LlmCompletion,
   LlmImage,
@@ -30,6 +30,16 @@ import type {
  * `APICallError`, timeout o error de red del intento activo mueven al
  * siguiente (FR-D08). La ÚNICA excepción es el `abortSignal` del llamador:
  * ahí se corta todo, porque cancelar no es fallar (design D4).
+ *
+ * ── Con qué clave se paga cada intento (tarea 7.10) ─────────────────────────
+ *
+ * `startTurn` pide a `AiConfigService` la credencial de CADA proveedor
+ * (`resolveForCall`) y la congela en el turno. De ahí en más es la misma que
+ * usa el filtro de la cadena y la que recibe `createProvider`: la clave propia
+ * del proyecto para el proveedor del proyecto, la del entorno para el resto.
+ * `unreadable` —clave BYO que no se pudo descifrar— no construye adaptador, así
+ * que ese proveedor queda fuera de la cadena en vez de gastar la clave del
+ * entorno. Nada de esto toca `process.env`.
  *
  * Cada intento fallido deja su reserva EN PIE (`settleCall` con `actual:
  * null`): no se cobra cero por ignorancia, y el turno queda cerrado con el
@@ -90,6 +100,13 @@ export interface AiTurn {
   readonly requiresVision: boolean;
   readonly requiresToolCalling: boolean;
   readonly startedAt: number;
+  /**
+   * Credencial por proveedor, CONGELADA al abrir el turno (tarea 7.10): la
+   * misma que filtró la cadena es la que construye el adaptador en `call`. Sin
+   * esto, borrar o romper la clave del proyecto entre `startTurn` y `call`
+   * haría que el llamado cayera a la clave del entorno sin que nadie lo decida.
+   */
+  readonly credentialFor: (provider: AiProviderId) => ProviderCredential;
 }
 
 export type StartTurnResult =
@@ -151,15 +168,16 @@ export class AiCallService {
    * el primer intento. Sin reserva no hay red (FR-D15b.2).
    */
   async startTurn(request: AiCallRequest): Promise<StartTurnResult> {
-    const resolved = await this.config.resolve(request.projectId);
+    const resolved = await this.config.resolveForCall(request.projectId);
     const requiresVision = (request.images?.length ?? 0) > 0;
     const requiresToolCalling = (request.tools?.length ?? 0) > 0;
 
     const chain = this.buildChain(
-      resolved.primary,
-      resolved.fallbackChain,
+      resolved.view.primary,
+      resolved.view.fallbackChain,
       requiresVision,
       requiresToolCalling,
+      resolved.credentialFor,
     );
     if (chain.length === 0) {
       this.log.warn(
@@ -190,6 +208,7 @@ export class AiCallService {
         requiresVision,
         requiresToolCalling,
         startedAt: Date.now(),
+        credentialFor: resolved.credentialFor,
       },
     };
   }
@@ -207,10 +226,15 @@ export class AiCallService {
 
     for (const model of turn.chain) {
       const ref = `${model.provider}:${model.model}`;
-      const provider = this.env.createProvider(model);
+      // La credencial del proveedor va EXPLÍCITA al adaptador (tarea 7.10): la
+      // del proyecto si este proyecto guardó la suya, la del entorno si no. Es
+      // la MISMA credencial congelada que filtró la cadena, así que un
+      // `unreadable` no puede llegar hasta acá.
+      const provider = this.env.createProvider(model, turn.credentialFor(model.provider));
       if (provider === null) {
-        // No debería pasar: `buildChain` ya filtró por disponibilidad. Si pasa,
-        // se saltea igual y se registra (mismo camino fail-closed).
+        // No debería pasar: `buildChain` ya filtró por disponibilidad y por
+        // credencial con este mismo resolutor. Si pasa, se saltea igual y se
+        // registra (mismo camino fail-closed).
         this.log.warn(`turno ${turn.turnId}: eslabón ${ref} no disponible; se saltea`);
         fallbackFrom ??= ref;
         continue;
@@ -427,8 +451,9 @@ export class AiCallService {
   }
 
   /**
-   * Primario + eslabones, sin repetidos, hasta 4, salteando lo no disponible y
-   * lo que no declara la capacidad exigida.
+   * Primario + eslabones, sin repetidos, hasta 4, salteando lo no disponible
+   * (incluida una credencial `unreadable`) y lo que no declara la capacidad
+   * exigida.
    *
    * Nota de tensión declarada (nota [3.2] de `tasks.md`): el filtro usa el
    * booleano `capabilities.vision`, no `maxImageBytes === null`. Los límites de
@@ -441,6 +466,7 @@ export class AiCallService {
     fallbackChain: readonly AiModelView[],
     requiresVision: boolean,
     requiresToolCalling: boolean,
+    credentialFor: (provider: AiProviderId) => ProviderCredential,
   ): AiModelView[] {
     const seen = new Set<string>();
     const chain: AiModelView[] = [];
@@ -452,7 +478,10 @@ export class AiCallService {
 
       if (requiresVision && !model.capabilities.vision) continue;
       if (requiresToolCalling && !model.capabilities.toolCalling) continue;
-      if (this.env.createProvider(model) === null) continue;
+      // El filtro mira la CREDENCIAL, no solo la disponibilidad del entorno: un
+      // proyecto con clave BYO ilegible para `anthropic` no puede terminar
+      // llamando a Anthropic con `ANTHROPIC_API_KEY` (parada dura de 7.10).
+      if (this.env.createProvider(model, credentialFor(model.provider)) === null) continue;
 
       chain.push(model);
       if (chain.length === MAX_CHAIN_LINKS) break;

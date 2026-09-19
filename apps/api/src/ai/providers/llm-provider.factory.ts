@@ -33,6 +33,30 @@ import {
 /** Token del custom provider. Lo consumen los servicios de las fases 4/5. */
 export const AI_ENV = 'AI_ENV';
 
+/**
+ * Credencial con la que se construye un adaptador. Es un parámetro EXPLÍCITO
+ * del llamado, nunca una mutación de `process.env` (FR-D11, tarea 7.10).
+ *
+ * - `environment`: la clave del entorno, leída una vez al arrancar (D5). Es la
+ *   que sirve a un proyecto sin clave propia.
+ * - `project`: la clave BYO del proyecto, ya descifrada por `AiConfigService`.
+ *   Viaja a los settings de la fábrica del vendor (`create({ apiKey })`), así
+ *   el SDK no llega a leer `ANTHROPIC_API_KEY` —ni ninguna otra— por su cuenta
+ *   (`@ai-sdk/anthropic/dist/index.js`: `loadApiKey` cae a `process.env` si no
+ *   recibe `apiKey`).
+ * - `unreadable`: el proyecto TIENE clave propia y no se pudo descifrar. Es
+ *   una parada dura: `createProvider` devuelve `null` acá adentro, de modo que
+ *   no exista ningún camino que gaste la clave del entorno en un proyecto
+ *   cuya clave está rota.
+ */
+export type ProviderCredential =
+  | { readonly kind: 'environment' }
+  | { readonly kind: 'project'; readonly apiKey: string }
+  | { readonly kind: 'unreadable' };
+
+/** La credencial de un proyecto sin clave propia, y de todo proveedor que no sea el del proyecto. */
+export const ENVIRONMENT_CREDENTIAL: ProviderCredential = { kind: 'environment' };
+
 /** El entorno de IA ya resuelto: vistas, defaults y construcción de adaptadores. */
 export type AiEnvironment = {
   /** Una vista por entrada de catálogo, para el panel y para la cadena. */
@@ -40,11 +64,15 @@ export type AiEnvironment = {
   readonly primary: AiModelRef;
   readonly fallbackChain: readonly AiModelRef[];
   /**
-   * Construye el adaptador de un modelo del catálogo. Devuelve `null` si el
-   * proveedor no está disponible (sin clave, sin precio verificado), si el
-   * modelo no está en el catálogo, o si la configuración del endpoint falta.
+   * Construye el adaptador de un modelo del catálogo. La credencial es
+   * OBLIGATORIA: quien llama tiene que declarar de dónde sale la clave —la del
+   * entorno o la del proyecto— y `unreadable` no construye nada.
+   *
+   * Devuelve `null` si el proveedor no está disponible (sin clave de entorno,
+   * sin precio verificado), si el modelo no está en el catálogo, si la
+   * configuración del endpoint falta, o si la credencial es `unreadable`.
    */
-  createProvider(ref: AiModelRef): LlmProvider | null;
+  createProvider(ref: AiModelRef, credential: ProviderCredential): LlmProvider | null;
 };
 
 const DEFAULT_PROVIDER: AiProviderId = 'gemini';
@@ -203,28 +231,45 @@ function resolveFallbackChain(config: ConfigService): readonly AiModelRef[] {
 }
 
 /** FR-D07/D5: la clave se pasa EXPLÍCITA al SDK; el SDK nunca lee `process.env` solo. */
-function buildProviderFactory(config: ConfigService): (ref: AiModelRef) => LlmProvider | null {
-  return (ref: AiModelRef): LlmProvider | null => {
+function buildProviderFactory(
+  config: ConfigService,
+): (ref: AiModelRef, credential: ProviderCredential) => LlmProvider | null {
+  return (ref: AiModelRef, credential: ProviderCredential): LlmProvider | null => {
     const entry = PROVIDER_CATALOG.find((candidate) => candidate.id === ref.provider);
     if (entry === undefined || entry.unavailableReason !== null) return null;
 
     const model = modelsOf(entry, config).find((candidate) => candidate.id === ref.model);
     if (model === undefined) return null;
 
+    // Parada dura de FR-D11: si el proyecto tiene clave propia y no se pudo
+    // descifrar, este proveedor queda no disponible. Se corta acá ADENTRO y no
+    // en el llamador, para que ningún camino pueda construir el adaptador con
+    // la clave del entorno en lugar de la clave rota del proyecto.
+    if (credential.kind === 'unreadable') return null;
+
     const settings: { apiKey?: string; baseURL?: string } = {};
 
     if (entry.envKey !== null) {
-      const apiKey = readSetting(config, entry.envKey);
-      if (apiKey === undefined) return null;
-      settings.apiKey = apiKey;
+      // La disponibilidad sigue siendo la del entorno (nota [7.4]): sin su
+      // variable el proveedor no es seleccionable. La clave BYO cambia la
+      // CREDENCIAL del llamado, no la disponibilidad.
+      const envApiKey = readSetting(config, entry.envKey);
+      if (envApiKey === undefined) return null;
+      // La clave del proyecto se PREFIERE sobre la del entorno (FR-D11) y va
+      // como parámetro explícito de `create({ apiKey })`, nunca por `process.env`.
+      settings.apiKey = credential.kind === 'project' ? credential.apiKey : envApiKey;
     }
 
     if (entry.id === 'openai-compatible') {
       const baseURL = readSetting(config, 'AI_OPENAI_COMPATIBLE_BASE_URL');
       if (baseURL === undefined) return null;
       settings.baseURL = baseURL;
-      const apiKey = readSetting(config, 'AI_OPENAI_COMPATIBLE_API_KEY');
-      if (apiKey !== undefined) settings.apiKey = apiKey;
+      // Misma preferencia: la clave del proyecto gana sobre `_API_KEY`, que acá
+      // es opcional (design D5).
+      settings.apiKey =
+        credential.kind === 'project'
+          ? credential.apiKey
+          : readSetting(config, 'AI_OPENAI_COMPATIBLE_API_KEY');
     }
 
     return new AiSdkLlmProvider(entry.buildModel(settings, ref.model), model.capabilities);
