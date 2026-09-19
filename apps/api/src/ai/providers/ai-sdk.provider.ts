@@ -3,10 +3,15 @@ import {
   generateText,
   jsonSchema,
   tool,
+  type AssistantModelMessage,
   type FilePart,
   type LanguageModel,
   type ModelMessage,
   type SystemModelMessage,
+  type TextPart,
+  type ToolCallPart,
+  type ToolModelMessage,
+  type ToolResultPart,
   type ToolSet,
 } from 'ai';
 import type {
@@ -15,6 +20,7 @@ import type {
   LlmImage,
   LlmMessage,
   LlmProvider,
+  LlmToolCall,
   ToolDefinition,
 } from './llm-provider.interface';
 
@@ -85,11 +91,20 @@ export class AiSdkLlmProvider implements LlmProvider {
     const modelMessages: ModelMessage[] = [];
 
     for (const message of messages) {
-      if (message.role === 'system') {
-        instructions.push({ role: 'system', content: message.content });
-        continue;
+      switch (message.role) {
+        case 'system':
+          instructions.push({ role: 'system', content: message.content });
+          break;
+        case 'user':
+          modelMessages.push({ role: 'user', content: message.content });
+          break;
+        case 'assistant':
+          modelMessages.push(toAssistantMessage(message));
+          break;
+        case 'tool':
+          modelMessages.push(toToolMessage(message));
+          break;
       }
-      modelMessages.push({ role: message.role, content: message.content });
     }
 
     // Las imágenes viajan como `FilePart` (design D2; `ImagePart` está
@@ -138,6 +153,10 @@ export class AiSdkLlmProvider implements LlmProvider {
         toolCallId: call.toolCallId,
         toolName: call.toolName,
         input: call.input,
+        // Lectura del eco opaco (D8): el SDK lo expone en `providerMetadata`.
+        // Se copia TAL CUAL, sin mirarlo; `undefined` significa "este proveedor
+        // no exige eco" y la propiedad no viaja.
+        ...(call.providerMetadata === undefined ? {} : { opaque: call.providerMetadata }),
       })),
       usage: {
         inputTokens: result.usage.inputTokens ?? null,
@@ -146,6 +165,59 @@ export class AiSdkLlmProvider implements LlmProvider {
       finishReason: result.finishReason,
     };
   }
+}
+
+type LlmAssistantMessage = Extract<LlmMessage, { role: 'assistant' }>;
+type LlmToolMessage = Extract<LlmMessage, { role: 'tool' }>;
+
+/**
+ * El mensaje del asistente: su texto más sus llamadas, cada una con el eco
+ * `opaque` reenviado. Un mensaje sin texto y sin llamadas no existe, así que el
+ * caso vacío se normaliza a una parte de texto vacía en vez de un arreglo de
+ * contenido vacío (que el SDK rechaza).
+ */
+function toAssistantMessage(message: LlmAssistantMessage): AssistantModelMessage {
+  const parts: (TextPart | ToolCallPart)[] = [];
+  if (message.text.length > 0) parts.push({ type: 'text', text: message.text });
+  for (const call of message.toolCalls) parts.push(toToolCallPart(call));
+  return {
+    role: 'assistant',
+    content: parts.length > 0 ? parts : [{ type: 'text', text: '' }],
+  };
+}
+
+/**
+ * El eco opaco se escribe en la parte de la llamada. El SDK lo devuelve como
+ * `providerMetadata` en la respuesta y lo reenvía al proveedor desde
+ * `providerOptions` de la parte: es el mismo objeto, sin interpretarlo, que es
+ * exactamente lo que D8 pide.
+ */
+function toToolCallPart(call: LlmToolCall): ToolCallPart {
+  const part: ToolCallPart = {
+    type: 'tool-call',
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    input: call.input,
+  };
+  if (call.opaque !== undefined) {
+    return { ...part, providerOptions: call.opaque as NonNullable<ToolCallPart['providerOptions']> };
+  }
+  return part;
+}
+
+/**
+ * El resultado de una herramienta tal como lo ve el modelo: el texto ya
+ * serializado que el servidor decidió devolver (incluido el error de
+ * validación, FR-D05/SC-D03).
+ */
+function toToolMessage(message: LlmToolMessage): ToolModelMessage {
+  const part: ToolResultPart = {
+    type: 'tool-result',
+    toolCallId: message.toolCallId,
+    toolName: message.toolName,
+    output: { type: 'text', value: message.content },
+  };
+  return { role: 'tool', content: [part] };
 }
 
 /**

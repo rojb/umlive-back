@@ -26,6 +26,11 @@
  * van sin `.js`.
  */
 
+// El turno del asistente lleva el tipo de operación que produjo y, cuando se
+// rechaza después del proveedor, el rechazo del pipeline ya tipado. Es un
+// import SOLO de tipos, así que no introduce ciclo en runtime.
+import type { OperationRejected, OperationType } from './operations';
+
 /** Los seis proveedores del catálogo (FR-D02). */
 export type AiProviderId =
   | 'gemini'
@@ -208,3 +213,121 @@ export const AI_ERROR = {
 } as const;
 
 export type AiErrorCode = (typeof AI_ERROR)[keyof typeof AI_ERROR];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Turnos de texto y voz (M6, rebanada 2/4 — `ai-text-instructions`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Especificación: `.../ai-text-instructions-backend/spec.md` (FR-D05, FR-D15b,
+// FR-D20, FR-D24, FR-D25, SC-D03/D06/D07/D08/D09/D11/D14/C20) y
+// `.../ai-text-instructions-frontend/spec.md`. Diseño: `design.md` D8, D9, D10.
+//
+// Estos tipos NO tienen ningún campo de clave ni de credencial: valen las
+// mismas reglas de SC-D05 que el resto del contrato.
+
+export type AiTurnInputMode = 'TEXT' | 'VOICE';
+
+/** Cuerpo de `POST .../ai/turns`. El `prompt` se acota en el DTO (1 a 2000). */
+export interface AiTurnRequest {
+  readonly prompt: string;
+  readonly inputMode: AiTurnInputMode;
+}
+
+/** Una operación que el turno aplicó, con su etiqueta en lenguaje simple. */
+export interface AiTurnAppliedOp {
+  readonly type: OperationType;
+  /** «Clase Dirección creada», «Atributo nombre agregado a Cliente». */
+  readonly label: string;
+}
+
+/** Una llamada a herramienta que no se aplicó, con su motivo (FR-D25). */
+export interface AiTurnNotAppliedCall {
+  readonly tool: string;
+  readonly reason: string;
+}
+
+/** FR-D25 y SC-D11: qué se aplicó, qué no, y qué dijo el modelo. */
+export interface AiTurnSummary {
+  readonly applied: readonly AiTurnAppliedOp[];
+  readonly notApplied: readonly AiTurnNotAppliedCall[];
+  readonly modelText: string;
+}
+
+export type AiTurnStatus = 'APPLIED' | 'REJECTED' | 'FAILED' | 'CANCELLED';
+
+/**
+ * Motivo por el que «Deshacer turno» no se ofrece (PO-1, PO-B).
+ *
+ * - `not_create_only`: el turno no solo creó (D5 exige inversas solo de
+ *   creaciones).
+ * - `touched_later`: alguna operación posterior tocó algo que el turno creó.
+ * - `already_undone`: está el `undo:0` en el log.
+ * - `not_owner`: lo pide alguien que no pidió el turno.
+ * - `nothing_applied`: no hay nada que deshacer.
+ */
+export type AiUndoIneligibleReason =
+  | 'not_create_only'
+  | 'touched_later'
+  | 'already_undone'
+  | 'not_owner'
+  | 'nothing_applied';
+
+export type AiUndoEligibility =
+  | { readonly eligible: true }
+  | { readonly eligible: false; readonly reason: AiUndoIneligibleReason };
+
+/**
+ * Resultado de un turno (D10).
+ *
+ * Todo turno que llegó al proveedor responde `200` con este cuerpo y su
+ * `status`; `rejection` viaja solo en `REJECTED` posterior al proveedor, porque
+ * el costo ya se pagó y la fila existe.
+ *
+ * `costUsd` es `string` decimal, no `number`: misma regla de dinero que el
+ * resto del contrato (`DATA-MODEL.md` §3.8).
+ */
+export interface AiTurnResult {
+  readonly turnId: string;
+  readonly status: AiTurnStatus;
+  readonly summary: AiTurnSummary;
+  readonly rejection?: OperationRejected;
+  readonly costUsd: string;
+  readonly iterations: number;
+  readonly provider: string;
+  readonly model: string;
+  readonly fallbackFired: boolean;
+  readonly fallbackFrom: string | null;
+  readonly undo: AiUndoEligibility;
+}
+
+/**
+ * Respuesta de `POST .../ai/turns/:turnId/undo` (D5).
+ *
+ * `undone: false` con `reason` es la respuesta segura: el doble clic encuentra
+ * `undo:0` y devuelve `already_undone` sin aplicar nada una segunda vez.
+ */
+export interface AiUndoResult {
+  readonly turnId: string;
+  readonly undone: boolean;
+  /** `null` si y solo si `undone` es `true`. */
+  readonly reason: AiUndoIneligibleReason | null;
+  /** Versión del diagrama después del lote. */
+  readonly version: number;
+}
+
+/**
+ * Códigos de error de las guardas del turno (D9, D10).
+ *
+ * Son rechazos ANTES del proveedor: errores HTTP y **sin** fila en `ai_turns`.
+ * Los `429`/`409` de la reserva ya viajan con `AI_ERROR` de la rebanada 1.
+ */
+export const AI_TURN_ERROR = {
+  /** Congelado antes del proveedor (SC-C20): `423`, cero pedidos al proveedor. */
+  DIAGRAM_FROZEN: 'diagram_frozen',
+  /** Ya hay un turno de este usuario sobre este diagrama: `409`. */
+  TURN_IN_PROGRESS: 'ai_turn_in_progress',
+  /** Ningún eslabón de la cadena declara `toolCalling`: `409`. */
+  TOOL_CALLING_UNAVAILABLE: 'ai_tool_calling_unavailable',
+} as const;
+
+export type AiTurnErrorCode = (typeof AI_TURN_ERROR)[keyof typeof AI_TURN_ERROR];

@@ -1,0 +1,1306 @@
+import {
+  LOCK_REQUIREMENTS,
+  type AiTurnAppliedOp,
+  type AiTurnNotAppliedCall,
+  type AggregationKind,
+  type DiagramContent,
+  type ElementKind,
+  type OperationType,
+  type PayloadFor,
+  type Rect,
+  type RelationshipKind,
+  type Visibility,
+} from '@umlive/contracts';
+import { MAX_OPS_PER_TURN } from './ai-tools';
+
+/**
+ * El plan del turno (M6, rebanada 2/4 — `ai-text-instructions`, diseño D3).
+ *
+ * ── El modelo planifica y el pipeline aplica ───────────────────────────────
+ *
+ * Este archivo NO escribe nada y NO abre ninguna transacción: construye una
+ * lista de `PlannedOp` a partir de la foto del diagrama (`DiagramContent`) más
+ * lo que el turno ya planificó. La aplicación de ese plan (una sola transacción
+ * y un solo `FOR UPDATE`) es de `applyBatch`, en la rebanada siguiente.
+ *
+ * ── Referencias: `e:/f:/r:` para lo que existe, `new:N` para lo que se crea ─
+ *
+ * Los UUID nunca llegan al modelo: la foto se serializa con alias cortos
+ * (`e:3 CLASS Cliente {f:7 nombre: String}`). Al planificar, cada alias se
+ * resuelve a su UUID real contra la foto; un alias desconocido se rechaza como
+ * resultado de herramienta, nunca se inventa (SC-D11). Lo que el turno crea
+ * queda como `new:N` y se resuelve recién dentro de la transacción.
+ *
+ * ── La sustitución va campo por campo, NUNCA por regex ─────────────────────
+ *
+ * `REF_FIELDS` dice, por tipo de operación, qué campos llevan referencias. Un
+ * reemplazo por regex sobre todo el payload cambiaría una clase que se llame
+ * literalmente `new:1`: texto del usuario decidiendo una rama. La sustitución
+ * recorre esos caminos y solo esos (D3).
+ *
+ * `apps/api` es CommonJS: imports relativos sin `.js`.
+ */
+
+/** Ancho y alto por defecto de un elemento nuevo (espeja `InsertPalette.tsx`). */
+export const DEFAULT_ELEMENT_WIDTH = 180;
+export const DEFAULT_ELEMENT_HEIGHT = 90;
+const PACKAGE_WIDTH = 260;
+const PACKAGE_HEIGHT = 160;
+const COMMENT_WIDTH = 180;
+const COMMENT_HEIGHT = 80;
+
+/** Origen del recuadro nuevo y separaciones, iguales al criterio de `ai-image-input`. */
+const ORIGIN_X = 40;
+const ORIGIN_Y = 40;
+const COLUMN_GAP = 160;
+const ROW_GAP = 40;
+
+/** Tope de caracteres de todo nombre creado, impuesto por los DTOs compartidos. */
+export const MAX_NAME_LENGTH = 120;
+
+/** De qué tabla es una referencia. Determina qué herramientas la aceptan. */
+export type RefKind = 'element' | 'feature' | 'relationship';
+
+/**
+ * Una operación planificada. Unión discriminada por `type`: `op.type` estrecha
+ * `op.payload` al payload real de esa operación.
+ *
+ * `produces` es el `new:N` que esta operación crea, o `null`. Después de
+ * aplicarla, `applyBatch` guarda `refMap.set(op.produces, autoritativo.id)`.
+ */
+export type PlannedOp = {
+  [T in OperationType]: {
+    readonly type: T;
+    readonly payload: PayloadFor<T>;
+    readonly produces: string | null;
+  };
+}[OperationType];
+
+/** Motivos de una llamada no aplicada. Van al resumen (FR-D25). */
+export type NotAppliedReason =
+  | 'invalid_input'
+  | 'unknown_alias'
+  | 'alias_kind_mismatch'
+  | 'unknown_tool'
+  | 'nothing_to_update'
+  | 'field_not_applicable'
+  | 'invalid_multiplicity'
+  | 'aggregation_requires_association'
+  | 'self_generalization'
+  | 'op_limit_reached'
+  | 'layout_target_not_planned';
+
+export type ToolCallOutcome =
+  | {
+      readonly ok: true;
+      /** Texto que se le devuelve al modelo como resultado de herramienta. */
+      readonly result: string;
+      readonly ops: readonly PlannedOp[];
+    }
+  | {
+      readonly ok: false;
+      readonly result: string;
+      readonly error: NotAppliedReason;
+    };
+
+/**
+ * Campos de un payload que llevan referencias, por tipo de operación. `D3`.
+ *
+ * El camino `ends[].elementId` no es expresable con `keyof` porque es anidado,
+ * y por eso se admite aparte: el recorrido soporta `[]` para arrays.
+ */
+type RefStringKeys<P> = {
+  [K in keyof P]-?: NonNullable<P[K]> extends string ? K : never;
+}[keyof P];
+
+type RefPath<T extends OperationType> = RefStringKeys<PayloadFor<T>> | 'ends[].elementId';
+
+export const REF_FIELDS: { [T in OperationType]?: readonly RefPath<T>[] } = {
+  'element.create': ['parentId'],
+  'element.rename': ['id'],
+  'element.setAbstract': ['id'],
+  'element.move': ['id'],
+  'element.delete': ['id'],
+  'feature.create': ['ownerId', 'typeElementId'],
+  'feature.update': ['id', 'typeElementId'],
+  'feature.delete': ['id'],
+  'parameter.add': ['operationId', 'typeElementId'],
+  'relationship.create': ['sourceElementId', 'targetElementId', 'ends[].elementId'],
+  'relationship.rename': ['id'],
+  'relationship.delete': ['id'],
+  'relationshipEnd.setMultiplicity': ['relationshipId'],
+  'relationshipEnd.setAggregation': ['relationshipId'],
+};
+
+/**
+ * Sustituye referencias campo por campo, sobre los caminos de `REF_FIELDS`.
+ *
+ * `resolve` devuelve el valor nuevo para una referencia, o `undefined` para
+ * dejarla como está (el `new:N` que todavía no existe, al planificar) o para
+ * ignorarla (texto que no es una referencia). Genérica a propósito: la usa el
+ * plan al fijar los `new:N` de una misma llamada y la usa `applyBatch` al
+ * enlazar los `new:N` contra los ids autoritativos.
+ */
+export function substituteRefFields<T extends OperationType>(
+  type: T,
+  payload: PayloadFor<T>,
+  resolve: (reference: string) => string | undefined,
+): PayloadFor<T> {
+  const paths = REF_FIELDS[type];
+  if (paths === undefined) return payload;
+  const clone: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  for (const path of paths) {
+    replaceAtPath(clone, String(path).split('.'), resolve);
+  }
+  return clone as PayloadFor<T>;
+}
+
+function replaceAtPath(
+  node: Record<string, unknown>,
+  segments: readonly string[],
+  resolve: (reference: string) => string | undefined,
+): void {
+  const head = segments[0];
+  if (head === undefined) return;
+  const isArray = head.endsWith('[]');
+  const key = isArray ? head.slice(0, -2) : head;
+  const value = node[key];
+
+  if (isArray) {
+    if (!Array.isArray(value) || segments.length === 1) return;
+    for (const item of value) {
+      if (typeof item === 'object' && item !== null) {
+        replaceAtPath(item as Record<string, unknown>, segments.slice(1), resolve);
+      }
+    }
+    return;
+  }
+
+  if (segments.length === 1) {
+    if (typeof value === 'string') {
+      const next = resolve(value);
+      if (next !== undefined) node[key] = next;
+    }
+    return;
+  }
+
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    replaceAtPath(value as Record<string, unknown>, segments.slice(1), resolve);
+  }
+}
+
+/** Id inerte de una creación: el servidor genera el autoritativo y lo devuelve. */
+const INERT_ID = 'pending';
+
+/** Marcador interno de una referencia al `new:N` que produce otra op de la misma llamada. */
+const SELF_PREFIX = '\u0000self:';
+
+function selfRef(index: number): string {
+  return `${SELF_PREFIX}${index}`;
+}
+
+function selfRefIndex(reference: string): number | null {
+  if (!reference.startsWith(SELF_PREFIX)) return null;
+  const raw = reference.slice(SELF_PREFIX.length);
+  return /^\d+$/.test(raw) ? Number(raw) : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alias de la foto
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ResolvedRef {
+  readonly kind: RefKind;
+  readonly token: string;
+}
+
+type AliasLookup = { readonly ok: true } & ResolvedRef;
+
+const ALIAS_RE = /^(e|f|r|new):(\d+)$/;
+
+function looksLikeAlias(value: string): boolean {
+  return /^(e|f|r|new):/.test(value);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Borradores de operación
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface DraftOp {
+  readonly type: OperationType;
+  readonly payload: Record<string, unknown>;
+  readonly produces: RefKind | null;
+}
+
+type DraftResult = { readonly ops: readonly DraftOp[] } | DraftError;
+interface DraftError {
+  readonly error: NotAppliedReason;
+  readonly message: string;
+}
+
+function draftError(error: NotAppliedReason, message: string): DraftError {
+  return { error, message };
+}
+
+function isDraftError(value: unknown): value is DraftError {
+  return typeof value === 'object' && value !== null && 'error' in value;
+}
+
+type Validator = (input: Record<string, unknown>, plan: TurnPlan) => DraftResult;
+
+/** Un alias de la foto, por índice 0-based. La MISMA numeración que usa `TurnPlan`. */
+export function elementAlias(index: number): string {
+  return `e:${index + 1}`;
+}
+
+export function featureAlias(index: number): string {
+  return `f:${index + 1}`;
+}
+
+export function relationshipAlias(index: number): string {
+  return `r:${index + 1}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// El plan
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Plan en memoria de un turno: la foto, los alias resueltos, y los `PlannedOp`
+ * que el modelo fue validando. Cada llamada a herramienta pasa por `addToolCall`
+ * y **nunca** toca la base.
+ */
+export class TurnPlan {
+  /** Lo que se aplicó y no se aplicó, tal como lo reporta el resumen (FR-D25). */
+  readonly notApplied: AiTurnNotAppliedCall[] = [];
+
+  private readonly refs = new Map<string, ResolvedRef>();
+  private readonly planned: PlannedOp[] = [];
+  private newCount = 0;
+
+  constructor(readonly snapshot: DiagramContent) {
+    snapshot.elements.forEach((element, index) => {
+      this.refs.set(`e:${index + 1}`, { kind: 'element', token: element.id });
+    });
+    snapshot.features.forEach((feature, index) => {
+      this.refs.set(`f:${index + 1}`, { kind: 'feature', token: feature.id });
+    });
+    snapshot.relationships.forEach((relationship, index) => {
+      this.refs.set(`r:${index + 1}`, { kind: 'relationship', token: relationship.id });
+    });
+  }
+
+  /** Las operaciones planificadas, en el orden en que se aplicarán. */
+  get ops(): readonly PlannedOp[] {
+    return this.planned;
+  }
+
+  /** La foto con la que se planificó: los alias se resuelven contra ella, no contra la base. */
+  get diagram(): DiagramContent {
+    return this.snapshot;
+  }
+
+  /**
+   * El único camino por el que una llamada del modelo entra al plan.
+   *
+   * Valida contra el plan (no contra la base), aplica el tope de operaciones y
+   * recién entonces registra el `new:N` de lo que crea. Un error vuelve como
+   * resultado de herramienta y **no** deja rastro en el plan (FR-D05, SC-D03).
+   */
+  addToolCall(toolName: string, input: unknown): ToolCallOutcome {
+    const validator = VALIDATORS[toolName];
+    if (validator === undefined) {
+      return this.reject(toolName, 'unknown_tool', `La herramienta "${toolName}" no existe.`);
+    }
+
+    const record = isRecord(input) ? input : {};
+    const result = validator(record, this);
+    if (isDraftError(result)) return this.reject(toolName, result.error, result.message);
+
+    if (this.planned.length + result.ops.length > MAX_OPS_PER_TURN) {
+      return this.reject(
+        toolName,
+        'op_limit_reached',
+        `El plan ya tiene ${this.planned.length} operaciones y el tope es ${MAX_OPS_PER_TURN}. ` +
+          'No se planificó nada de esta llamada; el resto del turno sigue igual.',
+      );
+    }
+
+    const committed = this.commit(result.ops);
+    this.planned.push(...committed);
+    return {
+      ok: true,
+      result:
+        committed.length === 0
+          ? `Sin operaciones nuevas: la llamada se plegó en lo que el turno ya tenía planificado.`
+          : `Planificado: ${committed.map((op) => this.describe(op)).join('; ')}.`,
+      ops: committed,
+    };
+  }
+
+  /**
+   * Resuelve un alias contra la foto o contra lo que el turno ya planificó.
+   * Un alias que no resuelve es un error de herramienta, nunca un silencio.
+   */
+  resolveAlias(value: string): AliasLookup | DraftError {
+    if (!ALIAS_RE.test(value)) {
+      return draftError(
+        'unknown_alias',
+        `"${value}" no es un alias válido. Usá e:N, f:N o r:N para algo que está en la foto del diagrama, o new:N para algo que este turno creó.`,
+      );
+    }
+    const resolved = this.refs.get(value);
+    if (resolved === undefined) {
+      return draftError(
+        'unknown_alias',
+        `El alias ${value} no corresponde a nada de la foto del diagrama ni a algo que este turno planificó.`,
+      );
+    }
+    return { ok: true, ...resolved };
+  }
+
+  /** Resuelve un alias exigiendo su tipo (un dueño de atributo es un elemento). */
+  resolveAliasOf(value: string, expected: RefKind, field: string): AliasLookup | DraftError {
+    const resolved = this.resolveAlias(value);
+    if (isDraftError(resolved)) return resolved;
+    if (resolved.kind !== expected) {
+      return draftError(
+        'alias_kind_mismatch',
+        `${field}: ${value} apunta a un ${resolved.kind}, no a un ${expected}.`,
+      );
+    }
+    return resolved;
+  }
+
+  /** El `id` del elemento que produce una determinada creación planificada. */
+  plannedCreateLabelOf(index: number): string | null {
+    return this.planned[index]?.produces ?? null;
+  }
+
+  /** Cuántos elementos crea el plan hasta ahora (para ubicar los nuevos). */
+  plannedCreateCount(): number {
+    return this.planned.filter((op) => op.type === 'element.create').length;
+  }
+
+  /**
+   * Ubica un elemento nuevo en una columna a la derecha de lo que ya existe
+   * (D3): sin `apply_layout`, un turno que solo crea tiene que seguir siendo
+   * solo de creación — y deshacible.
+   */
+  nextCreateLayout(kind: ElementKind): Rect {
+    const size = defaultSize(kind);
+    const existing = this.snapshot.layouts;
+    const baseX =
+      existing.length === 0 ? ORIGIN_X : Math.max(...existing.map((l) => l.x + l.width)) + COLUMN_GAP;
+    const baseY = existing.length === 0 ? ORIGIN_Y : Math.min(...existing.map((l) => l.y));
+    const row = this.plannedCreateCount();
+    return {
+      x: baseX,
+      y: baseY + row * (DEFAULT_ELEMENT_HEIGHT + ROW_GAP),
+      width: size.width,
+      height: size.height,
+    };
+  }
+
+  /**
+   * `apply_layout` sobre un `new:N` se PLIEGA en el `element.create` planificado
+   * y no genera un `element.move` (D3). Devuelve `false` si la etiqueta no
+   * corresponde a una creación de elemento de este turno.
+   */
+  foldLayout(label: string, x: number, y: number): boolean {
+    const index = this.planned.findIndex(
+      (op) => op.type === 'element.create' && op.produces === label,
+    );
+    if (index < 0) return false;
+    const op = this.planned[index]!;
+    const payload = op.payload as unknown as Record<string, unknown>;
+    const layout = payload['layout'] as Rect;
+    const next = {
+      ...op,
+      payload: { ...payload, layout: { x, y, width: layout.width, height: layout.height } },
+    };
+    this.planned[index] = next as unknown as PlannedOp;
+    return true;
+  }
+
+  /** Posición del próximo atributo/operación de un dueño (foto + lo planificado). */
+  nextFeaturePosition(ownerToken: string): number {
+    const existing = this.snapshot.features.filter((f) => f.ownerId === ownerToken).length;
+    const planned = this.planned.filter(
+      (op) => op.type === 'feature.create' && (op.payload as { ownerId: string }).ownerId === ownerToken,
+    ).length;
+    return existing + planned;
+  }
+
+  /** Posición del próximo parámetro de una operación (foto + lo planificado). */
+  nextParameterPosition(operationToken: string): number {
+    const existing = this.snapshot.parameters.filter((p) => p.operationId === operationToken).length;
+    const planned = this.planned.filter(
+      (op) => op.type === 'parameter.add' && (op.payload as { operationId: string }).operationId === operationToken,
+    ).length;
+    return existing + planned;
+  }
+
+  /** Relaciones incidentes de un elemento en la foto, para `expectedIncidentRelationshipIds`. */
+  incidentRelationshipIds(elementToken: string): string[] {
+    const ids = new Set<string>();
+    for (const relationship of this.snapshot.relationships) {
+      if (relationship.sourceElementId === elementToken || relationship.targetElementId === elementToken) {
+        ids.add(relationship.id);
+      }
+    }
+    for (const end of this.snapshot.relationshipEnds) {
+      if (end.elementId === elementToken) ids.add(end.relationshipId);
+    }
+    return [...ids];
+  }
+
+  /** La multiplicidad vigente del extremo destino de una relación, si está en la foto. */
+  relationshipEnd(elementToken: string, endIndex: 0 | 1) {
+    return this.snapshot.relationshipEnds.find(
+      (end) => end.relationshipId === elementToken && end.endIndex === endIndex,
+    );
+  }
+
+  /**
+   * La unión de objetivos de lock del plan (Fase 6 / `acquireAllTracked`).
+   *
+   * Se deriva de `LOCK_REQUIREMENTS` y de la FOTO, no de la base: es la lista
+   * que el turno intenta tomar antes de aplicar. Lo que el turno crea no
+   * necesita lock (todavía no existe); los `new:N` se descartan por eso.
+   *
+   * El servidor vuelve a resolver la tabla dentro de su transacción y es la
+   * autoridad; esto es la lista con la que se pide, todo o nada.
+   */
+  lockTargets(): string[] {
+    const targets = new Set<string>();
+    for (const op of this.planned) {
+      for (const target of LOCK_REQUIREMENTS[op.type].targets) {
+        for (const id of this.resolveLockTarget(op, target)) {
+          if (!id.startsWith('new:')) targets.add(id);
+        }
+      }
+    }
+    return [...targets];
+  }
+
+  /** El resumen de lo aplicado, con su etiqueta en lenguaje simple (FR-D25). */
+  applied(): AiTurnAppliedOp[] {
+    return this.planned.map((op) => ({ type: op.type, label: this.describe(op) }));
+  }
+
+  private resolveLockTarget(
+    op: PlannedOp,
+    target: (typeof LOCK_REQUIREMENTS)[OperationType]['targets'][number],
+  ): string[] {
+    const payload = op.payload as unknown as Record<string, unknown>;
+    const field = (target as { field: string }).field;
+    const raw = payload[field];
+    const value = typeof raw === 'string' ? raw : null;
+    if (value === null) return [];
+
+    switch (target.from) {
+      case 'payload':
+        return [value];
+      case 'featureOwner': {
+        const feature = this.snapshot.features.find((f) => f.id === value);
+        return feature ? [feature.ownerId] : [];
+      }
+      case 'parameterOwner': {
+        const parameter = this.snapshot.parameters.find((p) => p.id === value);
+        if (!parameter) return [];
+        const operation = this.snapshot.features.find((f) => f.id === parameter.operationId);
+        return operation ? [operation.ownerId] : [];
+      }
+      case 'literalOwner': {
+        const literal = this.snapshot.enumLiterals.find((l) => l.id === value);
+        return literal ? [literal.enumerationId] : [];
+      }
+      case 'deleteClosure': {
+        const subtree = this.subtreeOf(value);
+        const relationships =
+          op.type === 'element.delete'
+            ? this.incidentRelationshipIds(value)
+            : [];
+        return [...subtree, ...relationships];
+      }
+      default:
+        return [];
+    }
+  }
+
+  private subtreeOf(root: string): string[] {
+    const ids: string[] = [];
+    const queue = [root];
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      ids.push(current);
+      for (const element of this.snapshot.elements) {
+        if (element.parentId === current && !ids.includes(element.id)) queue.push(element.id);
+      }
+    }
+    return ids;
+  }
+
+  /** Asigna los `new:N`, sustituye los marcadores internos y registra los alias. */
+  private commit(drafts: readonly DraftOp[]): PlannedOp[] {
+    const labels = drafts.map((draft) => (draft.produces === null ? null : `new:${++this.newCount}`));
+
+    return drafts.map((draft, index) => {
+      const payload = substituteRefFields(
+        draft.type,
+        draft.payload as PayloadFor<OperationType>,
+        (reference) => {
+          const self = selfRefIndex(reference);
+          if (self === null) return undefined;
+          const label = labels[self];
+          if (label === null || label === undefined) {
+            throw new Error(`marcador interno de referencia inválido: ${reference}`);
+          }
+          return label;
+        },
+      );
+      const label = labels[index] ?? null;
+      if (label !== null) this.refs.set(label, { kind: draft.produces!, token: label });
+      return { type: draft.type, payload, produces: label } as unknown as PlannedOp;
+    });
+  }
+
+  private reject(tool: string, reason: NotAppliedReason, message: string): ToolCallOutcome {
+    this.notApplied.push({ tool, reason });
+    return { ok: false, error: reason, result: message };
+  }
+
+  /** Etiqueta legible de una operación, para el resumen (FR-D25). */
+  describe(op: PlannedOp): string {
+    const payload = op.payload as unknown as Record<string, unknown>;
+    switch (op.type) {
+      case 'element.create': {
+        const kind = payload['kind'] as ElementKind;
+        const noun = ELEMENT_NOUNS[kind] ?? { singular: 'Elemento', feminine: false };
+        return `${noun.singular} ${String(payload['name'])} ${noun.feminine ? 'creada' : 'creado'}`;
+      }
+      case 'feature.create': {
+        const kind = payload['kind'] === 'OPERATION' ? 'Operación' : 'Atributo';
+        const feminine = kind === 'Operación';
+        return `${kind} ${String(payload['name'])} ${feminine ? 'agregada' : 'agregado'} a ${this.nameOf(payload['ownerId'])}`;
+      }
+      case 'parameter.add':
+        return `Parámetro ${String(payload['name'])} agregado a ${this.nameOf(payload['operationId'])}`;
+      case 'relationship.create':
+        return `Relación ${this.nameOf(payload['sourceElementId'])} → ${this.nameOf(payload['targetElementId'])} creada`;
+      case 'element.rename':
+        return `${this.nameOf(payload['id'])} renombrado a ${String(payload['name'])}`;
+      case 'element.setAbstract':
+        return `${this.nameOf(payload['id'])} ${payload['isAbstract'] === true ? 'marcado abstracto' : 'desmarcado como abstracto'}`;
+      case 'feature.update':
+        return `${this.nameOf(payload['id'])} actualizado`;
+      case 'element.move':
+        return `${this.nameOf(payload['id'])} reubicado`;
+      case 'relationship.rename':
+        return `Relación ${this.nameOf(payload['id'])} renombrada a ${String(payload['name'])}`;
+      case 'relationshipEnd.setMultiplicity':
+      case 'relationshipEnd.setAggregation':
+        return `Extremo de la relación ${this.nameOf(payload['relationshipId'])} actualizado`;
+      case 'element.delete':
+      case 'feature.delete':
+      case 'relationship.delete':
+        return `${this.nameOf(payload['id'])} borrado`;
+      default:
+        return op.type;
+    }
+  }
+
+  /** Nombre de un id real o de un `new:N` planificado, para las etiquetas. */
+  private nameOf(reference: unknown): string {
+    if (typeof reference !== 'string') return '?';
+    const element = this.snapshot.elements.find((e) => e.id === reference);
+    if (element !== undefined) return element.name ?? element.id;
+    const feature = this.snapshot.features.find((f) => f.id === reference);
+    if (feature !== undefined) return feature.name;
+    const relationship = this.snapshot.relationships.find((r) => r.id === reference);
+    if (relationship !== undefined) return relationship.name ?? relationship.id;
+    return reference;
+  }
+}
+
+const ELEMENT_NOUNS: Partial<Record<ElementKind, { singular: string; feminine: boolean }>> = {
+  CLASS: { singular: 'Clase', feminine: true },
+  INTERFACE: { singular: 'Interfaz', feminine: true },
+  ENUMERATION: { singular: 'Enumeración', feminine: true },
+  DATATYPE: { singular: 'Tipo de dato', feminine: false },
+  PRIMITIVE_TYPE: { singular: 'Tipo primitivo', feminine: false },
+  PACKAGE: { singular: 'Paquete', feminine: false },
+  COMMENT: { singular: 'Comentario', feminine: false },
+};
+
+function defaultSize(kind: ElementKind): { width: number; height: number } {
+  if (kind === 'PACKAGE') return { width: PACKAGE_WIDTH, height: PACKAGE_HEIGHT };
+  if (kind === 'COMMENT') return { width: COMMENT_WIDTH, height: COMMENT_HEIGHT };
+  return { width: DEFAULT_ELEMENT_WIDTH, height: DEFAULT_ELEMENT_HEIGHT };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lectura y validación de la entrada del modelo
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function requiredName(input: Record<string, unknown>, field: string): string | DraftError {
+  const raw = input[field];
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return draftError('invalid_input', `\`${field}\` es obligatorio: es un nombre no vacío.`);
+  }
+  if (raw.length > MAX_NAME_LENGTH) {
+    return draftError(
+      'invalid_input',
+      `\`${field}\` tiene ${raw.length} caracteres y el máximo es ${MAX_NAME_LENGTH}.`,
+    );
+  }
+  return raw;
+}
+
+function optionalName(input: Record<string, unknown>, field: string): string | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || raw.trim().length === 0) {
+    return draftError('invalid_input', `\`${field}\` debe ser un nombre no vacío si se manda.`);
+  }
+  if (raw.length > MAX_NAME_LENGTH) {
+    return draftError(
+      'invalid_input',
+      `\`${field}\` tiene ${raw.length} caracteres y el máximo es ${MAX_NAME_LENGTH}.`,
+    );
+  }
+  return raw;
+}
+
+function optionalEnum<T extends string>(
+  input: Record<string, unknown>,
+  field: string,
+  allowed: readonly T[],
+): T | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || !(allowed as readonly string[]).includes(raw)) {
+    return draftError('invalid_input', `\`${field}\` debe ser uno de: ${allowed.join(', ')}.`);
+  }
+  return raw as T;
+}
+
+function optionalBoolean(
+  input: Record<string, unknown>,
+  field: string,
+): boolean | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'boolean') {
+    return draftError('invalid_input', `\`${field}\` debe ser true o false.`);
+  }
+  return raw;
+}
+
+function optionalString(
+  input: Record<string, unknown>,
+  field: string,
+  maxLength: number,
+): string | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return draftError('invalid_input', `\`${field}\` debe ser un texto no vacío si se manda.`);
+  }
+  if (raw.length > maxLength) {
+    return draftError('invalid_input', `\`${field}\` supera los ${maxLength} caracteres.`);
+  }
+  return raw;
+}
+
+function requiredInteger(
+  input: Record<string, unknown>,
+  field: string,
+): number | DraftError {
+  const raw = input[field];
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) {
+    return draftError('invalid_input', `\`${field}\` debe ser un número entero.`);
+  }
+  return raw;
+}
+
+/** Multiplicidad textual (`"1"`, `"0..1"`, `"1..*"`, `"*"`) → par de cotas. */
+function parseMultiplicity(value: string): { lowerBound: number; upperBound: number | null } | null {
+  if (value === '*') return { lowerBound: 0, upperBound: null };
+  const parts = value.split('..');
+  if (parts.length === 1) {
+    const bound = toBound(parts[0]);
+    return bound === null ? null : { lowerBound: bound, upperBound: bound };
+  }
+  if (parts.length !== 2) return null;
+  const lower = toBound(parts[0]);
+  const upper = parts[1] === '*' ? null : toBound(parts[1]);
+  if (lower === null || (parts[1] !== '*' && upper === null)) return null;
+  if (upper !== null && upper < lower) return null;
+  return { lowerBound: lower, upperBound: upper };
+}
+
+function toBound(raw: string | undefined): number | null {
+  if (raw === undefined || !/^\d+$/.test(raw)) return null;
+  return Number(raw);
+}
+
+function optionalMultiplicity(
+  input: Record<string, unknown>,
+  field: string,
+): { lowerBound: number; upperBound: number | null } | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') {
+    return draftError('invalid_input', `\`${field}\` debe ser texto, por ejemplo "1" o "0..1".`);
+  }
+  const parsed = parseMultiplicity(raw);
+  if (parsed === null) {
+    return draftError(
+      'invalid_multiplicity',
+      `\`${field}\`: "${raw}" no es una multiplicidad válida. Usá "1", "0..1", "1..*" o "*".`,
+    );
+  }
+  return parsed;
+}
+
+type TypeResolution =
+  | { readonly kind: 'element'; readonly token: string }
+  | { readonly kind: 'name'; readonly name: string };
+
+/**
+ * Un tipo puede ser un primitivo (`String`) o el alias de un elemento modelado
+ * (D6): si tiene forma de alias, se resuelve; si no, se copia tal cual.
+ */
+function resolveTypeField(
+  input: Record<string, unknown>,
+  field: string,
+  plan: TurnPlan,
+): TypeResolution | undefined | DraftError {
+  const raw = input[field];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return draftError('invalid_input', `\`${field}\` debe ser un texto no vacío si se manda.`);
+  }
+  if (!looksLikeAlias(raw)) return { kind: 'name', name: raw };
+  const resolved = plan.resolveAliasOf(raw, 'element', field);
+  if ('error' in resolved) return resolved;
+  return { kind: 'element', token: resolved.token };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validadores por herramienta (FR-D05, SC-D03)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VALIDATORS: Record<string, Validator> = {
+  create_class: (input, plan) => {
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    const kind = optionalEnum(input, 'kind', CLASSIFIER_KINDS);
+    if (isDraftError(kind)) return kind;
+    const isAbstract = optionalBoolean(input, 'isAbstract');
+    if (isDraftError(isAbstract)) return isAbstract;
+
+    let parentId: string | null = null;
+    if (input['parent'] !== undefined && input['parent'] !== null) {
+      if (typeof input['parent'] !== 'string') {
+        return draftError('invalid_input', '`parent` debe ser el alias de un paquete.');
+      }
+      const parent = plan.resolveAliasOf(input['parent'], 'element', 'parent');
+      if ('error' in parent) return parent;
+      parentId = parent.token;
+    }
+
+    const effectiveKind: ElementKind = kind ?? 'CLASS';
+    return {
+      ops: [
+        {
+          type: 'element.create',
+          produces: 'element',
+          payload: {
+            id: INERT_ID,
+            kind: effectiveKind,
+            name,
+            parentId,
+            ...(isAbstract === undefined ? {} : { isAbstract }),
+            layout: plan.nextCreateLayout(effectiveKind),
+          },
+        },
+      ],
+    };
+  },
+
+  add_attribute: (input, plan) => {
+    const target = aliasField(input, 'target', 'element', plan);
+    if (isDraftError(target)) return target;
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    const type = resolveTypeField(input, 'type', plan);
+    if (type !== undefined && isDraftError(type)) return type;
+    const visibility = optionalEnum(input, 'visibility', VISIBILITIES);
+    if (isDraftError(visibility)) return visibility;
+    const multiplicity = optionalMultiplicity(input, 'multiplicity');
+    if (multiplicity !== undefined && isDraftError(multiplicity)) return multiplicity;
+    const defaultValue = optionalString(input, 'defaultValue', 2000);
+    if (defaultValue !== undefined && isDraftError(defaultValue)) return defaultValue;
+
+    const flags = readFlags(input, ['isStatic', 'isReadonly', 'isDerived']);
+    if (isDraftError(flags)) return flags;
+
+    return {
+      ops: [
+        {
+          type: 'feature.create',
+          produces: 'feature',
+          payload: {
+            id: INERT_ID,
+            ownerId: target.token,
+            kind: 'ATTRIBUTE',
+            name,
+            visibility: visibility ?? 'PUBLIC',
+            ...typeFields(type),
+            lowerBound: multiplicity?.lowerBound ?? 1,
+            upperBound: multiplicity === undefined ? 1 : multiplicity.upperBound,
+            position: plan.nextFeaturePosition(target.token),
+            ...(defaultValue === undefined ? {} : { defaultValue }),
+            ...flags.value,
+          },
+        },
+      ],
+    };
+  },
+
+  add_operation: (input, plan) => {
+    const target = aliasField(input, 'target', 'element', plan);
+    if (isDraftError(target)) return target;
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    const returnType = resolveTypeField(input, 'returnType', plan);
+    if (returnType !== undefined && isDraftError(returnType)) return returnType;
+    const visibility = optionalEnum(input, 'visibility', VISIBILITIES);
+    if (isDraftError(visibility)) return visibility;
+
+    const flags = readFlags(input, ['isStatic', 'isAbstract', 'isQuery']);
+    if (isDraftError(flags)) return flags;
+
+    const rawParameters = input['parameters'];
+    const parameters: { name: string; type?: TypeResolution; direction?: 'IN' | 'OUT' | 'INOUT' }[] = [];
+    if (rawParameters !== undefined && rawParameters !== null) {
+      if (!Array.isArray(rawParameters)) {
+        return draftError('invalid_input', '`parameters` debe ser un arreglo.');
+      }
+      for (const [index, raw] of rawParameters.entries()) {
+        if (!isRecord(raw)) {
+          return draftError('invalid_input', `\`parameters[${index}]\` debe ser un objeto.`);
+        }
+        const paramName = requiredName(raw, 'name');
+        if (isDraftError(paramName)) return paramName;
+        const direction = optionalEnum(raw, 'direction', PARAMETER_DIRECTIONS);
+        if (isDraftError(direction)) return direction;
+        const paramType = resolveTypeField(raw, 'type', plan);
+        if (paramType !== undefined && isDraftError(paramType)) return paramType;
+        parameters.push({ name: paramName, type: paramType, direction });
+      }
+    }
+
+    const operation: DraftOp = {
+      type: 'feature.create',
+      produces: 'feature',
+      payload: {
+        id: INERT_ID,
+        ownerId: target.token,
+        kind: 'OPERATION',
+        name,
+        visibility: visibility ?? 'PUBLIC',
+        ...typeFields(returnType),
+        position: plan.nextFeaturePosition(target.token),
+        ...flags.value,
+      },
+    };
+
+    const base = plan.nextParameterPosition(selfRef(0));
+    const parameterOps: DraftOp[] = parameters.map((parameter, index) => ({
+      type: 'parameter.add',
+      produces: null,
+      payload: {
+        id: INERT_ID,
+        // Referencia a la operación que crea ESTA misma llamada: el marcador se
+        // sustituye por el `new:N` en cuanto el plan lo asigna.
+        operationId: selfRef(0),
+        name: parameter.name,
+        direction: parameter.direction ?? 'IN',
+        ...typeFields(parameter.type),
+        position: base + index,
+      },
+    }));
+
+    return { ops: [operation, ...parameterOps] };
+  },
+
+  create_relationship: (input, plan) => {
+    const kind = optionalEnum(input, 'kind', RELATIONSHIP_KINDS);
+    if (isDraftError(kind)) return kind;
+    if (kind === undefined) {
+      return draftError('invalid_input', '`kind` es obligatorio: decí qué tipo de relación es.');
+    }
+    const source = aliasField(input, 'source', 'element', plan);
+    if (isDraftError(source)) return source;
+    const target = aliasField(input, 'target', 'element', plan);
+    if (isDraftError(target)) return target;
+    const name = optionalName(input, 'name');
+    if (name !== undefined && isDraftError(name)) return name;
+
+    const aggregation = optionalEnum(input, 'aggregation', AGGREGATIONS);
+    if (isDraftError(aggregation)) return aggregation;
+    if (aggregation !== undefined && kind !== 'ASSOCIATION') {
+      return draftError(
+        'aggregation_requires_association',
+        '`aggregation` solo aplica a una asociación: una composición es kind ASSOCIATION con aggregation COMPOSITE.',
+      );
+    }
+
+    const sourceMultiplicity = optionalMultiplicity(input, 'sourceMultiplicity');
+    if (sourceMultiplicity !== undefined && isDraftError(sourceMultiplicity)) return sourceMultiplicity;
+    const targetMultiplicity = optionalMultiplicity(input, 'targetMultiplicity');
+    if (targetMultiplicity !== undefined && isDraftError(targetMultiplicity)) return targetMultiplicity;
+
+    if (kind === 'GENERALIZATION' && source.token === target.token) {
+      return draftError('self_generalization', 'Una generalización no puede heredar de sí misma.');
+    }
+
+    const ends =
+      kind === 'ASSOCIATION'
+        ? buildEnds(sourceMultiplicity, targetMultiplicity, aggregation)
+        : undefined;
+    if (ends !== undefined && isDraftError(ends)) return ends;
+
+    return {
+      ops: [
+        {
+          type: 'relationship.create',
+          produces: 'relationship',
+          payload: {
+            id: INERT_ID,
+            kind,
+            sourceElementId: source.token,
+            targetElementId: target.token,
+            ...(name === undefined ? {} : { name }),
+            ...(ends === undefined ? {} : { ends: ends.value }),
+          },
+        },
+      ],
+    };
+  },
+
+  update_element: (input, plan) => {
+    if (typeof input['target'] !== 'string') {
+      return draftError('invalid_input', '`target` es obligatorio: el alias de lo que se cambia.');
+    }
+    const resolved = plan.resolveAlias(input['target']);
+    if ('error' in resolved) return resolved;
+
+    switch (resolved.kind) {
+      case 'element':
+        return updateElement(input, resolved.token);
+      case 'feature':
+        return updateFeature(input, resolved.token, plan);
+      case 'relationship':
+        return updateRelationship(input, resolved.token, plan);
+    }
+  },
+
+  delete_element: (input, plan) => {
+    if (typeof input['target'] !== 'string') {
+      return draftError('invalid_input', '`target` es obligatorio: el alias de lo que se borra.');
+    }
+    const resolved = plan.resolveAlias(input['target']);
+    if ('error' in resolved) return resolved;
+
+    if (resolved.kind === 'element') {
+      return {
+        ops: [
+          {
+            type: 'element.delete',
+            produces: null,
+            payload: {
+              id: resolved.token,
+              expectedIncidentRelationshipIds: resolved.token.startsWith('new:')
+                ? []
+                : plan.incidentRelationshipIds(resolved.token),
+            },
+          },
+        ],
+      };
+    }
+    if (resolved.kind === 'feature') {
+      return { ops: [{ type: 'feature.delete', produces: null, payload: { id: resolved.token } }] };
+    }
+    return { ops: [{ type: 'relationship.delete', produces: null, payload: { id: resolved.token } }] };
+  },
+
+  apply_layout: (input, plan) => {
+    const target = aliasField(input, 'target', 'element', plan);
+    if (isDraftError(target)) return target;
+    const x = requiredInteger(input, 'x');
+    if (isDraftError(x)) return x;
+    const y = requiredInteger(input, 'y');
+    if (isDraftError(y)) return y;
+
+    // Sobre algo que el turno crea, se pliega en el create: no genera un
+    // `element.move` y el turno sigue siendo solo de creación (D3).
+    if (target.token.startsWith('new:')) {
+      const folded = plan.foldLayout(target.token, x, y);
+      if (!folded) {
+        return draftError(
+          'layout_target_not_planned',
+          `${target.token} no es una creación de elemento de este turno.`,
+        );
+      }
+      return { ops: [] };
+    }
+
+    return {
+      ops: [{ type: 'element.move', produces: null, payload: { id: target.token, x, y } }],
+    };
+  },
+};
+
+/** Campos de actualización admitidos por cada tipo de destino del `update_element`. */
+const ELEMENT_UPDATE_FIELDS = ['name', 'isAbstract'];
+const FEATURE_UPDATE_FIELDS = [
+  'name',
+  'type',
+  'visibility',
+  'multiplicity',
+  'defaultValue',
+  'isStatic',
+  'isReadonly',
+  'isDerived',
+  'isAbstract',
+  'isQuery',
+];
+const RELATIONSHIP_UPDATE_FIELDS = [
+  'name',
+  'sourceMultiplicity',
+  'targetMultiplicity',
+  'aggregation',
+];
+
+function updateElement(input: Record<string, unknown>, id: string): DraftResult {
+  const stray = strayFields(input, ELEMENT_UPDATE_FIELDS);
+  if (stray !== undefined) return stray;
+
+  const ops: DraftOp[] = [];
+  if (input['name'] !== undefined) {
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    ops.push({ type: 'element.rename', produces: null, payload: { id, name } });
+  }
+  if (input['isAbstract'] !== undefined) {
+    const isAbstract = optionalBoolean(input, 'isAbstract');
+    if (isDraftError(isAbstract)) return isAbstract;
+    ops.push({
+      type: 'element.setAbstract',
+      produces: null,
+      payload: { id, isAbstract: isAbstract ?? false },
+    });
+  }
+  return ops.length === 0 ? nothingToUpdate() : { ops };
+}
+
+function updateFeature(input: Record<string, unknown>, id: string, plan: TurnPlan): DraftResult {
+  const stray = strayFields(input, FEATURE_UPDATE_FIELDS);
+  if (stray !== undefined) return stray;
+
+  const payload: Record<string, unknown> = { id };
+  if (input['name'] !== undefined) {
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    payload['name'] = name;
+  }
+  if (input['visibility'] !== undefined) {
+    const visibility = optionalEnum(input, 'visibility', VISIBILITIES);
+    if (isDraftError(visibility)) return visibility;
+    payload['visibility'] = visibility;
+  }
+  const type = resolveTypeField(input, 'type', plan);
+  if (type !== undefined && isDraftError(type)) return type;
+  if (type !== undefined) Object.assign(payload, typeFields(type));
+  if (input['multiplicity'] !== undefined) {
+    const multiplicity = optionalMultiplicity(input, 'multiplicity');
+    if (multiplicity !== undefined && isDraftError(multiplicity)) return multiplicity;
+    payload['lowerBound'] = multiplicity?.lowerBound;
+    payload['upperBound'] = multiplicity === undefined ? null : multiplicity.upperBound;
+  }
+  if (input['defaultValue'] !== undefined) {
+    const defaultValue = optionalString(input, 'defaultValue', 2000);
+    if (defaultValue !== undefined && isDraftError(defaultValue)) return defaultValue;
+    payload['defaultValue'] = defaultValue;
+  }
+  const flags = readFlags(input, ['isStatic', 'isReadonly', 'isDerived', 'isAbstract', 'isQuery']);
+  if (isDraftError(flags)) return flags;
+  Object.assign(payload, flags.value);
+
+  return Object.keys(payload).length <= 1 ? nothingToUpdate() : { ops: [{ type: 'feature.update', produces: null, payload }] };
+}
+
+function updateRelationship(input: Record<string, unknown>, id: string, plan: TurnPlan): DraftResult {
+  const stray = strayFields(input, RELATIONSHIP_UPDATE_FIELDS);
+  if (stray !== undefined) return stray;
+
+  const ops: DraftOp[] = [];
+  if (input['name'] !== undefined) {
+    const name = requiredName(input, 'name');
+    if (isDraftError(name)) return name;
+    ops.push({ type: 'relationship.rename', produces: null, payload: { id, name } });
+  }
+
+  const sourceMultiplicity = optionalMultiplicity(input, 'sourceMultiplicity');
+  if (sourceMultiplicity !== undefined && isDraftError(sourceMultiplicity)) return sourceMultiplicity;
+  if (sourceMultiplicity !== undefined) {
+    ops.push({
+      type: 'relationshipEnd.setMultiplicity',
+      produces: null,
+      payload: { relationshipId: id, endIndex: 0, ...sourceMultiplicity },
+    });
+  }
+
+  const targetMultiplicity = optionalMultiplicity(input, 'targetMultiplicity');
+  if (targetMultiplicity !== undefined && isDraftError(targetMultiplicity)) return targetMultiplicity;
+  if (targetMultiplicity !== undefined) {
+    ops.push({
+      type: 'relationshipEnd.setMultiplicity',
+      produces: null,
+      payload: { relationshipId: id, endIndex: 1, ...targetMultiplicity },
+    });
+  }
+
+  if (input['aggregation'] !== undefined) {
+    const aggregation = optionalEnum(input, 'aggregation', AGGREGATIONS);
+    if (isDraftError(aggregation)) return aggregation;
+    const targetUpper =
+      targetMultiplicity?.upperBound ??
+      (id.startsWith('new:') ? 1 : plan.relationshipEnd(id, 1)?.upperBound ?? null);
+    if (aggregation === 'COMPOSITE' && targetUpper !== 1) {
+      return compositeMultiplicityError();
+    }
+    if (aggregation !== undefined) {
+      ops.push({
+        type: 'relationshipEnd.setAggregation',
+        produces: null,
+        payload: { relationshipId: id, endIndex: 1, aggregation },
+      });
+    }
+  }
+
+  return ops.length === 0 ? nothingToUpdate() : { ops };
+}
+
+function buildEnds(
+  source: { lowerBound: number; upperBound: number | null } | undefined,
+  target: { lowerBound: number; upperBound: number | null } | undefined,
+  aggregation: AggregationKind | undefined,
+): { value: unknown[] } | DraftError {
+  const sourceEnd = source ?? { lowerBound: 1, upperBound: 1 };
+  const targetEnd = target ?? { lowerBound: 1, upperBound: 1 };
+  if (aggregation === 'COMPOSITE' && targetEnd.upperBound !== 1) {
+    return compositeMultiplicityError();
+  }
+  return {
+    value: [
+      { ...sourceEnd, isNavigable: false, aggregation: 'NONE' as AggregationKind },
+      {
+        ...targetEnd,
+        isNavigable: false,
+        aggregation: aggregation ?? ('NONE' as AggregationKind),
+      },
+    ],
+  };
+}
+
+function compositeMultiplicityError(): DraftError {
+  return draftError(
+    'invalid_multiplicity',
+    'Una composición exige que el extremo destino tenga multiplicidad con tope 1 (por ejemplo "1" o "0..1").',
+  );
+}
+
+function nothingToUpdate(): DraftError {
+  return draftError('nothing_to_update', 'La llamada no cambia ningún campo.');
+}
+
+function strayFields(input: Record<string, unknown>, allowed: readonly string[]): DraftError | undefined {
+  const stray = Object.keys(input).filter((key) => key !== 'target' && !allowed.includes(key));
+  if (stray.length === 0) return undefined;
+  return draftError(
+    'field_not_applicable',
+    `Estos campos no aplican a este destino: ${stray.join(', ')}.`,
+  );
+}
+
+function readFlags(
+  input: Record<string, unknown>,
+  fields: readonly string[],
+): { value: Record<string, boolean> } | DraftError {
+  const value: Record<string, boolean> = {};
+  for (const field of fields) {
+    if (input[field] === undefined) continue;
+    const flag = optionalBoolean(input, field);
+    if (isDraftError(flag)) return flag;
+    if (flag !== undefined) value[field] = flag;
+  }
+  return { value };
+}
+
+function typeFields(
+  type: TypeResolution | DraftError | undefined,
+): Record<string, string> {
+  if (type === undefined || isDraftError(type)) return {};
+  return type.kind === 'element' ? { typeElementId: type.token } : { typeName: type.name };
+}
+
+function aliasField(
+  input: Record<string, unknown>,
+  field: string,
+  expected: RefKind,
+  plan: TurnPlan,
+): AliasLookup | DraftError {
+  const raw = input[field];
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return draftError('invalid_input', `\`${field}\` es obligatorio: es un alias (e:3, f:7, r:2 o new:1).`);
+  }
+  return plan.resolveAliasOf(raw, expected, field);
+}
+
+const CLASSIFIER_KINDS: ElementKind[] = [
+  'CLASS',
+  'INTERFACE',
+  'ENUMERATION',
+  'DATATYPE',
+  'PRIMITIVE_TYPE',
+  'PACKAGE',
+];
+
+const VISIBILITIES: Visibility[] = ['PUBLIC', 'PRIVATE', 'PROTECTED', 'PACKAGE'];
+
+const RELATIONSHIP_KINDS: RelationshipKind[] = [
+  'ASSOCIATION',
+  'GENERALIZATION',
+  'INTERFACE_REALIZATION',
+  'DEPENDENCY',
+  'USAGE',
+];
+
+const AGGREGATIONS: AggregationKind[] = ['NONE', 'SHARED', 'COMPOSITE'];
+
+const PARAMETER_DIRECTIONS = ['IN', 'OUT', 'INOUT'] as const;
+
+/** El catálogo de validadores, para el bucle de la rebanada 3. */
+export function hasValidator(toolName: string): boolean {
+  return VALIDATORS[toolName] !== undefined;
+}

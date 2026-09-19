@@ -10,16 +10,65 @@ import type { AiCapabilities } from '@umlive/contracts';
  * tipos neutrales.
  *
  * Especificación: `.../ai-provider-layer-backend/spec.md`, "`LlmProvider` es
- * el único contrato de acceso a modelos". Diseño: `design.md` D1/D2.
+ * el único contrato de acceso a modelos". Diseño: `design.md` D1/D2, y
+ * `ai-text-instructions/design.md` D8 (variantes `assistant`/`tool` y eco
+ * opaco).
  *
  * `apps/api` es CommonJS: los imports relativos van sin `.js`.
  */
 
-/** Un mensaje del chat, en el dialecto neutral del backend. */
-export interface LlmMessage {
-  readonly role: 'system' | 'user' | 'assistant';
-  readonly content: string;
+/**
+ * Una llamada a herramienta que devolvió el modelo, en el dialecto neutral.
+ *
+ * `opaque` es el eco que el proveedor exige reenviar en la iteración
+ * siguiente (la *thought signature* de los modelos Gemini, que el SDK expone
+ * como `providerMetadata`). Nada por encima de este puerto lo interpreta: el
+ * adaptador lo escribe, el bucle lo reenvía tal como llegó, y si es `undefined`
+ * simplemente se omite. No cuesta nada tenerlo y sin él el bucle de dos o más
+ * iteraciones puede fallar con `400` (D8, riesgo 2).
+ */
+export interface LlmToolCall {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly input: unknown;
+  readonly opaque?: unknown;
 }
+
+/**
+ * Un mensaje del chat, en el dialecto neutral del backend.
+ *
+ * Cuatro variantes, discriminadas por `role` (D8):
+ *
+ * - `system`/`user`: texto plano.
+ * - `assistant`: el texto de la respuesta más las llamadas a herramienta de esa
+ *   iteración, cada una con su eco `opaque`.
+ * - `tool`: el resultado de una llamada, de vuelta al modelo.
+ *
+ * ── Por qué TODAS las variantes llevan `content: string` ────────────────────
+ *
+ * El estimador de gasto (`ai-spend.service.ts`, `estimateCost`) pliega sobre
+ * `content.length` para acotar el costo por arriba. Ese archivo NO está entre
+ * las superficies de esta rebanada, así que el campo común se conserva en todas
+ * las variantes: para `assistant` es el mismo texto que `text`, y para `tool`
+ * es la salida ya serializada que recibe el modelo. La estimación es una cota
+ * superior, contar el texto una vez alcanza, y el tipo obliga a proveerlo en
+ * vez de dejar que el estimador lea `undefined` en runtime.
+ */
+export type LlmMessage = { readonly content: string } & (
+  | { readonly role: 'system' | 'user' }
+  | {
+      readonly role: 'assistant';
+      readonly text: string;
+      readonly toolCalls: readonly LlmToolCall[];
+    }
+  | {
+      readonly role: 'tool';
+      readonly toolCallId: string;
+      readonly toolName: string;
+      /** Resultado estructurado tal como lo produjo el servidor. */
+      readonly output: unknown;
+    }
+);
 
 /**
  * Una imagen de entrada. `data` acepta bytes crudos o base64; el adaptador la
@@ -54,11 +103,7 @@ export interface ToolDefinition {
  */
 export interface LlmCompletion {
   readonly text: string;
-  readonly toolCalls: readonly {
-    readonly toolCallId: string;
-    readonly toolName: string;
-    readonly input: unknown;
-  }[];
+  readonly toolCalls: readonly LlmToolCall[];
   readonly usage: {
     readonly inputTokens: number | null;
     readonly outputTokens: number | null;
