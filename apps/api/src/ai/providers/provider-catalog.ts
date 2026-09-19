@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import type {
   AiCapabilities,
   AiModelPrice,
@@ -61,10 +62,15 @@ export type CatalogProvider = {
 };
 
 /**
- * Las capacidades de visión llevan `maxImageBytes`/`maxImageDimension` en
- * `null`: los fija `ai-image-input` (design D1). Hasta entonces `null`
- * significa "límite no fijado", y los llamadores deben tratarlo como "sin
- * visión" (contrato `AiCapabilities`, `packages/contracts/src/ai.ts`).
+ * Las capacidades de visión de los modelos ESTÁTICOS llevan
+ * `maxImageBytes`/`maxImageDimension` en `null`: los fija `ai-image-input`
+ * (design D1). Hasta entonces `null` significa "límite no fijado", y los
+ * llamadores deben tratarlo como "sin visión" (contrato `AiCapabilities`,
+ * `packages/contracts/src/ai.ts`).
+ *
+ * `openai-compatible` es el único que no pasa por acá: su modelo es dinámico y
+ * su visión se declara desde el entorno (D9.1, `toModelView`). Los demás siguen
+ * con los límites sin fijar porque su tabla vive en `llm-provider.factory.ts`.
  */
 const VISION_LIMITS_UNSET = { maxImageBytes: null, maxImageDimension: null } as const;
 
@@ -255,7 +261,89 @@ export function toModelView(provider: AiProviderId, model: CatalogModel): AiMode
     provider,
     model: model.id,
     label: model.label,
-    capabilities: model.capabilities,
+    capabilities: capabilitiesOf(provider, model),
     price: model.price,
   };
+}
+
+/**
+ * ── D9.1: la visión de `openai-compatible` se declara ACÁ ────────────────────
+ *
+ * El proveedor `openai-compatible` no tiene modelos estáticos: su modelo se
+ * construye en `llm-provider.factory.ts` a partir de `AI_OPENAI_COMPATIBLE_*`.
+ * Esta función es la proyección por la que pasa TODO consumidor del catálogo
+ * (el panel y `AiConfigView` desde la fábrica, y la cadena de reserva desde
+ * `AiCallService`), así que es el único punto donde la declaración puede vivir y
+ * valer para los tres a la vez.
+ *
+ * Regla: las DOS variables tienen que ser enteros positivos para que el eslabón
+ * declare visión. Falta una, o cualquiera de las dos viene mal formada, y el
+ * eslabón queda como hasta ahora: **sin visión**. Un `Logger.error` deja el
+ * rastro de la variable mal cargada. Media configuración NO puede convertirse
+ * ni en un límite de cero (rechazaría todo) ni en un límite sin tope (aceptaría
+ * cualquier cosa): se trata como ausente, que es la dirección segura.
+ *
+ * Nota [2026-09-18]: el objeto de capacidades del adaptador de
+ * `openai-compatible` se arma en `llm-provider.factory.ts`, fuera de las
+ * superficies de esta corrida; por eso la declaración se aplica en la vista y
+ * no en ese archivo. `LlmProvider.describeCapabilities()` del adaptador sigue
+ * diciendo `vision: false` y nadie lo consulta para decidir visión.
+ */
+const log = new Logger('ProviderCatalog');
+
+/** Variable que declara el tope de bytes por imagen de `openai-compatible`. */
+export const COMPATIBLE_MAX_IMAGE_BYTES_ENV = 'AI_OPENAI_COMPATIBLE_MAX_IMAGE_BYTES';
+
+/** Variable que declara el tope de dimensión (el lado más largo) de `openai-compatible`. */
+export const COMPATIBLE_MAX_IMAGE_DIMENSION_ENV = 'AI_OPENAI_COMPATIBLE_MAX_IMAGE_DIMENSION';
+
+type VisionDeclaration = Pick<AiCapabilities, 'vision' | 'maxImageBytes' | 'maxImageDimension'>;
+
+/** Sin visión: es lo que devuelve cualquier configuración incompleta o mal formada. */
+const NO_VISION: VisionDeclaration = { vision: false, maxImageBytes: null, maxImageDimension: null };
+
+/**
+ * Los límites de imagen declarados por el entorno para `openai-compatible`.
+ *
+ * El entorno entra por PARÁMETRO (con `process.env` por defecto) para que la
+ * regla sea verificable sin tocar el proceso: es la misma razón por la que la
+ * fábrica lee con `ConfigService` en vez de con `process.env` directo.
+ */
+export function openAiCompatibleVision(
+  env: NodeJS.ProcessEnv = process.env,
+): VisionDeclaration {
+  const maxImageBytes = positiveInteger(env[COMPATIBLE_MAX_IMAGE_BYTES_ENV], COMPATIBLE_MAX_IMAGE_BYTES_ENV);
+  const maxImageDimension = positiveInteger(env[COMPATIBLE_MAX_IMAGE_DIMENSION_ENV], COMPATIBLE_MAX_IMAGE_DIMENSION_ENV);
+
+  if (maxImageBytes === null || maxImageDimension === null) return NO_VISION;
+  return { vision: true, maxImageBytes, maxImageDimension };
+}
+
+/**
+ * Entero positivo, o `null` si la variable está ausente o mal formada.
+ *
+ * Ausente no es un error (es el estado normal de un entorno sin el falso de
+ * `ai-image-input`); mal formada SÍ, y se reporta con `Logger.error`. Un
+ * `parseInt` suelto aceptaría `1024px` como 1024, así que la forma se valida
+ * antes de convertir.
+ */
+function positiveInteger(raw: string | undefined, key: string): number | null {
+  if (raw === undefined || raw === null) return null;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    log.error(`${key} inválida: "${raw}"; se trata como ausente y el eslabón queda sin visión`);
+    return null;
+  }
+  const parsed = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    log.error(`${key} inválida: "${raw}"; se trata como ausente y el eslabón queda sin visión`);
+    return null;
+  }
+  return parsed;
+}
+
+/** Las capacidades del modelo: para `openai-compatible`, las de la vista con su visión declarada. */
+function capabilitiesOf(provider: AiProviderId, model: CatalogModel): AiCapabilities {
+  if (provider !== 'openai-compatible') return model.capabilities;
+  return { ...model.capabilities, ...openAiCompatibleVision() };
 }

@@ -73,10 +73,22 @@ export type LlmMessage = { readonly content: string } & (
 /**
  * Una imagen de entrada. `data` acepta bytes crudos o base64; el adaptador la
  * traduce a `FilePart` (design D2). `ImagePart` del SDK está deprecado.
+ *
+ * ── Por qué `width`/`height` son OBLIGATORIOS (D9.3 de `ai-image-input`) ────
+ *
+ * La cadena descarta los eslabones cuyo límite declarado no entra con la imagen
+ * («`maxImageDimension` = 1024» y una foto de 2048 de ancho), y la reserva de
+ * gasto cuenta los tokens de la imagen con sus dimensiones (`imageTokenBound`).
+ * Ninguna de las dos cosas se puede decidir DESPUÉS de codificar el archivo: el
+ * que construye la imagen ya leyó sus dimensiones del encabezado con
+ * `readImageDimensions`, así que las pasa y el tipo obliga a que las pase en vez
+ * de dejar que el filtro lea `undefined` en runtime.
  */
 export interface LlmImage {
   readonly mediaType: string;
   readonly data: string | Uint8Array;
+  readonly width: number;
+  readonly height: number;
 }
 
 /**

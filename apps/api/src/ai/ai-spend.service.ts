@@ -5,7 +5,7 @@ import { Prisma } from '../generated/prisma/client';
 import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { MAX_OUTPUT_TOKENS } from './providers/ai-sdk.provider';
-import type { LlmMessage, ToolDefinition } from './providers/llm-provider.interface';
+import type { LlmImage, LlmMessage, ToolDefinition } from './providers/llm-provider.interface';
 
 /**
  * El libro de gasto (design D3). Es el freno que existe ANTES de que exista un
@@ -63,6 +63,69 @@ const MTOK = new Prisma.Decimal(1_000_000);
 const TRANSACTION_TIMEOUT_MS = 5_000;
 const TRANSACTION_MAX_WAIT_MS = 2_000;
 
+/**
+ * ── La cota de tokens de una imagen (D9.2, CORREGIDA el 2026-09-18) ──────────
+ *
+ * El diseño original asumía `ceil(w·h / 500)`. Esa fórmula NO es la regla
+ * oficial y, en el caso documentado, SUBESTIMABA: una reserva corta es un turno
+ * que se pasa del techo sin que nada lo frene, porque el techo se comprueba
+ * ANTES del llamado y la liquidación posterior no puede deshacer lo gastado.
+ *
+ * La regla oficial del proveedor por defecto (Gemini), verificada contra
+ * `https://ai.google.dev/gemini-api/docs/tokens` y
+ * `https://ai.google.dev/gemini-api/docs/image-understanding`:
+ *
+ * 1. Una imagen de **≤ 384 px de cada lado** cuenta **258 tokens** planos.
+ * 2. Cualquier imagen más grande se tesela: la unidad de recorte es
+ *    `min(floor(min(w, h) / 1.5), 768)` y la grilla es
+ *    `ceil(w / unidad) × ceil(h / unidad)`, con **258 tokens por tesela**.
+ *    El ejemplo documentado: `960×540` → unidad `360` → grilla `3×2` →
+ *    **6 teselas ≈ 1 548 tokens** (la fórmula vieja daba 1 037, un 27% menos).
+ * 3. Lo que supera el máximo del modelo se escala a lo sumo a **3072×3072**
+ *    ANTES de contar, así que las dimensiones se acotan ahí primero.
+ *
+ * El `768` reconcilia las dos frases de la documentación: el ejemplo fija la
+ * unidad en `min(1.5)` y la doc dice que las teselas son de `768×768`. Cuando
+ * discrepan se toma la tesela MÁS CHICA, que da MÁS teselas y por lo tanto una
+ * cota más alta: la dirección segura es sobreestimar.
+ *
+ * Caveats anotados, no accionados: (a) la misma imagen puede contar distinto en
+ * Vertex AI que en la API de Gemini (un `700×1003` reportado como ~258 contra
+ * ~1806); (b) el cuerpo inline del pedido está acotado a **20 MB en total**
+ * (prompt + sistema + imagen), no solo por imagen.
+ */
+const IMAGE_FLAT_MAX_SIDE = 384;
+const IMAGE_TILE_MAX_SIDE = 768;
+const IMAGE_TILE_TOKENS = 258;
+
+/** Lado máximo del proveedor por defecto antes de contar: por encima se escala. */
+export const IMAGE_MAX_SIDE_BEFORE_COUNT = 3_072;
+
+/**
+ * Cota superior de tokens de UNA imagen, con la regla de teselas oficial.
+ *
+ * Una dimensión inválida (`NaN`, negativa o cero) NO cae a una cota chica: se
+ * trata como el máximo del modelo, porque un dato roto no puede abaratar la
+ * reserva.
+ */
+export function imageTokenBound(width: number, height: number): number {
+  const w = clampImageSide(width);
+  const h = clampImageSide(height);
+
+  if (w <= IMAGE_FLAT_MAX_SIDE && h <= IMAGE_FLAT_MAX_SIDE) return IMAGE_TILE_TOKENS;
+
+  const cropUnit = Math.min(Math.floor(Math.min(w, h) / 1.5), IMAGE_TILE_MAX_SIDE);
+  const columns = Math.ceil(w / cropUnit);
+  const rows = Math.ceil(h / cropUnit);
+  return columns * rows * IMAGE_TILE_TOKENS;
+}
+
+/** El lado, ya escalado al máximo del modelo (regla 3 de la cota). */
+function clampImageSide(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) return IMAGE_MAX_SIDE_BEFORE_COUNT;
+  return Math.min(Math.floor(value), IMAGE_MAX_SIDE_BEFORE_COUNT);
+}
+
 /** Motivo por el que el libro rechaza un turno. Ni `ceiling` ni `ceiling_not_configured` escriben fila. */
 export type SpendRejection =
   | { readonly ok: false; readonly reason: 'ceiling' }
@@ -79,11 +142,24 @@ export interface ActualCallCost {
   readonly outputTokens: number;
 }
 
-/** Lo que hay que estimar para reservar: instrucciones, mensajes y herramientas. */
+/** Lo que hay que estimar para reservar: instrucciones, mensajes, herramientas e imágenes. */
 export interface EstimatePayload {
   readonly instructions?: string;
   readonly messages: readonly LlmMessage[];
   readonly tools: readonly ToolDefinition[];
+  /**
+   * Las imágenes del turno, con sus dimensiones (D9.2). Un turno de texto no las
+   * trae y su estimación no cambia.
+   */
+  readonly images?: readonly LlmImage[];
+  /**
+   * Iteraciones ESPERADAS del bucle que va a reenviar esas imágenes. La reserva
+   * de un turno de imagen se hace una sola vez, antes de la primera iteración,
+   * así que tiene que cubrir todas: contar la imagen una vez subestima la
+   * reserva por un factor igual a la cantidad de iteraciones. Por defecto 1, que
+   * es lo correcto para el costo de UN llamado.
+   */
+  readonly imageIterations?: number;
 }
 
 export interface OpenTurnInput {
@@ -294,9 +370,14 @@ export class AiSpendService {
   /**
    * Estimación del turno (tarea 4.3): `ceil(chars/3)` de instrucciones,
    * mensajes y `JSON.stringify(tools)`, por el precio de entrada, más
-   * `MAX_OUTPUT_TOKENS` por el precio de salida. Es una COTA SUPERIOR: si la
-   * heurística se queda corta, la liquidación puede pasar el techo por centavos
-   * y el turno siguiente ya se rechaza.
+   * `MAX_OUTPUT_TOKENS` por el precio de salida, más la cota de tokens de cada
+   * imagen por la cantidad de iteraciones esperadas (D9.2). Es una COTA
+   * SUPERIOR: si la heurística se queda corta, la liquidación puede pasar el
+   * techo por centavos y el turno siguiente ya se rechaza.
+   *
+   * La imagen se cuenta aparte del texto porque el proveedor la cobra aparte: no
+   * viaja como caracteres en `messages`. Y se cuenta POR ITERACIÓN porque el
+   * bucle la reenvía entera en cada vuelta.
    */
   estimateCost(
     model: AiModelView,
@@ -309,14 +390,32 @@ export class AiSpendService {
       JSON.stringify(payload.tools).length;
 
     // `chars` es una CUENTA, no un monto: entra a la aritmética de dinero ya
-    // convertido a `Decimal`.
-    const inputTokens = new Prisma.Decimal(chars).div(3).ceil();
+    // convertido a `Decimal`. Los tokens de imagen también: son cuentas enteras.
+    const textTokens = new Prisma.Decimal(chars).div(3).ceil();
+    const imageTokens = this.imageTokensOf(payload);
+    const inputTokens = textTokens.add(imageTokens);
     const inputCost = inputTokens.mul(model.price.inputPerMtokUsd).div(MTOK);
     const outputCost = new Prisma.Decimal(maxOutputTokens)
       .mul(model.price.outputPerMtokUsd)
       .div(MTOK);
 
     return inputCost.add(outputCost);
+  }
+
+  /**
+   * La cota de tokens de las imágenes del turno, ya multiplicada por las
+   * iteraciones esperadas (D9.2). Sin imágenes devuelve cero, así que un turno
+   * de texto estima exactamente lo mismo que antes.
+   */
+  private imageTokensOf(payload: EstimatePayload): Prisma.Decimal {
+    const images = payload.images ?? [];
+    if (images.length === 0) return new Prisma.Decimal(0);
+
+    const onePass = images.reduce((sum, image) => sum + imageTokenBound(image.width, image.height), 0);
+    // `Math.max(1, ...)` y no el valor crudo: una reserva de cero iteraciones
+    // sería una reserva de cero tokens para una imagen que igual se va a mandar.
+    const iterations = Math.max(1, Math.floor(payload.imageIterations ?? 1));
+    return new Prisma.Decimal(onePass * iterations);
   }
 
   /**

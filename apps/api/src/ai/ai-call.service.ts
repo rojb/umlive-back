@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { AI_ERROR, type AiHealthCheckResult, type AiHealthCheckStep, type AiHealthCheckStepKind, type AiModelRef, type AiModelView, type AiProviderId } from '@umlive/contracts';
+import { AI_ERROR, type AiCapabilities, type AiHealthCheckResult, type AiHealthCheckStep, type AiHealthCheckStepKind, type AiModelRef, type AiModelView, type AiProviderId } from '@umlive/contracts';
 import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { AiConfigService } from './ai-config.service';
@@ -51,6 +51,17 @@ import type {
 
 /** Primario + 3 eslabones de reserva como máximo (design D4). */
 const MAX_CHAIN_LINKS = 4;
+
+/**
+ * Iteraciones que la reserva de un turno de imagen tiene que cubrir (D9.2).
+ *
+ * El bucle de imagen se corta a 6 iteraciones (D5) y **cada una reenvía la
+ * imagen entera**. La reserva se hace UNA vez, antes de la primera iteración, así
+ * que contar la imagen una sola vez la deja corta por un factor de 6. Este
+ * número es el tope de D5, no una medición: la reserva es una cota superior y la
+ * liquidación la ajusta después con el uso real.
+ */
+export const IMAGE_EXPECTED_ITERATIONS = 6;
 
 /**
  * `prompt_text` de toda fila del chequeo de salud (tarea 7.7). Es también el
@@ -195,7 +206,8 @@ export class AiCallService {
    */
   async startTurn(request: AiCallRequest): Promise<StartTurnResult> {
     const resolved = await this.config.resolveForCall(request.projectId);
-    const requiresVision = (request.images?.length ?? 0) > 0;
+    const images = request.images ?? [];
+    const requiresVision = images.length > 0;
     const requiresToolCalling = (request.tools?.length ?? 0) > 0;
 
     const chain = this.buildChain(
@@ -204,6 +216,9 @@ export class AiCallService {
       requiresVision,
       requiresToolCalling,
       resolved.credentialFor,
+      // La primera imagen es la del turno (`files: 1` en multer, D1): con ella se
+      // descartan los eslabones cuyo límite declarado no entra.
+      images[0],
     );
     if (chain.length === 0) {
       this.log.warn(
@@ -221,7 +236,9 @@ export class AiCallService {
       inputMode: request.inputMode,
       promptText: request.promptText,
       model: primary,
-      estimate: this.spend.estimateCost(primary, this.payloadOf(request)),
+      // La reserva del turno cubre TODAS las iteraciones esperadas del bucle, que
+      // en un turno de imagen reenvían la imagen entera (D9.2).
+      estimate: this.spend.estimateCost(primary, this.payloadOf(request, this.expectedIterations(requiresVision))),
     });
     if (!opened.ok) return opened;
 
@@ -244,7 +261,10 @@ export class AiCallService {
    * del segundo en adelante se reserva con `reserveCall` ANTES de llamar.
    */
   async call(turn: AiTurn, request: AiCallRequest): Promise<AiCallResult> {
-    const payload = this.payloadOf(request);
+    // Cada intento de la cadena se estima por UN llamado: la reserva del primer
+    // intento ya cubría las iteraciones esperadas del bucle (D9.2), y acá se
+    // liquida el uso real de este llamado.
+    const payload = this.payloadOf(request, 1);
     const images = request.images ?? [];
     const tools = request.tools ?? [];
     let fallbackFrom: string | null = null;
@@ -450,7 +470,7 @@ export class AiCallService {
       promptText: HEALTH_CHECK_PROMPT,
       messages: [{ role: 'user', content: HEALTH_CHECK_PROMPT }],
       ...(kind === 'vision'
-        ? { images: [{ mediaType: 'image/png', data: HEALTH_CHECK_IMAGE_BASE64 }] }
+        ? { images: [{ mediaType: 'image/png', data: HEALTH_CHECK_IMAGE_BASE64, width: 1, height: 1 }] }
         : {}),
       ...(kind === 'toolCalling' ? { tools: [HEALTH_CHECK_TOOL] } : {}),
     };
@@ -484,11 +504,13 @@ export class AiCallService {
    * (incluida una credencial `unreadable`) y lo que no declara la capacidad
    * exigida.
    *
-   * Nota de tensión declarada (nota [3.2] de `tasks.md`): el filtro usa el
-   * booleano `capabilities.vision`, no `maxImageBytes === null`. Los límites de
-   * tamaño de imagen con `null` los hace cumplir `ai-image-input`; si acá se
-   * tratara `null` como "sin visión", ningún modelo del catálogo sería capaz
-   * de recibir una imagen y FR-D13 quedaría inejercitable.
+   * Nota [3.2] de `tasks.md` (respuesta de D9.3): el filtro usa el booleano
+   * `capabilities.vision`, no `maxImageBytes === null`. Los límites SIN DECLARAR
+   * (`null`) no excluyen a nadie —si excluyeran, ningún modelo del catálogo
+   * podría recibir una imagen y FR-D13 quedaría inejercitable—; lo que excluye
+   * es violar un límite DECLARADO, porque ese eslabón devolvería un error del
+   * proveedor DESPUÉS de haber reservado el gasto. `openai-compatible` declara
+   * los dos límites o ninguno (D9.1), así que ahí no hay medio camino.
    */
   private buildChain(
     primary: AiModelView,
@@ -496,6 +518,7 @@ export class AiCallService {
     requiresVision: boolean,
     requiresToolCalling: boolean,
     credentialFor: (provider: AiProviderId) => ProviderCredential,
+    image: LlmImage | undefined,
   ): AiModelView[] {
     const seen = new Set<string>();
     const chain: AiModelView[] = [];
@@ -507,6 +530,16 @@ export class AiCallService {
 
       if (requiresVision && !model.capabilities.vision) continue;
       if (requiresToolCalling && !model.capabilities.toolCalling) continue;
+      // D9.3: la imagen descarta los eslabones que la rechazarían por bytes o por
+      // dimensión. Se saltea acá y no en el bucle para no reservar por un eslabón
+      // que jamás se va a llamar.
+      if (image !== undefined && !imageFitsDeclaredLimits(image, model.capabilities)) {
+        this.log.warn(
+          `eslabón ${ref} descartado: la imagen de ${image.width}×${image.height} no entra en ` +
+            `sus límites declarados (${describeLimits(model.capabilities)})`,
+        );
+        continue;
+      }
       // El filtro mira la CREDENCIAL, no solo la disponibilidad del entorno: un
       // proyecto con clave BYO ilegible para `anthropic` no puede terminar
       // llamando a Anthropic con `ANTHROPIC_API_KEY` (parada dura de 7.10).
@@ -519,13 +552,52 @@ export class AiCallService {
     return chain;
   }
 
-  private payloadOf(request: AiCallRequest) {
+  /**
+   * Iteraciones esperadas del bucle de este turno: las de imagen, que reenvían
+   * la imagen, o una sola para un turno de texto (D9.2).
+   */
+  private expectedIterations(requiresVision: boolean): number {
+    return requiresVision ? IMAGE_EXPECTED_ITERATIONS : 1;
+  }
+
+  private payloadOf(request: AiCallRequest, imageIterations: number) {
     return {
       instructions: request.instructions,
       messages: request.messages,
       tools: request.tools ?? [],
+      images: request.images ?? [],
+      imageIterations,
     };
   }
+}
+
+/**
+ * ¿La imagen entra en los límites DECLARADOS del eslabón? (D9.3.)
+ *
+ * Los dos límites son independientes: alcanza con violar uno para que el
+ * eslabón devuelva un `400` sobre un pedido ya reservado. Un límite `null` está
+ * sin declarar y no rechaza nada (nota [3.2]).
+ */
+function imageFitsDeclaredLimits(image: LlmImage, capabilities: AiCapabilities): boolean {
+  if (capabilities.maxImageBytes !== null && imageBytes(image) > capabilities.maxImageBytes) return false;
+  if (capabilities.maxImageDimension !== null && Math.max(image.width, image.height) > capabilities.maxImageDimension) {
+    return false;
+  }
+  return true;
+}
+
+/** Bytes reales de la imagen; en base64 se calculan sin asignar un `Buffer` nuevo. */
+function imageBytes(image: LlmImage): number {
+  if (typeof image.data !== 'string') return image.data.byteLength;
+  const padding = image.data.endsWith('==') ? 2 : image.data.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((image.data.length * 3) / 4) - padding);
+}
+
+/** Los límites declarados, para el `Logger.warn` del eslabón descartado. */
+function describeLimits(capabilities: AiCapabilities): string {
+  const bytes = capabilities.maxImageBytes === null ? 'sin declarar' : `${capabilities.maxImageBytes} B`;
+  const dimension = capabilities.maxImageDimension === null ? 'sin declarar' : `${capabilities.maxImageDimension} px`;
+  return `bytes ${bytes}, dimensión ${dimension}`;
 }
 
 /** Error legible para `error_message` y el log: nunca se guarda un objeto crudo. */

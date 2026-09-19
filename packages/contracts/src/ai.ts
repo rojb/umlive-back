@@ -328,6 +328,115 @@ export const AI_TURN_ERROR = {
   TURN_IN_PROGRESS: 'ai_turn_in_progress',
   /** Ningún eslabón de la cadena declara `toolCalling`: `409`. */
   TOOL_CALLING_UNAVAILABLE: 'ai_tool_calling_unavailable',
+  /** El archivo supera el tope de la subida: `413`, con `limitBytes`. */
+  IMAGE_TOO_LARGE: 'image_too_large',
+  /** La firma de los bytes no es PNG/JPEG/WebP: `415`. */
+  IMAGE_TYPE_UNSUPPORTED: 'image_type_unsupported',
+  /** La firma es válida pero la estructura no se puede leer entera (JPEG truncado): `422`. */
+  IMAGE_UNREADABLE: 'image_unreadable',
+  /** La imagen no entra en los límites declarados del eslabón efectivo: `422`. */
+  IMAGE_EXCEEDS_PROVIDER_LIMITS: 'image_exceeds_provider_limits',
+  /** Ningún eslabón de la cadena declara `vision` y `toolCalling`: `409`. */
+  AI_VISION_UNAVAILABLE: 'ai_vision_unavailable',
+  /** Modo `create` sobre un diagrama con elementos (PO-4): `409`. */
+  AI_IMAGE_CREATE_REQUIRES_EMPTY_DIAGRAM: 'ai_image_create_requires_empty_diagram',
+  /** La vista previa venció o se perdió en un reinicio: `410`. */
+  AI_PREVIEW_EXPIRED: 'ai_preview_expired',
+  /** El diagrama cambió desde que se armó el plan (PO-D): `409`, con `reason`. */
+  AI_PREVIEW_STALE: 'ai_preview_stale',
+  /** La confirmación nombró un índice que el plan no tiene: `400`. */
+  AI_PREVIEW_ITEM_UNKNOWN: 'ai_preview_item_unknown',
 } as const;
 
 export type AiTurnErrorCode = (typeof AI_TURN_ERROR)[keyof typeof AI_TURN_ERROR];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Entrada de imagen (M6, rebanada 3/4 — `ai-image-input`)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Especificación: `.../ai-image-input-backend/spec.md` (FR-D21, FR-D22, FR-D23,
+// FR-D25, SC-D02, SC-D16, SC-D18) y `.../ai-image-input-frontend/spec.md`.
+// Diseño: `design.md` D2, D6, D7, D8 y D9.
+//
+// Un turno de imagen es un turno de texto partido en dos pedidos: planificar
+// (devuelve `AiImagePreview`, cero escrituras) y confirmar (devuelve
+// `AiImageConfirmResult`, un solo lote). Mismas reglas de siempre: ningún tipo
+// de acá lleva clave ni credencial, y ningún monto viaja como `number`.
+
+export type AiImageMode = 'create' | 'modify';
+
+/**
+ * Por qué un ítem arranca con `confidence: 'low'` (PO-2, D6).
+ *
+ * - `model`: el propio modelo lo declaró dudoso.
+ * - `multiplicity_unparsed`: el servidor no pudo interpretar una multiplicidad.
+ * - `name_suspicious`: el nombre trae caracteres fuera de `[\p{L}\p{N}_]`.
+ */
+export type AiPreviewLowReason = 'model' | 'multiplicity_unparsed' | 'name_suspicious';
+
+/**
+ * Un ítem de la vista previa: UNA llamada a herramienta aceptada (D6).
+ *
+ * `dependsOn` son los ítems que producen los `new:N` que este ítem referencia, y
+ * **solo apunta hacia atrás**: por eso el cierre de exclusiones se calcula en
+ * una sola pasada. `initiallyExcluded` es `true` para todo ítem de baja
+ * confianza y para todo ítem que dependa, directa o indirectamente, de uno.
+ */
+export interface AiPreviewItem {
+  readonly index: number;
+  /** Etiqueta en lenguaje simple: «Clase Pedido». */
+  readonly label: string;
+  readonly kind: 'class' | 'attribute' | 'operation' | 'relationship';
+  readonly confidence: 'high' | 'low';
+  readonly lowReasons: readonly AiPreviewLowReason[];
+  readonly note: string | null;
+  readonly dependsOn: readonly number[];
+  readonly initiallyExcluded: boolean;
+}
+
+/**
+ * La vista previa de un turno de imagen (SC-D18, mitad servidor).
+ *
+ * No lleva ningún byte de la imagen: solo el plan, su costo ya liquidado y el
+ * momento en que vence. `truncated: true` es la marca de PO-C — el bucle agotó
+ * sus iteraciones y el plan está incompleto, nunca `FAILED`.
+ */
+export interface AiImagePreview {
+  readonly turnId: string;
+  readonly mode: AiImageMode;
+  /** ISO: vencimiento del TTL de la vista previa (D8). */
+  readonly expiresAt: string;
+  readonly items: readonly AiPreviewItem[];
+  readonly notApplied: AiTurnSummary['notApplied'];
+  readonly modelText: string;
+  readonly costUsd: string;
+  readonly iterations: number;
+  readonly truncated: boolean;
+  readonly provider: string;
+  readonly model: string;
+  readonly fallbackFired: boolean;
+  readonly fallbackFrom: string | null;
+}
+
+/**
+ * Cuerpo de `POST .../ai/turns/:turnId/confirm` (PO-2).
+ *
+ * Los índices son los ítems que el usuario DESTILDÓ. El servidor los valida
+ * como enteros únicos dentro del rango de su plan y recalcula el cierre: nunca
+ * confía en el cierre que armó el cliente.
+ */
+export interface AiConfirmTurnRequest {
+  readonly excluded: readonly number[];
+}
+
+/**
+ * Respuesta de la confirmación (D6, D8): el resultado del turno más el cierre
+ * de exclusiones que el servidor aplicó de verdad.
+ *
+ * `alreadyConfirmed` es el eco del doble clic: el plan ya estaba aplicado y no
+ * se aplicó una segunda vez.
+ */
+export type AiImageConfirmResult = AiTurnResult & {
+  readonly excludedClosure: readonly number[];
+  readonly alreadyConfirmed?: true;
+};
