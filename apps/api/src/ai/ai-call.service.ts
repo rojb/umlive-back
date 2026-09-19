@@ -1,6 +1,6 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { AI_ERROR, type AiHealthCheckResult, type AiHealthCheckStep, type AiHealthCheckStepKind, type AiModelRef, type AiModelView, type AiProviderId } from '@umlive/contracts';
-import type { AiInputMode } from '../generated/prisma/enums';
+import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { AiConfigService } from './ai-config.service';
 import { AiSpendService, type SpendRejection } from './ai-spend.service';
@@ -129,6 +129,32 @@ export type AiCallResult =
       readonly fallbackFired: boolean;
       readonly fallbackFrom: string | null;
     };
+
+/**
+ * Cómo se cierra la fila `ai_turns` de un turno. `status` sale del LLAMADOR y no
+ * se deriva del `AiCallResult`: desde `ai-text-instructions` el estado final del
+ * turno lo decide la APLICACIÓN (un `REJECTED` por lock ajeno tuvo un último
+ * llamado exitoso), no el último `call`. El chequeo de salud sigue derivándolo
+ * del resultado, que para él es lo mismo.
+ */
+export interface CloseCallInput {
+  readonly status: AiTurnStatus;
+  /** Iteraciones de tool-calling que consumió el turno (SC-D14). */
+  readonly iterations: number;
+  readonly errorMessage: string | null;
+}
+
+/**
+ * Lo que `finishTurn` deja para armar el resultado del turno: el costo que ya
+ * quedó escrito y el eslabón que respondió (FR-D12, D10).
+ */
+export interface AiTurnClose {
+  readonly costUsd: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly fallbackFired: boolean;
+  readonly fallbackFrom: string | null;
+}
 
 /**
  * Resultado de un chequeo de salud (FR-D13) tal como lo necesita el
@@ -306,35 +332,31 @@ export class AiCallService {
     };
   }
 
-  /** Cierra la fila con el eslabón que respondió (o con el error) y la latencia real. */
-  async finishTurn(turn: AiTurn, result: AiCallResult): Promise<void> {
+  /**
+   * Cierra la fila con el eslabón que respondió (o con el error), la latencia
+   * real, el estado final y las iteraciones. Devuelve el costo YA escrito, que
+   * el turno de IA necesita para su `AiTurnResult`.
+   */
+  async finishTurn(turn: AiTurn, result: AiCallResult, close: CloseCallInput): Promise<AiTurnClose> {
     const latencyMs = Date.now() - turn.startedAt;
+    // El eslabón que respondió si lo hubo; el primario si el turno no llegó a
+    // que ninguno contestara.
+    const provider = result.ok ? result.model.provider : turn.primary.provider;
+    const model = result.ok ? result.model.model : turn.primary.model;
 
-    if (result.ok) {
-      await this.spend.closeTurn({
-        turnId: turn.turnId,
-        status: 'APPLIED',
-        provider: result.model.provider,
-        model: result.model.model,
-        fallbackFired: result.fallbackFired,
-        fallbackFrom: result.fallbackFrom,
-        latencyMs,
-        errorMessage: null,
-      });
-      return;
-    }
-
-    await this.spend.closeTurn({
+    const costUsd = await this.spend.closeTurn({
       turnId: turn.turnId,
-      // Un abort es cancelación, no fallo del proveedor.
-      status: result.aborted ? 'CANCELLED' : 'FAILED',
-      provider: turn.primary.provider,
-      model: turn.primary.model,
+      status: close.status,
+      provider,
+      model,
       fallbackFired: result.fallbackFired,
       fallbackFrom: result.fallbackFrom,
       latencyMs,
-      errorMessage: result.errorMessage,
+      iterations: close.iterations,
+      errorMessage: close.errorMessage,
     });
+
+    return { costUsd, provider, model, fallbackFired: result.fallbackFired, fallbackFrom: result.fallbackFrom };
   }
 
   /**
@@ -442,7 +464,14 @@ export class AiCallService {
     }
 
     const result = await this.call(started.turn, request);
-    await this.finishTurn(started.turn, result);
+    // Un paso es un turno de un solo llamado: `iterations = 1`. El estado sigue
+    // saliendo del resultado, que para un único llamado es lo mismo que decide
+    // el llamador del turno real.
+    await this.finishTurn(started.turn, result, {
+      status: result.ok ? 'APPLIED' : result.aborted ? 'CANCELLED' : 'FAILED',
+      iterations: 1,
+      errorMessage: result.ok ? null : result.errorMessage,
+    });
 
     return {
       kind: 'step',

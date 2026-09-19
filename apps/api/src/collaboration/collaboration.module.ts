@@ -53,6 +53,11 @@ import { ReconnectService } from './reconnect.service';
   imports: [AuthModule, ProjectsModule, UmlModule],
   controllers: [DiagramFreezeController, MemberRemovalController, DiagramDeletionController],
   providers: [LocksService, CollaborationGateway, OperationsService, OperationDispatcher, ReconnectService, DiagramFreezeService],
-  exports: [LocksService],
+  // `LocksService` desde M3. Desde `ai-text-instructions` (rebanada 2/4 de M6,
+  // tarea 4.5) también `OperationsService` y `CollaborationGateway`: el turno
+  // de IA necesita aplicar su lote por la MISMA puerta que un humano, liberar
+  // los locks que tomó y difundir después del `COMMIT`. Nadie importa
+  // `AiModule`, así que la dependencia va en un solo sentido y no hay ciclo.
+  exports: [LocksService, OperationsService, CollaborationGateway],
 })
 export class CollaborationModule {}

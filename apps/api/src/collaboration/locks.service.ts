@@ -30,6 +30,16 @@ export type LockOutcome =
   | { ok: false; holder: LockHolder };
 
 /**
+ * Resultado de `acquireAllTracked`: como `LockAllOutcome`, pero dice QUÉ TOMÓ
+ * (`taken`), que es lo único que el turno puede soltar al terminar. `taken`
+ * puede ser más chico que `ids` — justo cuando el titular ya tenía parte de lo
+ * que pide.
+ */
+export type TrackedLockOutcome =
+  | { ok: true; taken: string[]; expiresAt: number }
+  | { ok: false; elementId: string; holder: LockHolder };
+
+/**
  * La compuerta del diagrama está cerrada (`diagram-freeze` D4). Variante propia
  * y NO `holder` opcional: un diagrama congelado no tiene tenedor, y por eso
  * `r.holder` después de `!r.ok` deja de compilar en los dos handlers del
@@ -184,6 +194,47 @@ export class LocksService implements OnModuleDestroy {
       expiresAt = r.expiresAt;
     }
     return { ok: true, expiresAt };
+  }
+
+  /**
+   * Adquisición de la UNIÓN de objetivos de un turno, con la foto de lo que el
+   * usuario YA tenía (M6, rebanada 2/4 — `ai-text-instructions` D1, instrucción
+   * #3 de #2308).
+   *
+   * Devuelve `taken` — los ids que el llamador tiene que soltar al terminar—,
+   * que es `ids − preHeld`. Sin esa resta, terminar un turno soltaría locks que
+   * la persona ya tenía ANTES de pedirlo: el turno le sacaría a Mariana el
+   * bloqueo de la clase que estaba editando, y su siguiente pulsación de tecla
+   * iría a un elemento que ya no tiene tomado.
+   *
+   * 🔴 **La foto se toma ANTES de `acquireAll`, en el MISMO tick, y por eso
+   * esto es SÍNCRONO: cero puntos de suspensión entre la foto y la toma.**
+   * Dejarlo en el llamador ("sin `await` entre las dos líneas") es una
+   * disciplina que se rompe en la primera refactorización; acá, en cambio, la
+   * foto es una lectura de `Map` y `acquireAll` es de dos fases, así que entre
+   * las dos no hay nada que pueda intercalarse. Volverlo asíncrono rompería la
+   * única garantía que lo hace correcto.
+   *
+   * **Un lock propio pero VENCIDO cuenta como tomado por el turno**: el usuario
+   * ya no lo tenía, `acquire` lo recrea, y el turno es quien debe soltarlo.
+   * Se filtra por `expiresAt > now` a propósito y no se usa `heldBy()` (que lee
+   * el índice `byUser`, donde un vencido que el barrido todavía no limpió
+   * sigue apareciendo).
+   */
+  acquireAllTracked(diagramId: string, ids: readonly string[], holder: LockHolder): TrackedLockOutcome | LockFrozen {
+    const now = Date.now();
+    const locks = this.byDiagram.get(diagramId);
+    const preHeld = new Set(
+      ids.filter((id) => {
+        const lock = locks?.get(id);
+        return !!lock && lock.expiresAt > now && lock.holder.userId === holder.userId;
+      }),
+    );
+
+    const outcome = this.acquireAll(diagramId, ids, holder);
+    if (!outcome.ok) return outcome;
+
+    return { ok: true, taken: ids.filter((id) => !preHeld.has(id)), expiresAt: outcome.expiresAt };
   }
 
   // ───────────────────────────────────────────────────────────────────────────

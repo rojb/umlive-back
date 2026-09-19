@@ -18,6 +18,7 @@ import {
   type DiagramSync,
   type LockAllResult,
   type LockHolder,
+  type OperationCommitted,
   type OperationRejected,
   type OperationRequest,
   type PresenceUser,
@@ -846,6 +847,50 @@ export class CollaborationGateway implements OnGatewayInit<CollabServer>, OnGate
     });
     this.socketQueues.set(client.id, next);
     return next;
+  }
+
+  /**
+   * Difunde los hechos confirmados de un lote (M6, rebanada 2/4 —
+   * `ai-text-instructions` D10, INV-3). Cada operación va como un
+   * `op:committed` propio, en orden de versión, con `actorKind: 'AI'`,
+   * `actorId` de quien pidió el turno y su `aiTurnId` (SC-D09).
+   *
+   * **Lo llama `AiTurnService` DESPUÉS de que `applyBatch` resolvió** — o sea
+   * después del `COMMIT`. Emitir antes es cómo las otras ventanas terminan
+   * mostrando un diagrama que no existe: la operación se difundió, la
+   * transacción revirtió, y nadie revierte el `op:committed` de la sala.
+   *
+   * Es una puerta ADICIONAL, no un bypass: sale por `emitTo`, la misma puerta
+   * por sala que el resto del archivo, y mantiene la barrera de tipos y de
+   * grafo que ese método documenta (el gateway no conoce la capa de base).
+   */
+  emitCommitted(diagramId: string, committed: readonly OperationCommitted[]): void {
+    for (const payload of committed) this.emitTo(diagramId, 'op:committed', payload);
+  }
+
+  /**
+   * Quién es este usuario en la sala, para armar el `LockHolder` de un turno
+   * (D10). El color NO se recalcula acá: sale de la asignación por sala que
+   * hizo `diagram:join` (`socket.data.color`, D7 de `reconnect-and-presence`).
+   *
+   * SÍNCRONO y sobre el `Map` local del namespace, por el mismo motivo que
+   * `evictUserFromProject`: el llamador está por tomar locks y no puede
+   * permitirse un punto de suspensión.
+   *
+   * `null` si el usuario no está conectado a este diagrama; el llamador usa
+   * entonces un color neutro fijo. Que no esté conectado NO es un error: un
+   * turno puede llegar de un cliente que perdió el socket.
+   */
+  presenceHolder(diagramId: string, userId: string): LockHolder | null {
+    const socket = this.localSockets().find(
+      (candidate) => candidate.data?.diagramId === diagramId && candidate.data?.user?.id === userId,
+    );
+    if (!socket) return null;
+    return {
+      userId,
+      displayName: socket.data.user.displayName,
+      color: socket.data.color ?? presenceColor(userId),
+    };
   }
 
   /**

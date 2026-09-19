@@ -119,6 +119,13 @@ export interface CloseTurnInput {
   readonly fallbackFired: boolean;
   readonly fallbackFrom: string | null;
   readonly latencyMs: number | null;
+  /**
+   * Iteraciones de tool-calling que consumió el turno (`ai_turns.iterations`,
+   * FR-D15b.3). Lo agrega `ai-text-instructions`: es el número que SC-D14 exige
+   * (`iterations = 25`) y el que hace auditable un turno que se comió el tope.
+   * Un turno sin bucle (salud, un solo llamado) cierra con 1.
+   */
+  readonly iterations: number;
   readonly errorMessage: string | null;
 }
 
@@ -259,9 +266,15 @@ export class AiSpendService {
     });
   }
 
-  /** Cierra el turno: `status`, latencia, eslabón que respondió y error concatenado. */
-  async closeTurn(input: CloseTurnInput): Promise<void> {
-    await this.prisma.aiTurn.update({
+  /**
+   * Cierra el turno: `status`, latencia, eslabón que respondió, iteraciones y
+   * error concatenado. Devuelve el `cost_usd` que quedó en la fila — el turno
+   * de IA lo necesita para el `AiTurnResult` (FR-D12) sin volver a leerla, y el
+   * cobro NO cambia acá: un `FAILED` conserva su reserva (SC-D14: la plata se
+   * gastó aunque el turno no haya llegado a aplicarse).
+   */
+  async closeTurn(input: CloseTurnInput): Promise<string> {
+    const row = await this.prisma.aiTurn.update({
       where: { id: input.turnId },
       data: {
         status: input.status,
@@ -270,9 +283,12 @@ export class AiSpendService {
         fallbackFired: input.fallbackFired,
         fallbackFrom: input.fallbackFrom,
         latencyMs: input.latencyMs,
+        iterations: input.iterations,
         errorMessage: input.errorMessage,
       },
+      select: { costUsd: true },
     });
+    return row.costUsd.toString();
   }
 
   /**
