@@ -26,7 +26,15 @@ export type ProjectRole = 'HOST' | 'PARTICIPANT';
  * hoy, pero solo las de `enforcedSince: 'projects'` tienen ruta y controlador
  * en esta rebanada (design.md §2.1).
  */
-export type EnforcedSince = 'projects' | 'join-codes' | 'M2' | 'M4' | 'M5' | 'M6' | 'diagram-freeze';
+export type EnforcedSince =
+  | 'projects'
+  | 'join-codes'
+  | 'M2'
+  | 'M4'
+  | 'M5'
+  | 'M6'
+  | 'diagram-freeze'
+  | 'ai-provider-layer';
 
 export interface ActionRule {
   readonly roles: readonly ProjectRole[];
@@ -97,8 +105,8 @@ export const PROJECT_PERMISSIONS = {
   'diagram.edit': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M2', frA13Row: 'Edit diagram content (when unlocked)' },
   'xmi.import': { roles: ['HOST'], enforcedSince: 'M5', frA13Row: 'Import XMI into a diagram' },
   'export.run': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M5', frA13Row: 'Export XMI / generate code / export Postman' },
-  'ai.use': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'M6', frA13Row: 'Use the AI assistant on a diagram' },
-  'ai.configure': { roles: ['HOST'], enforcedSince: 'M6', frA13Row: "Change the project's AI provider / model" },
+  'ai.use': { roles: ['HOST', 'PARTICIPANT'], enforcedSince: 'ai-provider-layer', frA13Row: 'Use the AI assistant on a diagram' },
+  'ai.configure': { roles: ['HOST'], enforcedSince: 'ai-provider-layer', frA13Row: "Change the project's AI provider / model" },
 } as const satisfies Record<string, ActionRule>;
 
 export type ProjectAction = keyof typeof PROJECT_PERMISSIONS;

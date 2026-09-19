@@ -7,3 +7,4 @@ export * from './projects';
 export * from './join-codes';
 export * from './xmi';
 export * from './codegen';
+export * from './ai';
