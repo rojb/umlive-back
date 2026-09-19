@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { APP_GUARD } from '@nestjs/core';
 import { join } from 'node:path';
+import { AiModule } from './ai/ai.module';
 import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { CodegenModule } from './codegen/codegen.module';
@@ -52,7 +53,10 @@ const envFilePath = join(__dirname, '..', '.env');
     // `POST /projects/:id/diagrams/:id/codegen` con `export.run`. El ZIP se
     // arma en memoria; el generador no escribe filas ni archivos.
     CodegenModule,
-    // M6  AiModule
+    // M6 — capa de proveedores de IA (`ai-provider-layer`, rebanada 1 de 4):
+    // catálogo + adaptador + fábrica, libro de gasto y las cuatro rutas de
+    // `ai.use`/`ai.configure`.
+    AiModule,
   ],
   providers: [
     // Guard de autenticación global (design.md §5): toda ruta requiere sesión
