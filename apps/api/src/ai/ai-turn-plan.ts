@@ -1,5 +1,8 @@
 import {
   LOCK_REQUIREMENTS,
+  type AiImageMode,
+  type AiPreviewItem,
+  type AiPreviewLowReason,
   type AiTurnAppliedOp,
   type AiTurnNotAppliedCall,
   type AggregationKind,
@@ -88,7 +91,33 @@ export type NotAppliedReason =
   | 'aggregation_requires_association'
   | 'self_generalization'
   | 'op_limit_reached'
-  | 'layout_target_not_planned';
+  | 'layout_target_not_planned'
+  | 'image_turn_create_only';
+
+/**
+ * Opciones del plan (D5, D6, D7).
+ *
+ * `image` cambia tres cosas: expone solo las herramientas de creación, afloja
+ * la validación de multiplicidad (el servidor marca el ítem como dudoso en vez
+ * de tirarlo) y hace que `apply_layout` reciba el centro NORMALIZADO de la foto.
+ * `opLimit` es el tope de operaciones del turno, que depende del modo de entrada.
+ */
+export interface TurnPlanOptions {
+  readonly image?: boolean;
+  readonly opLimit?: number;
+}
+
+/** La posición normalizada (0..1) del centro de una clase en la foto (D7). */
+interface PlannedPosition {
+  readonly nx: number;
+  readonly ny: number;
+}
+
+/** Lo que produjo UNA llamada aceptada: sus operaciones y lo que la vista previa lista. */
+interface PlannedItem {
+  readonly ops: PlannedOp[];
+  readonly applied: AiTurnAppliedOp[];
+}
 
 export type ToolCallOutcome =
   | {
@@ -189,8 +218,96 @@ function replaceAtPath(
   }
 }
 
+/**
+ * Los valores de los caminos de `REF_FIELDS` de un payload, en orden de tabla.
+ * Los usa `referencedIds()` (D8) y los `dependsOn` de los ítems (D6): son las
+ * mismas referencias que `substituteRefFields` reemplaza, leídas en vez de
+ * escritas.
+ */
+function collectRefValues<T extends OperationType>(type: T, payload: PayloadFor<T>): string[] {
+  const paths = REF_FIELDS[type];
+  if (paths === undefined) return [];
+  const values: string[] = [];
+  for (const path of paths) {
+    readAtPath(payload as unknown as Record<string, unknown>, String(path).split('.'), values);
+  }
+  return values;
+}
+
+function readAtPath(node: Record<string, unknown>, segments: readonly string[], out: string[]): void {
+  const head = segments[0];
+  if (head === undefined) return;
+  const isArray = head.endsWith('[]');
+  const key = isArray ? head.slice(0, -2) : head;
+  const value = node[key];
+
+  if (isArray) {
+    if (!Array.isArray(value) || segments.length === 1) return;
+    for (const item of value) {
+      if (typeof item === 'object' && item !== null) {
+        readAtPath(item as Record<string, unknown>, segments.slice(1), out);
+      }
+    }
+    return;
+  }
+
+  if (segments.length === 1) {
+    if (typeof value === 'string') out.push(value);
+    return;
+  }
+
+  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    readAtPath(value as Record<string, unknown>, segments.slice(1), out);
+  }
+}
+
+/**
+ * El cierre de exclusiones (D6, PO-2): todo ítem que depende, directa o
+ * indirectamente, de uno excluido también queda fuera.
+ *
+ * **Una sola pasada** alcanza porque `dependsOn` SIEMPRE apunta hacia atrás y
+ * los ítems vienen en orden de plan: cuando el recorrido llega a un ítem, todos
+ * sus dependencias ya se evaluaron. Trasladar esto a un grafo con una pila no
+ * sería más correcto, sería más código.
+ *
+ * La corre el CLIENTE para mostrar el efecto al instante y la vuelve a correr
+ * el SERVIDOR sobre su propio plan en cada confirmación: la lista de excluidos
+ * que llega del cliente es una pista, jamás la verdad (FR-D24).
+ */
+export function excludeClosure(items: readonly AiPreviewItem[], seed: Iterable<number>): Set<number> {
+  const out = new Set<number>(seed);
+  for (const item of items) {
+    if (item.dependsOn.some((dependency) => out.has(dependency))) out.add(item.index);
+  }
+  return out;
+}
+
 /** Id inerte de una creación: el servidor genera el autoritativo y lo devuelve. */
 const INERT_ID = 'pending';
+
+/** Las herramientas que un turno de imagen puede aceptar (D5, PO-3). */
+const IMAGE_TOOL_NAMES = new Set<string>([
+  'create_class',
+  'add_attribute',
+  'add_operation',
+  'create_relationship',
+  'apply_layout',
+]);
+
+/** Tipo de ítem de cada herramienta de creación (D6). `apply_layout` no produce ítem. */
+const ITEM_KINDS: Partial<Record<string, AiPreviewItem['kind']>> = {
+  create_class: 'class',
+  add_attribute: 'attribute',
+  add_operation: 'operation',
+  create_relationship: 'relationship',
+};
+
+/**
+ * Un nombre sin nada fuera de `[\p{L}\p{N}_]` es el caso normal; cualquier otro
+ * carácter —un espacio, una barra, un emoji— deja el ítem en `low` con
+ * `name_suspicious` (D5). El ítem NO se descarta: entra, destildado.
+ */
+const SAFE_NAME = /^[\p{L}\p{N}_]+$/u;
 
 /** Marcador interno de una referencia al `new:N` que produce otra op de la misma llamada. */
 const SELF_PREFIX = '\u0000self:';
@@ -278,7 +395,25 @@ export class TurnPlan {
   private readonly planned: PlannedOp[] = [];
   private newCount = 0;
 
-  constructor(readonly snapshot: DiagramContent) {
+  /** Modo imagen (D5, D7): validación indulgente y posiciones normalizadas. */
+  private readonly image: boolean;
+  /** Tope de operaciones del turno; depende del modo de entrada (D5). */
+  private readonly opLimit: number;
+
+  /** Un ítem por llamada aceptada (D6), en orden de plan. */
+  private readonly itemDrafts: AiPreviewItem[] = [];
+  /** Lo que produjo cada ítem, alineado por índice con `itemDrafts`. */
+  private readonly itemProduced: PlannedItem[] = [];
+  /** `new:N` → índice del ítem que lo creó. Los `dependsOn` se resuelven con esto. */
+  private readonly itemOfLabel = new Map<string, number>();
+  /** El centro normalizado que el modelo declaró para cada `new:N` (D7). */
+  private readonly imagePositions = new Map<string, PlannedPosition>();
+  /** Marcas de baja confianza que dejó el validador de la llamada en curso. */
+  private marks: AiPreviewLowReason[] = [];
+
+  constructor(readonly snapshot: DiagramContent, options: TurnPlanOptions = {}) {
+    this.image = options.image === true;
+    this.opLimit = options.opLimit ?? MAX_OPS_PER_TURN;
     snapshot.elements.forEach((element, index) => {
       this.refs.set(`e:${index + 1}`, { kind: 'element', token: element.id });
     });
@@ -288,6 +423,11 @@ export class TurnPlan {
     snapshot.relationships.forEach((relationship, index) => {
       this.refs.set(`r:${index + 1}`, { kind: 'relationship', token: relationship.id });
     });
+  }
+
+  /** ¿Es el turno de la foto? (D5.) */
+  get imageMode(): boolean {
+    return this.image;
   }
 
   /** Las operaciones planificadas, en el orden en que se aplicarán. */
@@ -308,26 +448,38 @@ export class TurnPlan {
    * resultado de herramienta y **no** deja rastro en el plan (FR-D05, SC-D03).
    */
   addToolCall(toolName: string, input: unknown): ToolCallOutcome {
+    this.marks = [];
     const validator = VALIDATORS[toolName];
     if (validator === undefined) {
       return this.reject(toolName, 'unknown_tool', `La herramienta "${toolName}" no existe.`);
+    }
+    // En modo imagen la lista de herramientas es la del proveedor, pero un
+    // modelo puede pedir igual una que no está: acá se corta, porque una
+    // `update_element` aceptada rompería PO-3 (el turno de imagen solo crea).
+    if (this.image && !IMAGE_TOOL_NAMES.has(toolName)) {
+      return this.reject(
+        toolName,
+        'unknown_tool',
+        `La herramienta "${toolName}" no está disponible en un turno de imagen.`,
+      );
     }
 
     const record = isRecord(input) ? input : {};
     const result = validator(record, this);
     if (isDraftError(result)) return this.reject(toolName, result.error, result.message);
 
-    if (this.planned.length + result.ops.length > MAX_OPS_PER_TURN) {
+    if (this.planned.length + result.ops.length > this.opLimit) {
       return this.reject(
         toolName,
         'op_limit_reached',
-        `El plan ya tiene ${this.planned.length} operaciones y el tope es ${MAX_OPS_PER_TURN}. ` +
+        `El plan ya tiene ${this.planned.length} operaciones y el tope es ${this.opLimit}. ` +
           'No se planificó nada de esta llamada; el resto del turno sigue igual.',
       );
     }
 
     const committed = this.commit(result.ops);
     this.planned.push(...committed);
+    this.buildItem(toolName, record, committed);
     return {
       ok: true,
       result:
@@ -380,6 +532,81 @@ export class TurnPlan {
   /** Cuántos elementos crea el plan hasta ahora (para ubicar los nuevos). */
   plannedCreateCount(): number {
     return this.planned.filter((op) => op.type === 'element.create').length;
+  }
+
+  /**
+   * Los UUID EXISTENTES a los que apunta el plan: dueños, extremos y
+   * `typeElementId` (D6, D8). Es lo que el `precheck` del confirm vuelve a
+   * consultar —«¿algo posterior tocó alguno de estos?»— y el conjunto sobre el
+   * que se piden los locks. Los `new:N` del propio turno no cuentan: todavía no
+   * existen.
+   */
+  referencedIds(): string[] {
+    const ids = new Set<string>();
+    for (const op of this.planned) {
+      for (const reference of collectRefValues(op.type, op.payload)) {
+        if (!reference.startsWith('new:')) ids.add(reference);
+      }
+    }
+    return [...ids];
+  }
+
+  /**
+   * Los ítems de la vista previa (D6). `initiallyExcluded` es el cierre de las
+   * bajas confianzas: lo que depende de algo dudoso arranca destildado, aunque
+   * el propio ítem sea `high` (PO-2).
+   */
+  previewItems(): AiPreviewItem[] {
+    const low = this.itemDrafts.filter((item) => item.confidence === 'low').map((item) => item.index);
+    const closure = excludeClosure(this.itemDrafts, low);
+    return this.itemDrafts.map((item) => ({ ...item, initiallyExcluded: closure.has(item.index) }));
+  }
+
+  /** Las operaciones de cada ítem, alineadas por índice (D8: el confirm filtra por cierre). */
+  opsByItem(): PlannedOp[][] {
+    return this.itemProduced.map((entry) => entry.ops);
+  }
+
+  /** Lo que la vista previa lista por cada ítem, alineado por índice (FR-D25). */
+  appliedByItem(): AiTurnAppliedOp[][] {
+    return this.itemProduced.map((entry) => entry.applied);
+  }
+
+  /**
+   * Los `element.create` del plan, en orden de plan, con su `new:N` y el centro
+   * normalizado que el modelo declaró (o `null`): la entrada de
+   * `layoutImageItems` (D7).
+   */
+  imageCreateOps(): { label: string; index: number; position: PlannedPosition | null }[] {
+    return this.planned
+      .filter((op) => op.type === 'element.create' && op.produces !== null)
+      .map((op, index) => ({
+        label: op.produces!,
+        index,
+        position: this.imagePositions.get(op.produces!) ?? null,
+      }));
+  }
+
+  /** Aplica al `element.create` de ese `new:N` el rectángulo que resolvió el lienzo (D7). */
+  applyLayoutRect(label: string, rect: Rect): void {
+    const index = this.planned.findIndex((op) => op.type === 'element.create' && op.produces === label);
+    if (index < 0) return;
+    const op = this.planned[index]!;
+    const payload = op.payload as unknown as Record<string, unknown>;
+    this.planned[index] = { ...op, payload: { ...payload, layout: rect } } as unknown as PlannedOp;
+  }
+
+  /** Guarda el centro normalizado de un `new:N` (D7). Fuera de rango cae a la grilla, no es un error. */
+  recordImagePosition(label: string, nx: number, ny: number): void {
+    this.imagePositions.set(label, { nx, ny });
+  }
+
+  /**
+   * Marca la llamada en curso como dudosa (validación indulgente de D5). El
+   * validador la llama en vez de rechazar; el ítem nace `low` y destildado.
+   */
+  noteLow(reason: AiPreviewLowReason): void {
+    this.marks.push(reason);
   }
 
   /**
@@ -542,8 +769,7 @@ export class TurnPlan {
     return ids;
   }
 
-  /** Asigna los `new:N`, sustituye los marcadores internos y registra los alias. */
-  private commit(drafts: readonly DraftOp[]): PlannedOp[] {
+  /** Asigna los `new:N`, sustituye los marcadores internos y registra los alias. */  private commit(drafts: readonly DraftOp[]): PlannedOp[] {
     const labels = drafts.map((draft) => (draft.produces === null ? null : `new:${++this.newCount}`));
 
     return drafts.map((draft, index) => {
@@ -569,6 +795,72 @@ export class TurnPlan {
   private reject(tool: string, reason: NotAppliedReason, message: string): ToolCallOutcome {
     this.notApplied.push({ tool, reason });
     return { ok: false, error: reason, result: message };
+  }
+
+  /**
+   * Construye el ítem de una llamada aceptada (D6). Sin operaciones no hay
+   * ítem: `apply_layout` sobre un `new:N` se pliega en el create y no aparece
+   * como una fila aparte de la vista previa.
+   */
+  private buildItem(toolName: string, input: Record<string, unknown>, committed: readonly PlannedOp[]): void {
+    if (!this.image || committed.length === 0) return;
+    const kind = ITEM_KINDS[toolName];
+    if (kind === undefined) return;
+
+    const lowReasons = this.lowReasonsFor(input, committed);
+    const index = this.itemDrafts.length;
+    const note = typeof input['note'] === 'string' && input['note'].trim().length > 0 ? input['note'] : null;
+
+    this.itemDrafts.push({
+      index,
+      label: this.describe(committed[0]!),
+      kind,
+      confidence: lowReasons.length === 0 ? 'high' : 'low',
+      lowReasons,
+      note,
+      dependsOn: this.dependenciesOf(committed),
+      initiallyExcluded: false,
+    });
+    this.itemProduced.push({
+      ops: [...committed],
+      applied: committed.map((op) => ({ type: op.type, label: this.describe(op) })),
+    });
+
+    for (const op of committed) {
+      if (op.produces !== null) this.itemOfLabel.set(op.produces, index);
+    }
+  }
+
+  /**
+   * Por qué el ítem es dudoso (D5): lo que declaró el modelo (`confidence`)
+   * más lo que el servidor no pudo interpretar (marcas del validador, nombres
+   * con caracteres raros). Un solo motivo alcanza para `low`.
+   */
+  private lowReasonsFor(input: Record<string, unknown>, committed: readonly PlannedOp[]): AiPreviewLowReason[] {
+    const reasons = new Set<AiPreviewLowReason>(this.marks);
+    if (input['confidence'] === 'low') reasons.add('model');
+    for (const op of committed) {
+      const name = (op.payload as Record<string, unknown>)['name'];
+      if (typeof name === 'string' && !SAFE_NAME.test(name)) reasons.add('name_suspicious');
+    }
+    return [...reasons];
+  }
+
+  /**
+   * Los ítems que producen los `new:N` que esta llamada referencia (D6).
+   * `itemOfLabel` solo tiene los ítems YA cerrados, así que una referencia
+   * interna de la propia llamada (el parámetro que apunta a su operación) no
+   * cuenta como dependencia: es el mismo ítem.
+   */
+  private dependenciesOf(committed: readonly PlannedOp[]): number[] {
+    const deps = new Set<number>();
+    for (const op of committed) {
+      for (const reference of collectRefValues(op.type, op.payload)) {
+        const item = this.itemOfLabel.get(reference);
+        if (item !== undefined) deps.add(item);
+      }
+    }
+    return [...deps].sort((a, b) => a - b);
   }
 
   /** Etiqueta legible de una operación, para el resumen (FR-D25). */
@@ -725,6 +1017,15 @@ function requiredInteger(
   const raw = input[field];
   if (typeof raw !== 'number' || !Number.isInteger(raw)) {
     return draftError('invalid_input', `\`${field}\` debe ser un número entero.`);
+  }
+  return raw;
+}
+
+/** Un número finito, sin exigir que sea entero: las posiciones son normalizadas (D7). */
+function requiredNumber(input: Record<string, unknown>, field: string): number | DraftError {
+  const raw = input[field];
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    return draftError('invalid_input', `\`${field}\` debe ser un número.`);
   }
   return raw;
 }
@@ -1044,6 +1345,27 @@ const VALIDATORS: Record<string, Validator> = {
   },
 
   apply_layout: (input, plan) => {
+    // Modo imagen: el modelo ve la FOTO, no el lienzo (D7). Pide el centro
+    // normalizado y solo sobre algo que el turno crea; una posición fuera de
+    // rango no es un error: el lienzo la resuelve con su grilla de respaldo.
+    if (plan.imageMode) {
+      const target = aliasField(input, 'target', 'element', plan);
+      if (isDraftError(target)) return target;
+      if (!target.token.startsWith('new:')) {
+        return draftError(
+          'image_turn_create_only',
+          `Un turno de imagen solo ubica lo que crea: ${target.token} ya existe en el diagrama.`,
+        );
+      }
+      const nx = requiredNumber(input, 'nx');
+      if (isDraftError(nx)) return nx;
+      const ny = requiredNumber(input, 'ny');
+      if (isDraftError(ny)) return ny;
+
+      plan.recordImagePosition(target.token, nx, ny);
+      return { ops: [] };
+    }
+
     const target = aliasField(input, 'target', 'element', plan);
     if (isDraftError(target)) return target;
     const x = requiredInteger(input, 'x');

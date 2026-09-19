@@ -4,6 +4,7 @@ import { UmlModule } from '../uml/uml.module';
 import { AiCallService } from './ai-call.service';
 import { AiConfigService } from './ai-config.service';
 import { AiController } from './ai.controller';
+import { AiPreviewStore } from './ai-preview.store';
 import { AiSpendService } from './ai-spend.service';
 import { AiToolsService } from './ai-tools';
 import { AiTurnService } from './ai-turn.service';
@@ -17,7 +18,9 @@ import { AI_ENV, aiEnvProvider } from './providers/llm-provider.factory';
  * Reúne las tres fases del backend: el entorno resuelto `AI_ENV` (fase 3), el
  * libro de gasto `AiSpendService` (fase 4), la orquestación `AiCallService` +
  * `AiConfigService` con sus rutas (fase 5) y, desde `ai-text-instructions`,
- * `AiTurnService` con las dos rutas del turno (D9).
+ * `AiTurnService` con las dos rutas del turno (D9). Desde `ai-image-input`,
+ * `AiPreviewStore` guarda en memoria el plan del turno de foto hasta que el
+ * humano lo confirma o vence (D8).
  *
  * `AiToolsService` se registra para que su `onModuleInit` corra: la guarda de
  * palabras clave del catálogo (D6 de `ai-text-instructions`) audita los siete
@@ -36,7 +39,7 @@ import { AI_ENV, aiEnvProvider } from './providers/llm-provider.factory';
 @Module({
   imports: [CollaborationModule, UmlModule],
   controllers: [AiController, AiTurnsController],
-  providers: [aiEnvProvider, AiSpendService, AiConfigService, AiCallService, AiToolsService, AiTurnService],
+  providers: [aiEnvProvider, AiSpendService, AiConfigService, AiCallService, AiToolsService, AiTurnService, AiPreviewStore],
   exports: [AI_ENV, AiSpendService, AiConfigService, AiCallService, AiToolsService],
 })
 export class AiModule {}

@@ -1,5 +1,6 @@
-import type { DiagramContent, UmlElementView, UmlFeatureView } from '@umlive/contracts';
+import type { AiImageMode, DiagramContent, UmlElementView, UmlFeatureView } from '@umlive/contracts';
 import { AI_TURN_TOOLS } from './ai-tools';
+import type { ToolDefinition } from './providers/llm-provider.interface';
 import { elementAlias, featureAlias, relationshipAlias } from './ai-turn-plan';
 
 /**
@@ -20,13 +21,22 @@ import { elementAlias, featureAlias, relationshipAlias } from './ai-turn-plan';
  * `apps/api` es CommonJS: imports relativos sin `.js`.
  */
 
+/** Cómo se arma el prompt de sistema de un turno. */
+export interface SystemPromptOptions {
+  /** Las herramientas visibles; por defecto, las siete del turno de texto (D5). */
+  readonly tools?: readonly ToolDefinition[];
+  /** Presente solo en un turno de imagen: agrega las instrucciones de la foto (D5). */
+  readonly imageMode?: AiImageMode;
+}
+
 /** Arma el prompt de sistema completo para un turno. */
-export function buildSystemPrompt(snapshot: DiagramContent): string {
+export function buildSystemPrompt(snapshot: DiagramContent, options: SystemPromptOptions = {}): string {
+  const tools = options.tools ?? AI_TURN_TOOLS;
   return [
     'Sos el asistente de modelado UML de uMLive. Convertís una instrucción en lenguaje natural en llamadas a herramientas sobre el diagrama abierto.',
     '',
     '## Cómo trabajás',
-    `- Usá solo estas herramientas: ${AI_TURN_TOOLS.map((tool) => tool.name).join(', ')}.`,
+    `- Usá solo estas herramientas: ${tools.map((tool) => tool.name).join(', ')}.`,
     '- Una instrucción que no se puede mapear a ninguna herramienta se responde con texto, sin inventar operaciones.',
     '- Pedí todas las llamadas que necesites en la menor cantidad de respuestas; una respuesta puede traer varias.',
     '- Si una parte de la instrucción no se puede cumplir, decilo en el texto final. No la apliques a medias ni en silencio.',
@@ -42,14 +52,48 @@ export function buildSystemPrompt(snapshot: DiagramContent): string {
     '- Nunca traduzcas un identificador y nunca lo transliteres. `Dirección` lleva tilde; `códigoPostal` no se convierte en `codigoPostal`.',
     '- Tampoco cambies mayúsculas ni espacios para "normalizar": respetá el texto original.',
     `- Cada nombre tiene como máximo 120 caracteres.`,
+    ...(options.imageMode === undefined ? [] : imageInstructions(options.imageMode)),
     '',
     '## Herramientas',
-    ...AI_TURN_TOOLS.map((tool) => `- \`${tool.name}\`: ${tool.description}`),
+    ...tools.map((tool) => `- \`${tool.name}\`: ${tool.description}`),
     '',
     '## Foto del diagrama',
     'Formato: `e:N TIPO Nombre {f:M nombre: tipo}` para elementos y sus miembros, `r:N TIPO e:origen -> e:destino` para relaciones.',
     describeDiagram(snapshot),
   ].join('\n');
+}
+
+/**
+ * Las instrucciones del turno de imagen (D5, tarea 3.3). Cuatro reglas, y cada
+ * una existe por un modo de falla concreto:
+ *
+ * 1. **Leer TODAS las clases**: el usuario manda una foto, no un inventario. Si
+ *    el prompt no lo dice, el modelo dibuja las dos clases que nombra el pie de
+ *    foto y el resto de la pizarra se pierde.
+ * 2. **Agrupar las llamadas**: la foto se reenvía ENTERA en cada iteración, así
+ *    que una llamada por respuesta se paga seis veces.
+ * 3. **Posición normalizada del centro**: el modelo ve la foto, no el lienzo.
+ *    Un `x`/`y` inventado en píxeles del lienzo es una posición que no significa
+ *    nada (D7); `nx`/`ny` en `0..1` es lo único que puede estimar.
+ * 4. **`low` ante la duda**: es la válvula que el humano revisa (PO-2). Un dato
+ *    adivinado con confianza alta se aplica sin que nadie lo mire.
+ */
+function imageInstructions(mode: AiImageMode): string[] {
+  const framing =
+    mode === 'create'
+      ? '- La foto es el diagrama COMPLETO: creá todas las clases que se vean, con sus atributos y relaciones.'
+      : '- Estás AGREGANDO a un diagrama que ya existe: creá solo lo que la foto aporta. Nunca borres ni muevas lo que ya está; para algo que ya existe, usá su alias en vez de duplicarlo.';
+
+  return [
+    '',
+    '## Foto de referencia',
+    framing,
+    '- Leé TODAS las clases visibles en la foto, no solo las que nombra la instrucción escrita.',
+    '- Pedí todas las llamadas en la MENOR cantidad de respuestas posible: la foto se reenvía en cada vuelta y cada vuelta se paga.',
+    '- Ubicá cada clase que creás con `apply_layout` sobre su `new:N`, pasando `nx` y `ny`: la posición NORMALIZADA del CENTRO de esa clase en la foto, de 0 a 1. `(0,0)` es la esquina superior izquierda y `(1,1)` la inferior derecha. Es una estimación: el servidor la convierte al lienzo.',
+    '- Si dudás de algo —una multiplicidad que no se lee, un nombre que no distinguís, una relación que no estás seguro de ver— marcá `confidence: "low"` y explicá el motivo en `note`. La persona lo revisa y decide; un dato dudoso aplicado en silencio es peor que un dato dudoso destildado.',
+    '- Lo que no se pueda leer o interpretar decilo en el TEXTO FINAL, con tus palabras. No lo inventes ni lo apliques a medias.',
+  ];
 }
 
 /**

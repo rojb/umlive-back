@@ -7,6 +7,7 @@ import {
   type RelationshipKind,
   type Visibility,
 } from '@umlive/contracts';
+import type { AiInputMode } from '../generated/prisma/enums';
 import type { ToolDefinition } from './providers/llm-provider.interface';
 
 /**
@@ -47,6 +48,33 @@ import type { ToolDefinition } from './providers/llm-provider.interface';
  * del lote (D2, PO-A).
  */
 export const MAX_OPS_PER_TURN = 40;
+
+/**
+ * Tope de operaciones del plan de un turno de IMAGEN (D5, PO-5).
+ *
+ * Es más alto que el de texto porque una foto de un pizarrón real produce
+ * muchas más llamadas de las que una instrucción escrita produce: 80 cubre la
+ * foto de referencia de 10 clases (KR7) con sus atributos y relaciones, y sigue
+ * por debajo de lo que tolera la transacción de 5 s (el tope se mide contra ese
+ * timeout, nunca se sube el timeout).
+ */
+export const MAX_IMAGE_OPS_PER_TURN = 80;
+
+/** Iteraciones del bucle de imagen (D5, PO-C): 6, no 25. */
+export const MAX_IMAGE_ITERATIONS = 6;
+
+/**
+ * Topes por modo de entrada (D5). El texto conserva los suyos —40 operaciones y
+ * 25 iteraciones— y la imagen tiene los propios, porque reenvía la foto entera
+ * en cada vuelta: 25 iteraciones con una imagen `10 MB` no son un turno, son una
+ * factura. La clave sale de `AiInputMode`, la misma que usa una palabra clave al
+ * arrancar.
+ */
+export const TURN_LIMITS: Record<AiInputMode, { readonly ops: number; readonly iterations: number }> = {
+  TEXT: { ops: MAX_OPS_PER_TURN, iterations: 25 },
+  VOICE: { ops: MAX_OPS_PER_TURN, iterations: 25 },
+  IMAGE: { ops: MAX_IMAGE_OPS_PER_TURN, iterations: MAX_IMAGE_ITERATIONS },
+};
 
 const CLASSIFIER_KINDS: ElementKind[] = [
   'CLASS',
@@ -264,6 +292,92 @@ export const AI_TURN_TOOLS: readonly ToolDefinition[] = [
 ];
 
 /**
+ * Metadatos de corrida del turno de imagen (D5): `confidence` y `note`, los dos
+ * OPCIONALES. `confidence: 'low'` es la única forma en que el modelo declara su
+ * propia duda; el resto de la marca de baja confianza la pone el servidor.
+ *
+ * Son propiedades opcionales —fuera de `required`— porque el subconjunto
+ * conservador expresa nulabilidad así (D6 de `ai-text-instructions`).
+ */
+const RUN_META_PROPERTIES = {
+  confidence: {
+    type: 'string',
+    enum: ['high', 'low'],
+    description:
+      'Tu confianza en esta llamada. Poné "low" ante cualquier duda (una multiplicidad que no se lee, un nombre que no se distingue): la persona la revisa y decide.',
+  },
+  note: {
+    type: 'string',
+    description: 'Una frase corta que explique la duda o la decisión, para la vista previa.',
+  },
+} as const;
+
+/**
+ * Las herramientas del turno de IMAGEN (D5, PO-3): solo creación, sin
+ * `update_element` ni `delete_element`. Modificar un diagrama tampoco las
+ * habilita: el turno de imagen agrega un delta, nunca borra ni mueve lo que ya
+ * existe.
+ */
+const IMAGE_TOOL_NAMES = ['create_class', 'add_attribute', 'add_operation', 'create_relationship'] as const;
+
+/**
+ * `apply_layout` en modo imagen: la posición que el modelo ve es la de la FOTO,
+ * no la del lienzo, así que pide el CENTRO normalizado (0..1) y el servidor lo
+ * convierte (D7). Sobre un elemento que ya existe es un error de herramienta.
+ */
+const IMAGE_APPLY_LAYOUT: ToolDefinition = {
+  name: 'apply_layout',
+  description:
+    'Ubica una clase que este turno creó. Solo acepta alias new:N: el turno de imagen nunca mueve algo que ya existe.',
+  parameters: {
+    type: 'object',
+    properties: {
+      target: {
+        type: 'string',
+        description: 'Alias new:N de una clase que este turno creó.',
+      },
+      nx: {
+        type: 'number',
+        description:
+          'Posición horizontal del CENTRO de la clase en la foto, normalizada de 0 (borde izquierdo) a 1 (borde derecho).',
+      },
+      ny: {
+        type: 'number',
+        description:
+          'Posición vertical del CENTRO de la clase en la foto, normalizada de 0 (borde superior) a 1 (borde inferior).',
+      },
+    },
+    required: ['target', 'nx', 'ny'],
+  },
+};
+
+/** Agrega `confidence`/`note` sin mutar el esquema original. */
+function withRunMeta(tool: ToolDefinition): ToolDefinition {
+  const properties = (tool.parameters['properties'] ?? {}) as Record<string, unknown>;
+  return {
+    ...tool,
+    parameters: {
+      ...tool.parameters,
+      properties: { ...properties, ...RUN_META_PROPERTIES },
+    },
+  };
+}
+
+/** Las cinco herramientas del turno de imagen, con sus metadatos de corrida. */
+export const IMAGE_TURN_TOOLS: readonly ToolDefinition[] = [
+  ...AI_TURN_TOOLS.filter((tool) => (IMAGE_TOOL_NAMES as readonly string[]).includes(tool.name)).map(withRunMeta),
+  withRunMeta(IMAGE_APPLY_LAYOUT),
+];
+
+/**
+ * El catálogo de herramientas que ve el modelo para `inputMode` (D5). El turno
+ * de texto/voz mantiene sus siete; el de imagen solo las cinco de creación.
+ */
+export function buildTools(inputMode: AiInputMode): readonly ToolDefinition[] {
+  return inputMode === 'IMAGE' ? IMAGE_TURN_TOOLS : AI_TURN_TOOLS;
+}
+
+/**
  * Palabras clave que el subconjunto conservador prohíbe (D6). Se listan
  * explícitamente y además se cortan por prefijo `min`/`max`/`exclusiveMin`/
  * `exclusiveMax`, porque las restricciones numéricas de JSON Schema crecen en
@@ -355,10 +469,16 @@ export class AiToolsService implements OnModuleInit {
   private readonly log = new Logger(AiToolsService.name);
 
   onModuleInit(): void {
+    // La guarda recorre las DOS variantes: un `pattern` colado en el esquema de
+    // imagen fallaría igual que uno en el de texto, y descubrirlo en el primer
+    // turno real es demasiado tarde (D6).
     assertConservativeSchemas(AI_TURN_TOOLS);
+    assertConservativeSchemas(IMAGE_TURN_TOOLS);
     this.log.log(
-      `catálogo de ${AI_TURN_TOOLS.length} herramientas verificado ` +
-        `(subconjunto conservador de JSON Schema; tope ${MAX_OPS_PER_TURN} operaciones por turno)`,
+      `catálogo verificado (subconjunto conservador de JSON Schema): ` +
+        `${AI_TURN_TOOLS.length} herramientas de texto (tope ${TURN_LIMITS.TEXT.ops} operaciones, ` +
+        `${TURN_LIMITS.TEXT.iterations} iteraciones) y ${IMAGE_TURN_TOOLS.length} de imagen ` +
+        `(tope ${TURN_LIMITS.IMAGE.ops} operaciones, ${TURN_LIMITS.IMAGE.iterations} iteraciones)`,
     );
   }
 }

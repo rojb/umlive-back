@@ -1,5 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
+  AI_TURN_ERROR,
+  type AiImageConfirmResult,
+  type AiImageMode,
+  type AiImagePreview,
   type AiTurnResult,
   type AiTurnStatus,
   type AiTurnSummary,
@@ -21,12 +25,19 @@ import { PrismaService } from '../prisma/prisma.service';
 import type { Tx } from '../prisma/tx.type';
 import { DiagramContentService } from '../uml/diagram-content.service';
 import { AiCallService, type AiCallResult, type AiTurn, type AiTurnClose } from './ai-call.service';
-import { type SpendRejection } from './ai-spend.service';
-import { AI_TURN_TOOLS } from './ai-tools';
+import { AiConfigService } from './ai-config.service';
+import { AiPreviewStore, type PendingPreview, type PreviewCancelReason } from './ai-preview.store';
+import { AiSpendService, type SpendRejection } from './ai-spend.service';
+import { buildTools, TURN_LIMITS } from './ai-tools';
+import type { AiConfirmTurnDto } from './dto/ai-confirm-turn.dto';
+import type { AiImageTurnDto } from './dto/ai-image-turn.dto';
 import type { AiTurnRequestDto } from './dto/ai-turn-request.dto';
-import { TurnPlan } from './ai-turn-plan';
+import { readImageDimensions, sha256, sniffImageType, stripMetadata, type ImageType } from './image-input';
+import { layoutImageItems } from './image-layout';
+import type { UploadedImage } from './image-upload.filter';
+import { excludeClosure, TurnPlan } from './ai-turn-plan';
 import { buildSystemPrompt } from './ai-turn-prompt';
-import type { LlmMessage } from './providers/llm-provider.interface';
+import type { LlmImage, LlmMessage, ToolDefinition } from './providers/llm-provider.interface';
 import { batchOpId } from './turn-op-ids';
 
 /**
@@ -61,9 +72,6 @@ import { batchOpId } from './turn-op-ids';
  * `apps/api` es CommonJS: imports relativos sin `.js`.
  */
 
-/** Tope del bucle (FR-D15b.3, SC-D14). */
-const MAX_TOOL_ITERATIONS = 25;
-
 /**
  * Plazo total del turno (D9). Existe porque el `requestTimeout` por defecto del
  * `http.Server` de Node ≥18 son 300 s: 25 iteraciones lentas lo pasarían y la
@@ -71,6 +79,14 @@ const MAX_TOOL_ITERATIONS = 25;
  * con su costo ya registrado.
  */
 export const AI_TURN_DEADLINE_MS = 120_000;
+
+/**
+ * Código del dueño ajeno (PO-B). El contrato de `AI_TURN_ERROR` de la tarea 1.1
+ * no incluyó este código —enumera 9 y `ai_turn_not_owner` no está entre ellos—,
+ * así que vive acá como constante local en vez de agregar un código al contrato
+ * desde un archivo que no es su dueño.
+ */
+const AI_TURN_NOT_OWNER = 'ai_turn_not_owner';
 
 /**
  * Color neutro del `LockHolder` de un usuario que no está conectado a la sala
@@ -117,6 +133,35 @@ export type AiUndoOutcome =
   | { readonly kind: 'frozen' }
   | { readonly kind: 'locked'; readonly rejection: OperationRejected };
 
+/**
+ * Lo que puede devolver `POST .../ai/turns/image` (D4). El orden de las guardas
+ * que produce cada variante es el de `planImageTurn`, y no es casual: lo que
+ * responde un rechazo sin tocar la red no puede depender de nada que cueste.
+ */
+export type AiImagePlanOutcome =
+  | { readonly kind: 'preview'; readonly preview: AiImagePreview }
+  | { readonly kind: 'failed'; readonly result: AiTurnResult }
+  | { readonly kind: 'frozen' }
+  | { readonly kind: 'in_progress' }
+  | { readonly kind: 'vision_unavailable' }
+  | { readonly kind: 'create_requires_empty' }
+  | { readonly kind: 'image_rejected'; readonly status: number; readonly body: Record<string, unknown> }
+  | { readonly kind: 'spend_rejected'; readonly rejection: SpendRejection };
+
+/** Lo que puede devolver `POST .../ai/turns/:turnId/confirm` (D8). */
+export type AiImageConfirmOutcome =
+  | { readonly kind: 'result'; readonly result: AiImageConfirmResult }
+  | { readonly kind: 'frozen' }
+  | { readonly kind: 'in_progress' }
+  | { readonly kind: 'locked'; readonly rejection: OperationRejected }
+  | { readonly kind: 'stale'; readonly reason: string }
+  | { readonly kind: 'item_unknown' }
+  | { readonly kind: 'expired' }
+  | { readonly kind: 'not_owner' };
+
+/** Lo que puede devolver `POST .../ai/turns/:turnId/discard`. */
+export type AiImageDiscardOutcome = { readonly kind: 'discarded' } | { readonly kind: 'not_owner' };
+
 /** Todo lo que hace falta para correr, aplicar y cerrar un turno. */
 interface TurnContext {
   readonly turn: AiTurn;
@@ -126,6 +171,10 @@ interface TurnContext {
   readonly dto: AiTurnRequestDto;
   readonly instructions: string;
   readonly plan: TurnPlan;
+  /** Las herramientas visibles del modo (D5): 7 en texto/voz, 5 en imagen. */
+  readonly tools: readonly ToolDefinition[];
+  /** Tope de iteraciones del modo (D5). */
+  readonly maxIterations: number;
   /** La cancelación del cliente, sola: distingue CANCELLED de FAILED por plazo. */
   readonly cancelSignal: AbortSignal;
   /** `cancelSignal` combinada con el plazo de 120 s. */
@@ -150,6 +199,31 @@ interface ApplyResult {
   readonly rejection: OperationRejected | null;
 }
 
+/** Lo que dejó el bucle de imagen (D5, PO-C). */
+interface ImageLoopResult {
+  readonly iterations: number;
+  readonly modelText: string;
+  readonly lastResult: AiCallResult | null;
+  /** El modelo cerró con texto, sin pedir más herramientas. */
+  readonly closedByModel: boolean;
+  /** El proveedor no pudo responder (o se agotó el plazo): no hay vista previa. */
+  readonly failed: boolean;
+}
+
+/**
+ * El cierre de una fila más las iteraciones que quedaron registradas. `AiTurnClose`
+ * no las trae y el `AiTurnResult` de la confirmación sí las necesita.
+ */
+interface ClosedTurn extends AiTurnClose {
+  readonly iterations: number;
+}
+
+/**
+ * Instrucción por defecto de un turno de imagen sin texto del usuario (D4).
+ * La foto ya es la instrucción; esto solo fija el modo del pedido.
+ */
+const DEFAULT_IMAGE_PROMPT = 'Modelá en el diagrama lo que muestra esta foto.';
+
 @Injectable()
 export class AiTurnService {
   private readonly log = new Logger(AiTurnService.name);
@@ -164,12 +238,24 @@ export class AiTurnService {
 
   constructor(
     private readonly calls: AiCallService,
+    private readonly config: AiConfigService,
     private readonly content: DiagramContentService,
     private readonly locks: LocksService,
     private readonly operations: OperationsService,
     private readonly gateway: CollaborationGateway,
+    private readonly spend: AiSpendService,
+    private readonly previews: AiPreviewStore,
     private readonly prisma: PrismaService,
-  ) {}
+  ) {
+    // El cierre de las vistas previas que nadie confirma (TTL o reemplazo) es de
+    // este servicio: el store no conoce el libro de gasto. La fila se cierra
+    // `CANCELLED` y el costo queda donde ya estaba (nunca se borra una fila).
+    this.previews.registerCancel((turnId, reason) => {
+      void this.closeCancelled(turnId, reason).catch((error: unknown) => {
+        this.log.error(`no se pudo cancelar la vista previa ${turnId}: ${String(error)}`);
+      });
+    });
+  }
 
   // ───────────────────────────────────────────────────────────────────────────
   // Turno
@@ -215,8 +301,9 @@ export class AiTurnService {
     cancelSignal: AbortSignal,
     snapshot: DiagramContent,
   ): Promise<AiTurnOutcome> {
-    const plan = new TurnPlan(snapshot);
-    const instructions = buildSystemPrompt(snapshot);
+    const plan = new TurnPlan(snapshot, { opLimit: TURN_LIMITS[dto.inputMode as AiInputMode].ops });
+    const tools = buildTools(dto.inputMode as AiInputMode);
+    const instructions = buildSystemPrompt(snapshot, { tools });
     const messages: LlmMessage[] = [{ role: 'user', content: dto.prompt }];
     // El plazo y la cancelación del cliente, combinados (D9). Mantener las dos
     // señales SEPARADAS es lo que permite distinguir al final una cancelación
@@ -234,7 +321,7 @@ export class AiTurnService {
       promptText: dto.prompt,
       instructions,
       messages,
-      tools: AI_TURN_TOOLS,
+      tools,
       abortSignal: effective,
     });
     if (!started.ok) {
@@ -250,6 +337,8 @@ export class AiTurnService {
       dto,
       instructions,
       plan,
+      tools,
+      maxIterations: TURN_LIMITS[dto.inputMode as AiInputMode].iterations,
       cancelSignal,
       effective,
       modelText: '',
@@ -284,7 +373,7 @@ export class AiTurnService {
       closedByModel: false,
     });
 
-    while (iterations < MAX_TOOL_ITERATIONS) {
+    while (iterations < context.maxIterations) {
       // Última chance ANTES del llamado: un cancel que llegó mientras se
       // procesaban los resultados no necesita gastar una iteración más.
       if (context.effective.aborted) return fails(this.abortStatus(context.cancelSignal));
@@ -298,7 +387,7 @@ export class AiTurnService {
         promptText: context.dto.prompt,
         instructions: context.instructions,
         messages,
-        tools: AI_TURN_TOOLS,
+        tools: context.tools,
         abortSignal: context.effective,
       });
       lastResult = result;
@@ -339,7 +428,7 @@ export class AiTurnService {
     }
 
     // Salir del `while` sin `closedByModel` es el tope agotado: el modelo seguía
-    // pidiendo herramientas en la iteración 25 (SC-D14).
+    // pidiendo herramientas en la última iteración permitida (SC-D14).
     return closedByModel
       ? { status: 'APPLIED', iterations, modelText, lastResult, closedByModel: true }
       : fails('FAILED');
@@ -374,7 +463,7 @@ export class AiTurnService {
     } else {
       errorMessage = loop.lastResult !== null && !loop.lastResult.ok
         ? loop.lastResult.errorMessage
-        : `El modelo no cerró el turno en ${MAX_TOOL_ITERATIONS} iteraciones.`;
+        : `El modelo no cerró el turno en ${context.maxIterations} iteraciones.`;
     }
 
     // El cierre REAL, con el estado final: este archivo es el único que sabe si
@@ -416,6 +505,689 @@ export class AiTurnService {
       fallbackFrom: close.fallbackFrom,
       undo,
     };
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Turno de imagen (M6, rebanada 3/4 — `ai-image-input`)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Planifica un turno de imagen (D4, D5, D8): guardas, bucle con la foto,
+   * vista previa en memoria. **No toma ningún lock y no escribe ninguna fila de
+   * `diagram_operations`** (SC-D18, PO-1).
+   *
+   * El ORDEN de las guardas es la parte que no se puede mover:
+   *
+   * | # | Guarda | Costo si falla |
+   * |---|---|---|
+   * | 1 | diagrama congelado (`423`) | cero: no se llama al proveedor |
+   * | 2 | turno en curso (`409`) | cero |
+   * | 3 | cadena con `vision` + `toolCalling` (`409`) | cero |
+   * | 4 | imagen: tipo, estructura, límites (`415`/`422`) | cero: no hay fila |
+   * | 5 | modo crear sobre diagrama no vacío (`409`) | cero: no hay fila |
+   * | 6 | `startTurn` (ritmo + reserva) | acá ya se reserva |
+   *
+   * Un diagrama congelado tiene que costar CERO: por eso se lee la fila antes
+   * que nada, y la cadena antes de `startTurn`. La comprobación de visión no
+   * abre el turno (leería config, no reserva); `startTurn` la vuelve a hacer al
+   * armar la cadena, ahora también filtrando por los límites de la imagen.
+   */
+  async planImageTurn(
+    projectId: string,
+    diagramId: string,
+    user: CurrentUserPayload,
+    dto: AiImageTurnDto,
+    image: UploadedImage | undefined,
+  ): Promise<AiImagePlanOutcome> {
+    // 1. Congelado ANTES de todo lo que cuesta (D4): se lee la FILA, la misma
+    //    que mira `applyBatch`, así que lo que decide acá es lo que decide allá.
+    const snapshot = await this.content.getDiagramContent(diagramId);
+    if (snapshot.diagram.lockState !== 'UNLOCKED') return { kind: 'frozen' };
+
+    // 2. Un turno a la vez por (usuario, diagrama).
+    const key = `${user.id}:${diagramId}`;
+    if (this.inFlight.has(key)) return { kind: 'in_progress' };
+
+    // Multer sin `storage` deja el archivo en memoria (D1); un pedido sin
+    // archivo es un buffer vacío y cae más abajo en `415`, no en un `500`.
+    const received = image?.buffer ?? Buffer.alloc(0);
+    let payload: Buffer = received;
+
+    this.inFlight.add(key);
+    try {
+      // 3. Cadena con visión y herramientas, sin abrir el turno (FR-D04, SC-D02).
+      const chain = await this.visionChain(projectId);
+      if (chain === null) return { kind: 'vision_unavailable' };
+
+      // 4. D2: por CONTENIDO, nunca por el `Content-Type` que mandó el cliente.
+      const type = sniffImageType(received);
+      if (type === null) {
+        return { kind: 'image_rejected', status: 415, body: { code: AI_TURN_ERROR.IMAGE_TYPE_UNSUPPORTED } };
+      }
+      const dimensions = readImageDimensions(received, type);
+      if (!dimensions.ok) {
+        return { kind: 'image_rejected', status: 422, body: { code: AI_TURN_ERROR.IMAGE_UNREADABLE } };
+      }
+      const { width, height } = dimensions.dimensions;
+      const exceeds =
+        (chain.maxImageDimension !== null && Math.max(width, height) > chain.maxImageDimension) ||
+        (chain.maxImageBytes !== null && received.length > chain.maxImageBytes);
+      if (exceeds) {
+        return {
+          kind: 'image_rejected',
+          status: 422,
+          body: {
+            code: AI_TURN_ERROR.IMAGE_EXCEEDS_PROVIDER_LIMITS,
+            maxImageBytes: chain.maxImageBytes,
+            maxImageDimension: chain.maxImageDimension,
+          },
+        };
+      }
+
+      // 5. Modo (PO-4): crear solo sobre un diagrama vacío. La foto ya se tomó
+      //    para el prompt, así que esto no cuesta una consulta extra.
+      if (dto.mode === 'create' && snapshot.elements.length > 0) return { kind: 'create_requires_empty' };
+
+      const imageSha = sha256(received);
+      // Defensa en profundidad para un cliente que no recodifica (`curl`): los
+      // metadatos se quitan y lo que viaja al proveedor es esta copia.
+      payload = stripMetadata(received, type);
+      const llmImage: LlmImage = { mediaType: mediaTypeOf(type), data: payload, width, height };
+
+      const limits = TURN_LIMITS.IMAGE;
+      const plan = new TurnPlan(snapshot, { image: true, opLimit: limits.ops });
+      const tools = buildTools('IMAGE');
+      const instructions = buildSystemPrompt(snapshot, { tools, imageMode: dto.mode });
+      const promptText = dto.prompt ?? DEFAULT_IMAGE_PROMPT;
+      const messages: LlmMessage[] = [{ role: 'user', content: promptText }];
+      const effective = AbortSignal.timeout(AI_TURN_DEADLINE_MS);
+      // La versión se lee ANTES que la foto (D8/PO-D): con una carrera el
+      // resultado es un `409` de más, nunca uno de menos.
+      const baseVersion = snapshot.diagram.currentVersion;
+
+      // 6. Ritmo, reserva (con los tokens de imagen por iteración) y fila PENDING.
+      const started = await this.calls.startTurn({
+        projectId,
+        diagramId,
+        userId: user.id,
+        inputMode: 'IMAGE',
+        promptText,
+        instructions,
+        messages,
+        images: [llmImage],
+        tools,
+        abortSignal: effective,
+      });
+      if (!started.ok) {
+        // Sin eslabón que entre con la imagen: es el mismo rechazo de visión,
+        // y sigue sin haber fila ni gasto.
+        if (started.reason === 'no_capable_provider') return { kind: 'vision_unavailable' };
+        return { kind: 'spend_rejected', rejection: started };
+      }
+
+      // Lo ÚNICO que se guarda de la imagen es su hash (privacidad), también
+      // cuando el turno después falla: la auditoría no depende de que converja.
+      await this.prisma.aiTurn.update({
+        where: { id: started.turn.turnId },
+        data: { imageSha256: imageSha },
+      });
+
+      const loop = await this.runImageLoop(started.turn, {
+        projectId,
+        diagramId,
+        userId: user.id,
+        promptText,
+        instructions,
+        messages,
+        llmImage,
+        tools,
+        abortSignal: effective,
+        plan,
+        maxIterations: limits.iterations,
+      });
+
+      if (loop.failed) {
+        return { kind: 'failed', result: await this.finishImageFailure(started.turn, loop, plan, diagramId, user) };
+      }
+
+      // Las posiciones normalizadas de la foto pasan al lienzo (D7).
+      this.applyImageLayout(plan, snapshot, dto.mode, width, height);
+
+      const items = plan.previewItems();
+      // El turno queda PENDING con sus iteraciones ya registradas: la plata se
+      // liquidó, la escritura todavía no pasó (PO-C, SC-D18).
+      const closed = await this.calls.finishTurn(started.turn, closeResultOf(loop), {
+        status: 'PENDING',
+        iterations: loop.iterations,
+        errorMessage: null,
+      });
+      const expiresAt = this.previews.put(started.turn.turnId, {
+        userId: user.id,
+        diagramId,
+        mode: dto.mode,
+        items,
+        opsByItem: plan.opsByItem(),
+        appliedByItem: plan.appliedByItem(),
+        notApplied: plan.notApplied,
+        modelText: loop.modelText,
+        baseVersion,
+        referencedIds: plan.referencedIds(),
+      });
+
+      return {
+        kind: 'preview',
+        preview: {
+          turnId: started.turn.turnId,
+          mode: dto.mode,
+          expiresAt: new Date(expiresAt).toISOString(),
+          items,
+          notApplied: plan.notApplied,
+          modelText: loop.modelText,
+          costUsd: closed.costUsd,
+          iterations: loop.iterations,
+          // PO-C: agotar las 6 iteraciones NO es un turno fallido, es una vista
+          // previa INCOMPLETA. La plata ya se gastó y nada se aplica sin
+          // confirmación.
+          truncated: !loop.closedByModel,
+          provider: closed.provider,
+          model: closed.model,
+          fallbackFired: closed.fallbackFired,
+          fallbackFrom: closed.fallbackFrom,
+        },
+      };
+    } finally {
+      this.inFlight.delete(key);
+      // La imagen se libera ANTES de responder (D10): el buffer original y la
+      // copia sin metadatos que se le mandó al proveedor.
+      received.fill(0);
+      if (payload !== received) payload.fill(0);
+    }
+  }
+
+  /**
+   * Confirma una vista previa (D8, PO-2, PO-D): el servidor recalcula el cierre,
+   * revalida la precondición DENTRO del `FOR UPDATE` y aplica en UN lote.
+   *
+   * Nada de lo que manda el cliente es autoridad: `excluded` se valida como
+   * enteros únicos dentro del rango del plan propio, el cierre se recalcula
+   * sobre ese plan y la precondición de modo corre dentro de la transacción que
+   * toma los locks.
+   */
+  async confirmImageTurn(
+    diagramId: string,
+    user: CurrentUserPayload,
+    turnId: string,
+    dto: AiConfirmTurnDto,
+  ): Promise<AiImageConfirmOutcome> {
+    const pending = this.previews.take(turnId);
+    if (pending === null) return this.confirmWithoutPreview(diagramId, user.id, turnId);
+
+    if (pending.diagramId !== diagramId || pending.userId !== user.id) {
+      this.previews.restore(turnId);
+      return { kind: 'not_owner' };
+    }
+    if (dto.excluded.some((index) => !Number.isInteger(index) || index < 0 || index >= pending.items.length)) {
+      this.previews.restore(turnId);
+      return { kind: 'item_unknown' };
+    }
+
+    // El cierre es del SERVIDOR (FR-D24): un cliente que manda solo la clase
+    // excluida igual se lleva sus atributos y relaciones.
+    const closure = excludeClosure(pending.items, dto.excluded);
+    const excludedClosure = [...closure].sort((a, b) => a - b);
+    const summary = {
+      applied: pending.appliedByItem.filter((_, index) => !closure.has(index)).flat(),
+      notApplied: [...pending.notApplied],
+      modelText: pending.modelText,
+    };
+
+    // Todo excluido se trata como descartar (D6).
+    if (closure.size >= pending.items.length) {
+      this.previews.delete(turnId);
+      return { kind: 'result', result: await this.cancelledConfirm(diagramId, turnId, user, summary, excludedClosure) };
+    }
+
+    const ops: BatchOperation[] = [];
+    for (const [index, itemOps] of pending.opsByItem.entries()) {
+      if (closure.has(index)) continue;
+      for (const op of itemOps) ops.push({ type: op.type, payload: op.payload, produces: op.produces });
+    }
+
+    const key = `${user.id}:${diagramId}`;
+    if (this.inFlight.has(key)) {
+      this.previews.restore(turnId);
+      return { kind: 'in_progress' };
+    }
+
+    this.inFlight.add(key);
+    try {
+      const acquired = this.locks.acquireAllTracked(
+        diagramId,
+        pending.referencedIds,
+        this.holderFor(diagramId, user),
+      );
+      if (!acquired.ok) {
+        // Nada se aplicó: la vista previa se conserva para reintentar dentro del
+        // TTL (un `423` o un lock ajeno no invalidan el plan).
+        this.previews.restore(turnId);
+        if ('frozen' in acquired) return { kind: 'frozen' };
+        return {
+          kind: 'locked',
+          rejection: {
+            opId: batchOpId(turnId, 'apply', 0),
+            diagramId,
+            reason: 'ELEMENT_LOCKED',
+            message: `${acquired.holder.displayName} está editando un elemento que este turno necesita. No se aplicó ninguna de sus operaciones.`,
+            currentVersion: await this.operations.currentVersion(diagramId),
+            holder: acquired.holder,
+            lockedElementId: acquired.elementId,
+          },
+        };
+      }
+
+      const taken = acquired.taken;
+      let deletedIds: string[] = [];
+      try {
+        const batch = await this.operations.applyBatch(diagramId, user.id, turnId, ops, {
+          actorKind: 'AI',
+          aiTurnId: turnId,
+          opIdPrefix: 'apply',
+          // La precondición de modo, DENTRO del `FOR UPDATE` (D8/PO-D): es el
+          // mismo punto donde el deshacer reevalúa su elegibilidad.
+          guard: (tx) => this.modePrecondition(tx, diagramId, pending),
+        });
+
+        if (batch.kind === 'blocked') {
+          this.previews.delete(turnId);
+          await this.closeRow(turnId, 'REJECTED', 'El diagrama cambió desde que se armó la vista previa.');
+          return { kind: 'stale', reason: batch.reason };
+        }
+        if (batch.kind === 'rejected') {
+          this.previews.delete(turnId);
+          this.log.warn(`confirm del turno ${turnId} rechazado: ${batch.rejection.reason} — ${batch.rejection.message}`);
+          return {
+            kind: 'result',
+            result: await this.rejectedConfirm(diagramId, turnId, user, batch.rejection, summary, excludedClosure),
+          };
+        }
+
+        if (batch.kind === 'committed') {
+          deletedIds = batch.deletedIds;
+          // Después del COMMIT, nunca antes (INV-3).
+          this.gateway.emitCommitted(diagramId, batch.committed);
+        }
+        this.previews.delete(turnId);
+        return {
+          kind: 'result',
+          result: await this.appliedConfirm(diagramId, turnId, user, summary, excludedClosure, batch.kind === 'echo'),
+        };
+      } finally {
+        if (deletedIds.length > 0) this.locks.releaseElements(diagramId, deletedIds, 'deleted');
+        const deleted = new Set(deletedIds);
+        for (const id of taken) {
+          if (!deleted.has(id)) this.locks.release(diagramId, id, user.id, 'released');
+        }
+      }
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+
+  /**
+   * Descarta una vista previa (D8): no aplica nada y cierra su fila `CANCELLED`.
+   * Idempotente: descartar dos veces no es un error.
+   */
+  async discardImageTurn(diagramId: string, user: CurrentUserPayload, turnId: string): Promise<AiImageDiscardOutcome> {
+    const row = await this.prisma.aiTurn.findUnique({
+      where: { id: turnId },
+      select: { userId: true, diagramId: true, status: true },
+    });
+    if (row !== null && row.diagramId === diagramId && row.userId !== user.id) return { kind: 'not_owner' };
+
+    this.previews.delete(turnId);
+    if (row !== null && row.status === 'PENDING') {
+      await this.closeRow(turnId, 'CANCELLED', 'preview_discarded');
+    }
+    return { kind: 'discarded' };
+  }
+
+  /** El bucle de imagen (D5): ≤ 6 iteraciones, con la foto en CADA una. */
+  private async runImageLoop(
+    turn: AiTurn,
+    args: {
+      readonly projectId: string;
+      readonly diagramId: string;
+      readonly userId: string;
+      readonly promptText: string;
+      readonly instructions: string;
+      readonly messages: LlmMessage[];
+      readonly llmImage: LlmImage;
+      readonly tools: readonly ToolDefinition[];
+      readonly abortSignal: AbortSignal;
+      readonly plan: TurnPlan;
+      readonly maxIterations: number;
+    },
+  ): Promise<ImageLoopResult> {
+    let iterations = 0;
+    let modelText = '';
+    let lastResult: AiCallResult | null = null;
+    let closedByModel = false;
+    let failed = false;
+
+    while (iterations < args.maxIterations) {
+      if (args.abortSignal.aborted) {
+        failed = true;
+        break;
+      }
+
+      iterations += 1;
+      const result = await this.calls.call(turn, {
+        projectId: args.projectId,
+        diagramId: args.diagramId,
+        userId: args.userId,
+        inputMode: 'IMAGE',
+        promptText: args.promptText,
+        instructions: args.instructions,
+        messages: args.messages,
+        images: [args.llmImage],
+        tools: args.tools,
+        abortSignal: args.abortSignal,
+      });
+      lastResult = result;
+
+      if (!result.ok) {
+        failed = true;
+        break;
+      }
+
+      modelText = result.completion.text;
+      if (result.completion.toolCalls.length === 0) {
+        closedByModel = true;
+        break;
+      }
+
+      args.messages.push({
+        role: 'assistant',
+        content: result.completion.text,
+        text: result.completion.text,
+        toolCalls: result.completion.toolCalls,
+      });
+      for (const toolCall of result.completion.toolCalls) {
+        const outcome = args.plan.addToolCall(toolCall.toolName, toolCall.input);
+        args.messages.push({
+          role: 'tool',
+          content: outcome.result,
+          toolCallId: toolCall.toolCallId,
+          toolName: toolCall.toolName,
+          output: outcome.result,
+        });
+      }
+    }
+
+    return { iterations, modelText, lastResult, closedByModel, failed };
+  }
+
+  /** Cierra un turno de imagen que no pudo completar el bucle: `FAILED`, con su costo ya pagado. */
+  private async finishImageFailure(
+    turn: AiTurn,
+    loop: ImageLoopResult,
+    plan: TurnPlan,
+    diagramId: string,
+    user: CurrentUserPayload,
+  ): Promise<AiTurnResult> {
+    const errorMessage =
+      loop.lastResult !== null && !loop.lastResult.ok
+        ? loop.lastResult.errorMessage
+        : 'El turno superó el plazo sin llegar a una vista previa.';
+    const close = await this.calls.finishTurn(turn, closeResultOf(loop), {
+      status: 'FAILED',
+      iterations: loop.iterations,
+      errorMessage,
+    });
+
+    return {
+      turnId: turn.turnId,
+      status: 'FAILED',
+      summary: { applied: [], notApplied: plan.notApplied, modelText: loop.modelText },
+      costUsd: close.costUsd,
+      iterations: loop.iterations,
+      provider: close.provider,
+      model: close.model,
+      fallbackFired: close.fallbackFired,
+      fallbackFrom: close.fallbackFrom,
+      undo: await this.undoEligibilityView(diagramId, turn.turnId, user.id),
+    };
+  }
+
+  /** Pasa las posiciones normalizadas de la foto al lienzo (D7). */
+  private applyImageLayout(
+    plan: TurnPlan,
+    snapshot: DiagramContent,
+    mode: AiImageMode,
+    width: number,
+    height: number,
+  ): void {
+    const creates = plan.imageCreateOps();
+    if (creates.length === 0) return;
+
+    const placements = layoutImageItems({
+      items: creates.map((create) => ({ index: create.index, position: create.position })),
+      imageWidth: width,
+      imageHeight: height,
+      existing: snapshot.layouts.map((layout) => ({
+        x: layout.x,
+        y: layout.y,
+        width: layout.width,
+        height: layout.height,
+      })),
+      mode,
+    });
+    for (const placement of placements) {
+      const create = creates[placement.index];
+      if (create !== undefined) plan.applyLayoutRect(create.label, placement.rect);
+    }
+  }
+
+  /**
+   * La precondición de modo, evaluada DENTRO del `FOR UPDATE` (D8/PO-D). Devuelve
+   * el motivo del bloqueo o `null`.
+   *
+   * - crear: el diagrama tiene que seguir sin elementos;
+   * - modificar: ninguna operación POSTERIOR a `baseVersion` puede haber tocado
+   *   alguno de los UUID que el plan referencia. Mover algo no referenciado no
+   *   bloquea: con 30 personas editando, un chequeo de versión estricto no se
+   *   podría confirmar nunca.
+   */
+  private async modePrecondition(tx: Tx, diagramId: string, pending: PendingPreview): Promise<string | null> {
+    if (pending.mode === 'create') {
+      const elements = await tx.umlElement.count({ where: { diagramId } });
+      return elements === 0 ? null : 'diagram_not_empty';
+    }
+    if (pending.referencedIds.length === 0) return null;
+    const touched = await hasLaterTouchSince(tx, diagramId, pending.referencedIds, BigInt(pending.baseVersion));
+    return touched ? 'target_changed' : null;
+  }
+
+  /**
+   * La cadena EFECTIVA con visión y herramientas (FR-D04): la misma regla que
+   * `buildChain` de `AiCallService`, sin reservar nada. Devuelve los límites
+   * mínimos declarados o `null` si ningún eslabón puede con la imagen.
+   */
+  private async visionChain(
+    projectId: string,
+  ): Promise<{ maxImageBytes: number | null; maxImageDimension: number | null } | null> {
+    const view = await this.config.resolve(projectId);
+    const available = new Set(view.providers.filter((provider) => provider.available).map((provider) => provider.id));
+    const links = [view.primary, ...view.fallbackChain].filter(
+      (model) => available.has(model.provider) && model.capabilities.vision && model.capabilities.toolCalling,
+    );
+    if (links.length === 0) return null;
+
+    return {
+      maxImageBytes: minimumOf(links.map((model) => model.capabilities.maxImageBytes)),
+      maxImageDimension: minimumOf(links.map((model) => model.capabilities.maxImageDimension)),
+    };
+  }
+
+  /** Confirm sin vista previa en memoria: reinicio, TTL vencido o doble clic (D8). */
+  private async confirmWithoutPreview(diagramId: string, userId: string, turnId: string): Promise<AiImageConfirmOutcome> {
+    const row = await this.prisma.aiTurn.findUnique({
+      where: { id: turnId },
+      select: {
+        userId: true,
+        diagramId: true,
+        status: true,
+        costUsd: true,
+        provider: true,
+        model: true,
+        fallbackFired: true,
+        fallbackFrom: true,
+        iterations: true,
+      },
+    });
+    if (row === null || row.diagramId !== diagramId) return { kind: 'expired' };
+    if (row.userId !== userId) return { kind: 'not_owner' };
+
+    // `APPLIED` es el eco del doble clic: ya se aplicó, no se aplica de nuevo.
+    if (row.status !== 'APPLIED') return { kind: 'expired' };
+
+    return {
+      kind: 'result',
+      result: {
+        turnId,
+        status: 'APPLIED',
+        // El eco no reconstruye el plan: la fila y el log ya tienen la verdad.
+        summary: { applied: [], notApplied: [], modelText: '' },
+        costUsd: row.costUsd.toString(),
+        iterations: row.iterations,
+        provider: row.provider,
+        model: row.model,
+        fallbackFired: row.fallbackFired,
+        fallbackFrom: row.fallbackFrom,
+        undo: await this.undoEligibilityView(diagramId, turnId, userId),
+        excludedClosure: [],
+        alreadyConfirmed: true,
+      },
+    };
+  }
+
+  private async appliedConfirm(
+    diagramId: string,
+    turnId: string,
+    user: CurrentUserPayload,
+    summary: AiTurnSummary,
+    excludedClosure: number[],
+    alreadyConfirmed: boolean,
+  ): Promise<AiImageConfirmResult> {
+    const close = await this.closeRow(turnId, 'APPLIED', null);
+    return {
+      ...(await this.confirmResult(diagramId, turnId, user.id, summary, close)),
+      status: 'APPLIED',
+      excludedClosure,
+      ...(alreadyConfirmed ? { alreadyConfirmed: true as const } : {}),
+    };
+  }
+
+  private async rejectedConfirm(
+    diagramId: string,
+    turnId: string,
+    user: CurrentUserPayload,
+    rejection: OperationRejected,
+    summary: AiTurnSummary,
+    excludedClosure: number[],
+  ): Promise<AiImageConfirmResult> {
+    const close = await this.closeRow(turnId, 'REJECTED', rejection.message);
+    return {
+      ...(await this.confirmResult(diagramId, turnId, user.id, summary, close)),
+      status: 'REJECTED',
+      rejection,
+      // Un lote rechazado no aplicó nada: la lista de aplicadas queda vacía.
+      summary: { applied: [], notApplied: summary.notApplied, modelText: summary.modelText },
+      excludedClosure,
+    };
+  }
+
+  private async cancelledConfirm(
+    diagramId: string,
+    turnId: string,
+    user: CurrentUserPayload,
+    summary: AiTurnSummary,
+    excludedClosure: number[],
+  ): Promise<AiImageConfirmResult> {
+    const close = await this.closeRow(turnId, 'CANCELLED', 'Nada quedó incluido en la vista previa.');
+    return {
+      ...(await this.confirmResult(diagramId, turnId, user.id, summary, close)),
+      status: 'CANCELLED',
+      summary: { applied: [], notApplied: summary.notApplied, modelText: summary.modelText },
+      excludedClosure,
+    };
+  }
+
+  /** Los datos comunes de un resultado de confirmación: costo, eslabón y deshacer. */
+  private async confirmResult(
+    diagramId: string,
+    turnId: string,
+    userId: string,
+    summary: AiTurnSummary,
+    close: ClosedTurn | null,
+  ): Promise<AiImageConfirmResult> {
+    return {
+      turnId,
+      status: 'APPLIED',
+      summary,
+      costUsd: close?.costUsd ?? '0',
+      iterations: close?.iterations ?? 0,
+      provider: close?.provider ?? '',
+      model: close?.model ?? '',
+      fallbackFired: close?.fallbackFired ?? false,
+      fallbackFrom: close?.fallbackFrom ?? null,
+      undo: await this.undoEligibilityView(diagramId, turnId, userId),
+      excludedClosure: [],
+    };
+  }
+
+  /** Cierra una fila ya abierta leyendo de la fila lo que no es de este método (D8). */
+  private async closeRow(turnId: string, status: AiTurnStatus, errorMessage: string | null): Promise<ClosedTurn | null> {
+    const row = await this.prisma.aiTurn.findUnique({
+      where: { id: turnId },
+      select: {
+        provider: true,
+        model: true,
+        fallbackFired: true,
+        fallbackFrom: true,
+        latencyMs: true,
+        iterations: true,
+      },
+    });
+    if (row === null) return null;
+
+    const costUsd = await this.spend.closeTurn({
+      turnId,
+      status,
+      provider: row.provider,
+      model: row.model,
+      fallbackFired: row.fallbackFired,
+      fallbackFrom: row.fallbackFrom,
+      latencyMs: row.latencyMs,
+      iterations: row.iterations,
+      errorMessage,
+    });
+    return {
+      costUsd,
+      provider: row.provider,
+      model: row.model,
+      fallbackFired: row.fallbackFired,
+      fallbackFrom: row.fallbackFrom,
+      iterations: row.iterations,
+    };
+  }
+
+  /** El cierre de una vista previa cancelada sin confirmar: solo si sigue PENDING. */
+  private async closeCancelled(turnId: string, reason: PreviewCancelReason): Promise<void> {
+    const row = await this.prisma.aiTurn.findUnique({ where: { id: turnId }, select: { status: true } });
+    if (row === null || row.status !== 'PENDING') return;
+    const errorMessage = reason === 'expired' ? 'preview_expired' : 'preview_replaced';
+    await this.closeRow(turnId, 'CANCELLED', errorMessage);
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -708,6 +1480,59 @@ export class AiTurnService {
   private abortStatus(cancelSignal: AbortSignal): AiTurnStatus {
     return cancelSignal.aborted ? 'CANCELLED' : 'FAILED';
   }
+}
+
+/**
+ * ¿Alguna operación POSTERIOR a `version` menciona algún UUID que el plan
+ * referencia? (D8, precondición de modo `modify`.) La consulta es la misma de D5
+ * del texto —un UUID de 36 caracteres no aparece por accidente como
+ * subcadena—; lo que cambia es el punto de corte, que acá es la versión leída
+ * antes de la foto.
+ */
+async function hasLaterTouchSince(
+  tx: Tx,
+  diagramId: string,
+  referencedIds: readonly string[],
+  version: bigint,
+): Promise<boolean> {
+  const mentioned = Prisma.join(
+    referencedIds.map((id) => Prisma.sql`later.payload::text LIKE ${`%${id}%`}`),
+    ' OR ',
+  );
+  const rows = await tx.$queryRaw<{ touched: boolean }[]>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM diagram_operations later
+      WHERE later.diagram_id = ${diagramId}::uuid
+        AND later.version > ${version.toString()}::bigint
+        AND (${mentioned})
+    ) AS touched
+  `;
+  return rows[0]?.touched === true;
+}
+
+/** El último resultado del bucle, o un cierre sintético si nunca hubo uno. */
+function closeResultOf(loop: ImageLoopResult): AiCallResult {
+  return (
+    loop.lastResult ?? {
+      ok: false,
+      aborted: true,
+      errorMessage: 'el turno terminó antes del primer llamado',
+      fallbackFired: false,
+      fallbackFrom: null,
+    }
+  );
+}
+
+/** El `mediaType` que viaja al proveedor, derivado del tipo por CONTENIDO (D2). */
+function mediaTypeOf(type: ImageType): string {
+  return type === 'jpeg' ? 'image/jpeg' : `image/${type}`;
+}
+
+/** El mínimo de los límites DECLARADOS; `null` si ninguno declara ese límite. */
+function minimumOf(values: readonly (number | null)[]): number | null {
+  const declared = values.filter((value): value is number => value !== null);
+  return declared.length === 0 ? null : Math.min(...declared);
 }
 
 /**
