@@ -37,6 +37,36 @@ import { LocksService } from './locks.service';
  * Como la transacción acaba de escribir las tres columnas, la fila releída
  * dentro de la misma transacción es la que produce el `freeze` correcto.
  */
+/**
+ * Reintentos de la hidratación al arrancar. **Desviación fechada de
+ * `hosted-deployment`** (M7, rebanada 4/5, 2026-09-19) — ver la nota en
+ * `openspec/changes/hosted-deployment/tasks.md`.
+ *
+ * En Fly, Neon suspende el cómputo por inactividad y lo despierta en segundos
+ * con la primera consulta. `onModuleInit` lee la base ANTES de que el servidor
+ * escuche (Nest espera los `onModuleInit`), así que una lectura que fallara en
+ * ese instante mataba el proceso: la máquina nunca llegaba a estar sana y el
+ * orquestador la reiniciaba en bucle. Un hosteado cuyo proceso no sobrevive a
+ * una base suspendida no es desplegable, y esta rebanada existe para dejarlo
+ * desplegable.
+ *
+ * Se reintenta un número FIJO de veces, con espera creciente, y el fallo final
+ * **se lanza igual**: si la base no está, la compuerta no puede quedar sin
+ * hidratar en silencio.
+ *
+ * El plazo por intento no es un adorno: `pg` no fija `connectionTimeoutMillis`
+ * (mismo hallazgo que `health.controller.ts`), así que una conexión en el aire
+ * colgaría el arranque para siempre — y un reintento sin plazo no llegaría a
+ * correr nunca.
+ *
+ * El presupuesto total queda acotado a `4 × 5 s + (1 + 2 + 3) s = 26 s`, por
+ * debajo del `grace_period = "30s"` del chequeo de Fly (`fly.toml`): un arranque
+ * en frío entra en el plazo de la plataforma en vez de que el chequeo lo mate.
+ */
+const HYDRATION_ATTEMPTS = 4;
+const HYDRATION_TIMEOUT_MS = 5000;
+const HYDRATION_BACKOFF_MS = 1000;
+
 @Injectable()
 export class DiagramFreezeService implements OnModuleInit {
   private readonly log = new Logger(DiagramFreezeService.name);
@@ -72,16 +102,13 @@ export class DiagramFreezeService implements OnModuleInit {
    * compuerta con la base en `UNLOCKED`. Al arrancar no hay locks, así que acá
    * no se emite nada — solo se cierra la compuerta de lo que ya estaba
    * congelado en la base.
+   *
+   * La lectura va por `hydrateWithRetry` (desviación fechada del 2026-09-19):
+   * sigue siendo esperada por Nest —el servidor NO escucha si no hidrató— pero
+   * ya no muere en el primer fallo contra una base suspendida.
    */
   async onModuleInit(): Promise<void> {
-    const rows = await this.prisma.diagram.findMany({
-      where: { lockState: 'LOCKED_BY_HOST', deletedAt: null },
-      select: {
-        id: true,
-        lockedAt: true,
-        lockedByUser: { select: { id: true, displayName: true } },
-      },
-    });
+    const rows = await this.hydrateWithRetry();
 
     for (const row of rows) {
       const lockedByUser = row.lockedByUser;
@@ -98,6 +125,78 @@ export class DiagramFreezeService implements OnModuleInit {
     }
 
     if (rows.length > 0) this.log.log(`Compuerta de congelado hidratada con ${rows.length} diagrama(s)`);
+  }
+
+  /**
+   * La lectura de la hidratación, con un plazo propio. El rechazo tardío de un
+   * intento vencido se consume acá: sin el `.catch`, esa promesa rechazaría sin
+   * manejador y Node terminaría el proceso —justo lo contrario de lo que esta
+   * desviación busca.
+   */
+  private async readFrozen() {
+    const query = this.prisma.diagram.findMany({
+      where: { lockState: 'LOCKED_BY_HOST', deletedAt: null },
+      select: {
+        id: true,
+        lockedAt: true,
+        lockedByUser: { select: { id: true, displayName: true } },
+      },
+    });
+    void query.catch(() => undefined);
+
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`la base no respondió en ${HYDRATION_TIMEOUT_MS} ms`)),
+        HYDRATION_TIMEOUT_MS,
+      );
+      // A diferencia de la sonda de `/health`, este temporizador NO se
+      // desreferencia: si la consulta se cuelga, es lo único que queda vivo
+      // para rechazar. Sin él el arranque esperaría para siempre.
+    });
+
+    try {
+      return await Promise.race([query, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Reintentos con espera creciente. El último fallo se lanza: no se traga. */
+  private async hydrateWithRetry() {
+    let lastError: unknown = new Error('hidratación de la compuerta no intentada');
+
+    for (let attempt = 1; attempt <= HYDRATION_ATTEMPTS; attempt += 1) {
+      try {
+        const rows = await this.readFrozen();
+        if (attempt > 1) {
+          this.log.log(
+            `Compuerta hidratada en el intento ${attempt}/${HYDRATION_ATTEMPTS}`,
+          );
+        }
+        return rows;
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+
+        if (attempt === HYDRATION_ATTEMPTS) {
+          this.log.error(
+            `Hidratación de la compuerta agotó ${HYDRATION_ATTEMPTS} intentos; el arranque falla: ${message}`,
+          );
+          break;
+        }
+
+        const waitMs = HYDRATION_BACKOFF_MS * attempt;
+        this.log.warn(
+          `Hidratación de la compuerta falló (intento ${attempt}/${HYDRATION_ATTEMPTS}): ${message}. Reintento en ${waitMs} ms`,
+        );
+        await new Promise((resolve) => {
+          setTimeout(resolve, waitMs);
+        });
+      }
+    }
+
+    throw lastError;
   }
 
   /** `POST .../freeze`. Devuelve el `DiagramSummary` con el estado ya aplicado. */

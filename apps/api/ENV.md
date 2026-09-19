@@ -9,6 +9,64 @@ saber dónde está el backend.
 
 ---
 
+## Paridad por entorno (dev / offline / hosteado)
+
+*(`hosted-deployment` D5/D7, tarea 4.1, 2026-09-19.)*
+
+Los **nombres** de variable son los mismos en los tres entornos; lo que cambia es
+el valor y de dónde sale. La verificación V6 compara los nombres de
+`.env.offline.example` —sin `POSTGRES_*`, `SEED_*` ni
+`AI_OPENAI_COMPATIBLE_*`— contra la unión de `[env]` de `fly.toml` y
+`fly secrets list`, sin las `FLY_*` que inyecta la plataforma: el `diff` tiene
+que dar vacío.
+
+| Variable | dev | offline | hosteado |
+|---|---|---|---|
+| `DATABASE_URL` | `postgresql://umlive:umlive@localhost:5434/umlive?schema=public` (compose de `apps/api`) | `…@db:5432/umlive?schema=public` (servicio `db`) | **URL DIRECTA de Neon** —sin `-pooler`— con `sslmode=require`. **Secreto** |
+| `NODE_ENV` | `development` | `production` | `production` (`[env]`) |
+| `PORT` | `3000` | `3000` | `3000` (`[env]`; coincide con `internal_port`) |
+| `COOKIE_SECURE` | sin definir (`false` por `NODE_ENV`) | `false` (LAN por HTTP) | `true` explícito (`[env]`) |
+| `TRUST_PROXY_HOPS` | `0` | `0` | `1` (`[env]`; el proxy agrega un salto) |
+| `AI_SPEND_CEILING_USD` | `25.00` | `2.00` | **`8.00`** (`[env]`) |
+| `NODE_OPTIONS` | — | — | `--max-old-space-size=640` (`[env]`) |
+| `JWT_*_SECRET`, `AUTH_THROTTLE_PEPPER`, claves de IA | `.env` local | `.env.offline` | `fly secrets` |
+
+**Por qué la URL es la directa y no la del pooler** (D5): `prisma migrate
+  deploy` toma un `pg_advisory_lock` **de sesión** y el pooler en modo
+transacción devuelve esa sesión a otro cliente — la migración se rompe. Con una
+sola instancia y ≤ 10 conexiones no hay nada que multiplexar, y así no aparece un
+`DIRECT_URL` que rompería la paridad con la offline. `sslmode=require`: es el
+valor que aceptan los dos consumidores (`prisma.config.ts` y `prisma.service.ts`)
+y `pg` lo trata como `verify-full`.
+
+**Qué vive dónde en el hosteado** (D7):
+
+- **`fly.toml [env]`**, versionado y revisado en el PR: `NODE_ENV`, `PORT`,
+  `COOKIE_SECURE`, `TRUST_PROXY_HOPS`, `AI_SPEND_CEILING_USD`, `NODE_OPTIONS` y
+  los no secretos de este documento (`ACCESS_TOKEN_TTL`, `REFRESH_TOKEN_TTL`,
+  `AI_DEFAULT_*`, límites de IA, `LOCK_*`, `SNAPSHOT_EVERY_N_OPS`,
+  `MAX_RECONNECT_DELTA_OPS`).
+- **`fly secrets import`**, desde un archivo que vive FUERA del repo (por
+  ejemplo `%USERPROFILE%\umlive-secrets\hosted.env`): `DATABASE_URL`,
+  `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `AUTH_THROTTLE_PEPPER`,
+  `GOOGLE_GENERATIVE_AI_API_KEY` y **solo** las demás claves de IA que se usen.
+  `SEED_DEMO_PASSWORD` es temporal: se da de baja apenas termina el seed.
+- **Ningún valor secreto se escribe en el repo ni queda en la imagen.**
+
+> **⚠️ Precios y límites del hosteado SIN VERIFICAR (G0.2 y G0.4, 2026-09-19).**
+> Las tareas que los verifican siguen abiertas: acá no hay ningún precio
+> confirmado. Los supuestos que hay que confirmar en las páginas oficiales antes
+> de pagar son: que la región `gru` exista y su precio por región (hay reportes
+> de comunidad de un recargo cercano al 25 % en algunas regiones), que
+> `shared-cpu-1x` con 1 GB ronda **US$5.70–5.92 por mes** según fuentes de
+> terceros (no confirmado en `fly.io/docs/about/pricing`), el egreso en
+> Sudamérica, la IPv4 compartida gratuita, y las CU-horas del plan Free de Neon
+> (hay un reporte de usuario de que el cómputo incluido bajó de 0.25 a 0.125 CU).
+> **La decisión de pagar es del product owner, no de este documento**: el techo
+> de US$10/mes de PO-3 es el supuesto de trabajo, no una medición.
+
+---
+
 ## Base de datos
 
 | Variable | Qué hace |

@@ -6,6 +6,7 @@ import cookieParser from 'cookie-parser';
 import { join } from 'node:path';
 import { AppModule } from './app.module';
 import { applyHttpSecurity } from './http-security';
+import { logSingleInstance } from './single-instance';
 
 /**
  * ORIGEN ÚNICO (PRD §9, Apéndice B.7).
@@ -104,6 +105,15 @@ async function bootstrap() {
   });
 
   await app.listen(Number(process.env.PORT ?? 3000));
+
+  // D4 (`hosted-deployment`): diagnóstico de INV-H1 — «a lo sumo un proceso
+  // aceptando conexiones». Se llama DESPUÉS de `listen` y con `void`:
+  //  · el `void` es deliberado, es un diagnóstico y no participa del arranque;
+  //  · adentro espera 60 s antes de resolver el DNS privado (D4);
+  //  · NUNCA termina el proceso, ni siquiera si cree ver dos máquinas: los
+  //    locks y la sala viven en la memoria de esta única instancia.
+  // Sin `FLY_APP_NAME` (dev y offline) es un no-op.
+  void logSingleInstance();
 }
 
 void bootstrap();
