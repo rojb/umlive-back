@@ -31,7 +31,14 @@ services:
 volumes:
   umlive-pgdata:
 
-# NOTA (M7): este compose levanta SOLO la base de desarrollo.
-# El compose de contingencia de la defensa — plataforma completa offline,
-# API + PostgreSQL + web compilada — es otro artefacto y va en la raíz del
-# repositorio, porque compone las dos apps. Ver PRD §10, Demo Configuration.
+# NOTA (M7, 2026-09-19): este compose levanta SOLO la base de desarrollo.
+#
+# ⚠️ El compose que se usa en la defensa es el de la RAÍZ del repositorio:
+# `docker-compose.yml` (proyecto `umlive-offline`) — plataforma completa
+# offline: `db` + `migrate` + `api` con la web compilada. Componer las dos
+# apps es por eso que vive en la raíz y no acá.
+#
+# Este archivo NO es el de la defensa: publica el 5434 y lee credenciales
+# fijas de desarrollo. Si en el aula se arranca el compose equivocado, no hay
+# plataforma que demostrar. `docker compose -f docker-compose.yml up` desde la
+# raíz es el comando correcto. Ver PRD §10, Demo Configuration.

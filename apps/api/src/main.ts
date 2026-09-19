@@ -50,9 +50,26 @@ async function bootstrap() {
   // El bundle de la web, servido desde acá. Sin CORS porque no hay otro origen.
   app.useStaticAssets(webRoot, { index: false });
 
-  // Fallback de SPA: cualquier ruta que no sea API ni socket devuelve el index.
+  // Fallback de SPA: cualquier ruta que no sea API, socket ni sonda devuelve
+  // el index.
+  //
+  // `|| req.path === '/health'` (offline-docker-compose, tarea 2.3, 2026-09-19).
+  // Este middleware se registra ANTES de que Nest monte el router, así que sin
+  // la exclusión `GET /health` respondía el `index.html` de la SPA con 200 y el
+  // healthcheck del compose pasaba con la base caída.
+  //
+  // ⚠️ CONFLICTO CONOCIDO: `nfr-verification-and-security-hardening` toca esta
+  // misma línea (404 para `/assets/*` y `*.map`). La rebanada que se aplique
+  // SEGUNDA tiene que rebasar/mergear este bloque a mano antes de commitear,
+  // sin pisar el cambio de la otra.
   app.use((req: any, res: any, next: any) => {
-    if (req.path.startsWith('/api') || req.path.startsWith('/socket.io')) return next();
+    if (
+      req.path.startsWith('/api') ||
+      req.path.startsWith('/socket.io') ||
+      req.path === '/health'
+    ) {
+      return next();
+    }
     res.sendFile(join(webRoot, 'index.html'));
   });
 

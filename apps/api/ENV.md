@@ -46,6 +46,7 @@ que `npm run db:up` y listo. Si usás una base gestionada, cambiala.
 | `ACCESS_TOKEN_TTL` | Vida del access token |
 | `REFRESH_TOKEN_TTL` | Vida del refresh token |
 | `AUTH_THROTTLE_PEPPER` | Secreto del HMAC que llavea el limitador de intentos de login (`login-attempts.service.ts`). Nunca se guarda el email en claro en memoria — ver `design.md` §2.1 |
+| `COOKIE_SECURE` | Fuerza el atributo `Secure` de la cookie de refresh. Sin definir vale `NODE_ENV === 'production'`; definida, **solo** acepta `true` o `false`. Cualquier otro valor (`False`, `0`, `si`) **impide que la API arranque** y nombra la variable |
 
 Generá cada secreto por separado:
 
@@ -59,13 +60,22 @@ openssl rand -base64 48
 > y expondría el refresh a las restricciones de cookies de terceros — falla en
 > silencio, justo en el navegador del evaluador.
 >
-> **`Secure` se activa solo en producción** (`secure: NODE_ENV === 'production'`).
+> **`Secure` lo decide `COOKIE_SECURE`; sin definir, es `NODE_ENV === 'production'`.**
 > No es relajar la seguridad por comodidad: **WebKit no considera a `localhost`
 > contexto seguro y descarta las cookies `Secure`**, así que en desarrollo el
 > login bajo Safari devolvería 200 y aun así no habría sesión, sin ningún error
 > visible. Chrome, Edge y Firefox sí las aceptan. En producción sigue siendo
 > `true`, que es donde importa. Por la misma razón no se usa el prefijo
 > `__Host-`, que exige `Secure`.
+>
+> **⚠️ `COOKIE_SECURE=false` manda el refresh token EN CLARO por la red.** En la
+> plataforma offline (`docker-compose.yml` de la raíz) el valor baja a `false`
+> porque el teléfono entra por `http://<IP-LAN>:3000` y el navegador descarta
+> una cookie `Secure` sobre HTTP: el login daría 200 y no quedaría sesión. Eso
+> es aceptable **únicamente** en la LAN de la demostración. Fuera de la demo,
+> dejá `COOKIE_SECURE` sin definir. Cuando la API arranca con
+> `NODE_ENV=production` y `COOKIE_SECURE=false`, registra una advertencia una
+> sola vez.
 
 ## Asistente de IA
 
@@ -89,10 +99,11 @@ como no disponible en la interfaz en vez de fallar al invocarlo (SC-D02):
 
 | Variable | Por defecto | Qué hace |
 |---|---|---|
-| `AI_SPEND_CEILING_USD` | `25.00` | **Techo duro acumulado.** Al alcanzarlo se rechazan los turnos antes de llamar al proveedor |
+| `AI_SPEND_CEILING_USD` | `25.00` | **Techo duro acumulado.** Al alcanzarlo se rechazan los turnos antes de llamar al proveedor. En offline se fija en `2.00` |
 | `AI_MAX_TOOL_ITERATIONS` | `25` | Corta bucles de herramientas que no convergen |
-| `AI_TURNS_PER_HOUR` | `20` | Límite de ritmo por usuario |
-| `AI_IMAGE_TURNS_PER_HOUR` | `5` | Los turnos con imagen cuestan más |
+| `AI_RATE_LIMIT_TURNS_PER_HOUR` | `20` | Límite de ritmo por usuario |
+| `AI_RATE_LIMIT_IMAGE_TURNS_PER_HOUR` | `5` | Los turnos con imagen cuestan más |
+| `AI_RATE_LIMIT_TRANSCRIPTIONS_PER_HOUR` | *(sin default)* | Límite de ritmo de las transcripciones de audio |
 
 > El presupuesto total del proyecto es **US$30**. El techo queda en 25 para dejar
 > margen a la defensa. A los precios medidos eso son ~4.400 turnos de texto, así
@@ -101,6 +112,18 @@ como no disponible en la interfaz en vez de fallar al invocarlo (SC-D02):
 >
 > Configurá además un límite de facturación en la cuenta del proveedor. Es la
 > segunda línea de defensa, y no depende de que este código esté bien.
+>
+> **Techo offline**: el entorno de la defensa fija `AI_SPEND_CEILING_USD=2.00`
+> (no `25.00`). El acto usa IA pregrabada y esta instancia no debe poder tocar
+> el presupuesto de dev/hosteado. No se implementa ningún `default` distinto
+> acá: el valor lo pone `.env.offline`.
+
+## Seed de la demo
+
+| Variable | Qué hace |
+|---|---|
+| `SEED_HOST_EMAIL` | Email del usuario centinela. Si ya existe en `users`, el seed no escribe nada y termina en 0 (idempotencia) |
+| `SEED_DEMO_PASSWORD` | Contraseña **única** de los cuatro usuarios de la demo (PO-B). Vive solo en `.env.offline`. Faltante o por debajo del mínimo de registro, el seed termina con código 1 y la API no arranca |
 
 ## Concurrencia
 
@@ -132,6 +155,8 @@ DATABASE_URL="postgresql://umlive:umlive@localhost:5434/umlive?schema=public"
 # ── Servidor ────────────────────────────────────────────────────
 PORT=3000
 NODE_ENV=development
+# Sin definir vale `NODE_ENV === 'production'`. Solo `true`/`false`.
+# COOKIE_SECURE=false
 # WEB_DIST_PATH=""
 
 # ── Sesiones ────────────────────────────────────────────────────
@@ -155,8 +180,14 @@ MOONSHOT_API_KEY=""
 
 AI_SPEND_CEILING_USD="25.00"
 AI_MAX_TOOL_ITERATIONS="25"
-AI_TURNS_PER_HOUR="20"
-AI_IMAGE_TURNS_PER_HOUR="5"
+AI_RATE_LIMIT_TURNS_PER_HOUR="20"
+AI_RATE_LIMIT_IMAGE_TURNS_PER_HOUR="5"
+AI_RATE_LIMIT_TRANSCRIPTIONS_PER_HOUR=""
+
+# ── Seed de la demo ─────────────────────────────────────────────
+# Solo lo usan `docker-compose.yml` (raíz) y el seed; en dev no hacen falta.
+SEED_HOST_EMAIL="mariana@umlive.test"
+SEED_DEMO_PASSWORD=""
 
 # ── Concurrencia ────────────────────────────────────────────────
 LOCK_TTL_MS="15000"

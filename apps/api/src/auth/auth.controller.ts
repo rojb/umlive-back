@@ -3,6 +3,7 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
+  Logger,
   Post,
   Req,
   Res,
@@ -22,13 +23,44 @@ import { Public } from './public.decorator';
 /** Nombre y atributos fijos de la cookie de refresh (design.md §4.3). */
 const COOKIE_NAME = 'umlive_rt';
 
+/**
+ * D4 (`offline-docker-compose`, tarea 2.4): resolución estricta de `COOKIE_SECURE`.
+ *
+ * · Sin definir → reproduce el comportamiento actual: `NODE_ENV === 'production'`.
+ *   Así el entorno hosteado y el de desarrollo no cambian.
+ * · Solo acepta `true` o `false`. Cualquier otro valor **tira el arranque**
+ *   nombrando la variable. Un `False` (mayúscula) que se leyera como `true` en
+ *   silencio es el peor modo de falla: el login responde 200 y no queda sesión.
+ *   Fallar al arrancar se ve; fallar en el login del evaluador, no.
+ */
+function resolveCookieSecure(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.COOKIE_SECURE;
+  if (raw === undefined || raw.trim() === '') return env.NODE_ENV === 'production';
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(
+    `COOKIE_SECURE inválida: "${raw}". Se esperaba "true", "false" o sin definir; ` +
+      'cualquier otro valor se rechaza para no adivinar. Corregí la variable y volvé a arrancar.',
+  );
+}
+
+/** Resuelto UNA vez, al cargar el módulo: un valor inválido falla en el arranque, no en el login. */
+const COOKIE_SECURE = resolveCookieSecure(process.env);
+
+if (process.env.NODE_ENV === 'production' && !COOKIE_SECURE) {
+  new Logger('AuthController').warn(
+    'COOKIE_SECURE=false en producción: el refresh token viaja en texto plano. ' +
+      'Es aceptable ÚNICAMENTE en la red de la demostración; fuera de ella, dejalo sin definir.',
+  );
+}
+
 function baseCookieOptions(): CookieOptions {
   return {
     httpOnly: true,
     sameSite: 'lax',
-    // WebKit descarta cookies `Secure` sobre `http://localhost` — condicionar
-    // por entorno evita romper el login en desarrollo bajo Safari.
-    secure: process.env.NODE_ENV === 'production',
+    // WebKit descarta cookies `Secure` sobre `http://localhost` — por eso el
+    // default por entorno en desarrollo. En producción manda `COOKIE_SECURE`.
+    secure: COOKIE_SECURE,
     path: '/api/auth',
   };
 }

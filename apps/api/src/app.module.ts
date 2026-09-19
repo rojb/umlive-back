@@ -7,6 +7,7 @@ import { AuthModule } from './auth/auth.module';
 import { JwtAuthGuard } from './auth/jwt-auth.guard';
 import { CodegenModule } from './codegen/codegen.module';
 import { CollaborationModule } from './collaboration/collaboration.module';
+import { HealthModule } from './health/health.module';
 import { InteropModule } from './interop/interop.module';
 import { JoinCodesModule } from './join-codes/join-codes.module';
 import { PrismaModule } from './prisma/prisma.module';
@@ -57,6 +58,10 @@ const envFilePath = join(__dirname, '..', '.env');
     // catálogo + adaptador + fábrica, libro de gasto y las cuatro rutas de
     // `ai.use`/`ai.configure`.
     AiModule,
+    // M7 — sonda de vida para la plataforma offline (`offline-docker-compose`,
+    // tarea 2.2): `GET /health` pública, la que consulta el healthcheck del
+    // compose. Vive fuera del prefijo `api` a propósito.
+    HealthModule,
   ],
   providers: [
     // Guard de autenticación global (design.md §5): toda ruta requiere sesión
