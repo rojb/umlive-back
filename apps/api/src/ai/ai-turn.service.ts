@@ -81,14 +81,6 @@ import { batchOpId } from './turn-op-ids';
 export const AI_TURN_DEADLINE_MS = 120_000;
 
 /**
- * Código del dueño ajeno (PO-B). El contrato de `AI_TURN_ERROR` de la tarea 1.1
- * no incluyó este código —enumera 9 y `ai_turn_not_owner` no está entre ellos—,
- * así que vive acá como constante local en vez de agregar un código al contrato
- * desde un archivo que no es su dueño.
- */
-const AI_TURN_NOT_OWNER = 'ai_turn_not_owner';
-
-/**
  * Color neutro del `LockHolder` de un usuario que no está conectado a la sala
  * (D10). El color real es el de presencia por sala; este es el respaldo, y es
  * fijo a propósito: un color derivado por hash sugeriría una identidad que

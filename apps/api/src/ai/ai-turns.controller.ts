@@ -175,7 +175,7 @@ export class AiTurnsController {
     const outcome = await this.turns.discardImageTurn(diagramId, user, turnId);
     if (outcome.kind === 'not_owner') {
       res.status(HttpStatus.FORBIDDEN);
-      return { code: AI_TURN_NOT_OWNER };
+      return { code: AI_TURN_ERROR.AI_TURN_NOT_OWNER };
     }
     return undefined;
   }
@@ -286,9 +286,6 @@ function confirmHttp(
       return { code: AI_TURN_ERROR.AI_PREVIEW_EXPIRED };
     case 'not_owner':
       res.status(HttpStatus.FORBIDDEN);
-      return { code: AI_TURN_NOT_OWNER };
+      return { code: AI_TURN_ERROR.AI_TURN_NOT_OWNER };
   }
 }
-
-/** Código del dueño ajeno (PO-B); el contrato `AI_TURN_ERROR` no lo incluye. */
-const AI_TURN_NOT_OWNER = 'ai_turn_not_owner';

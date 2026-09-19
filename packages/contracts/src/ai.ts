@@ -346,6 +346,16 @@ export const AI_TURN_ERROR = {
   AI_PREVIEW_STALE: 'ai_preview_stale',
   /** La confirmación nombró un índice que el plan no tiene: `400`. */
   AI_PREVIEW_ITEM_UNKNOWN: 'ai_preview_item_unknown',
+  /**
+   * La vista previa es de otra persona (PO-B): `403`.
+   *
+   * Se declara acá —y no como literal local en `apps/api`— porque un cliente
+   * no puede tipar un código que el contrato no nombra. El `403` es el mismo
+   * estado que el resto de las denegaciones de pertenencia de la plataforma
+   * (`ProjectAccessGuard`), así que la superficie de IA no inventa uno nuevo.
+   * Está en el diseño D8/«Contratos» (`ai_turn_not_owner 403`).
+   */
+  AI_TURN_NOT_OWNER: 'ai_turn_not_owner',
 } as const;
 
 export type AiTurnErrorCode = (typeof AI_TURN_ERROR)[keyof typeof AI_TURN_ERROR];
