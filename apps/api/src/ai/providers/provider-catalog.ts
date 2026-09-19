@@ -1,0 +1,261 @@
+import type {
+  AiCapabilities,
+  AiModelPrice,
+  AiModelView,
+  AiProviderId,
+  AiProviderUnavailableReason,
+} from '@umlive/contracts';
+import { createAnthropic } from '@ai-sdk/anthropic';
+import { createDeepSeek } from '@ai-sdk/deepseek';
+import { createGoogle } from '@ai-sdk/google';
+import { createMoonshotAI } from '@ai-sdk/moonshotai';
+import { createOpenAI } from '@ai-sdk/openai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+import type { LanguageModel } from 'ai';
+
+/**
+ * El catálogo ES la tabla de precios (design D1).
+ *
+ * `price` es obligatorio en cada `CatalogModel`: un modelo sin precio no
+ * compila, y por lo tanto no existe. Eso hace cumplir la tarea 3.8 —
+ * "un modelo sin precio verificado no se agrega al catálogo ni es
+ * seleccionable"— por construcción, no por disciplina.
+ *
+ * Cada `CatalogProvider` es una entrada de catálogo, no una clase: `buildModel`
+ * delega en la fábrica del vendor del AI SDK v7. "Un adaptador por vendor"
+ * (`PRD.md:683`) se cumple acá por entrada; la clase adaptadora es una sola
+ * (`AiSdkLlmProvider`, design D1/D2).
+ *
+ * Especificación: `.../ai-provider-layer-backend/spec.md`, "`LlmProvider` es el
+ * único contrato". Diseño: `design.md` D1. Capacidades: matriz de `PRD.md`
+ * Apéndice D ("LLM Provider Capability Matrix", verificada 2026-09-12).
+ *
+ * `apps/api` es CommonJS: imports relativos sin `.js`.
+ */
+
+/** Credenciales y endpoint con los que se construye un modelo del SDK. */
+export type ProviderSettings = {
+  readonly apiKey?: string;
+  readonly baseURL?: string;
+};
+
+export type CatalogModel = {
+  readonly id: string;
+  readonly label: string;
+  readonly capabilities: AiCapabilities;
+  readonly price: AiModelPrice;
+};
+
+export type CatalogProvider = {
+  readonly id: AiProviderId;
+  readonly label: string;
+  /** Variable de entorno de la clave. `null` para `openai-compatible`. */
+  readonly envKey: string | null;
+  /**
+   * Motivo ESTÁTICO por el que el proveedor nunca es seleccionable, sin
+   * importar el entorno. Hoy sólo `moonshot` (sin precio verificado).
+   */
+  readonly unavailableReason: AiProviderUnavailableReason | null;
+  readonly models: readonly CatalogModel[];
+  buildModel(settings: ProviderSettings, modelId: string): LanguageModel;
+};
+
+/**
+ * Las capacidades de visión llevan `maxImageBytes`/`maxImageDimension` en
+ * `null`: los fija `ai-image-input` (design D1). Hasta entonces `null`
+ * significa "límite no fijado", y los llamadores deben tratarlo como "sin
+ * visión" (contrato `AiCapabilities`, `packages/contracts/src/ai.ts`).
+ */
+const VISION_LIMITS_UNSET = { maxImageBytes: null, maxImageDimension: null } as const;
+
+// ── Fuentes de precio, con fecha ────────────────────────────────────────────
+// Ningún número de este archivo es inventado: sale de una de estas fuentes.
+
+/** Gemini 3.8 Flash y GPT-5.6 Luna: PRD Apéndice D.2, verificado 2026-09-12. */
+const REPO_PRICE_SOURCE = 'PRD.md Apéndice D.2 (precios verificados 2026-09-12)';
+const REPO_PRICE_VERIFIED_AT = '2026-09-12';
+
+/** Anthropic: página oficial de precios, verificada 2026-09-18 por el coordinador. */
+const ANTHROPIC_PRICE_SOURCE = 'https://platform.claude.com/docs/en/about-claude/pricing';
+const ANTHROPIC_PRICE_VERIFIED_AT = '2026-09-18';
+
+/** DeepSeek: documentación oficial de precios. */
+const DEEPSEEK_PRICE_SOURCE = 'https://api-docs.deepseek.com/quick_start/pricing';
+const DEEPSEEK_PRICE_VERIFIED_AT = '2026-09-18';
+
+export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    envKey: 'GOOGLE_GENERATIVE_AI_API_KEY',
+    unavailableReason: null,
+    models: [
+      {
+        id: 'gemini-3.8-flash',
+        label: 'Gemini 3.8 Flash',
+        capabilities: {
+          text: true,
+          vision: true,
+          toolCalling: true,
+          structuredOutput: true,
+          ...VISION_LIMITS_UNSET,
+        },
+        // PRD Apéndice D.2: la tarifa rige hasta 2026-12-31 y después se duplica.
+        price: {
+          inputPerMtokUsd: '0.75',
+          outputPerMtokUsd: '3.75',
+          source: REPO_PRICE_SOURCE,
+          verifiedAt: REPO_PRICE_VERIFIED_AT,
+        },
+      },
+    ],
+    buildModel: (settings, modelId) =>
+      createGoogle({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+  },
+  {
+    id: 'openai',
+    label: 'OpenAI',
+    envKey: 'OPENAI_API_KEY',
+    unavailableReason: null,
+    models: [
+      {
+        id: 'gpt-5.6-luna',
+        label: 'GPT-5.6 Luna',
+        capabilities: {
+          text: true,
+          vision: true,
+          toolCalling: true,
+          structuredOutput: true,
+          ...VISION_LIMITS_UNSET,
+        },
+        // PRD Apéndice D.2: el tier más barato de OpenAI de la generación actual.
+        price: {
+          inputPerMtokUsd: '0.20',
+          outputPerMtokUsd: '1.20',
+          source: REPO_PRICE_SOURCE,
+          verifiedAt: REPO_PRICE_VERIFIED_AT,
+        },
+      },
+    ],
+    buildModel: (settings, modelId) =>
+      createOpenAI({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+  },
+  {
+    id: 'anthropic',
+    label: 'Anthropic Claude',
+    envKey: 'ANTHROPIC_API_KEY',
+    unavailableReason: null,
+    models: [
+      {
+        id: 'claude-sonnet-5',
+        label: 'Claude Sonnet 5',
+        capabilities: {
+          text: true,
+          vision: true,
+          toolCalling: true,
+          structuredOutput: true,
+          ...VISION_LIMITS_UNSET,
+        },
+        price: {
+          inputPerMtokUsd: '2',
+          outputPerMtokUsd: '10',
+          source: ANTHROPIC_PRICE_SOURCE,
+          verifiedAt: ANTHROPIC_PRICE_VERIFIED_AT,
+        },
+      },
+      {
+        id: 'claude-haiku-4-5-20251001',
+        label: 'Claude Haiku 4.5',
+        capabilities: {
+          text: true,
+          vision: true,
+          toolCalling: true,
+          structuredOutput: true,
+          ...VISION_LIMITS_UNSET,
+        },
+        price: {
+          inputPerMtokUsd: '1',
+          outputPerMtokUsd: '5',
+          source: ANTHROPIC_PRICE_SOURCE,
+          verifiedAt: ANTHROPIC_PRICE_VERIFIED_AT,
+        },
+      },
+    ],
+    buildModel: (settings, modelId) =>
+      createAnthropic({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    envKey: 'DEEPSEEK_API_KEY',
+    unavailableReason: null,
+    models: [
+      {
+        id: 'deepseek-flash',
+        label: 'DeepSeek V4.1 Flash',
+        // El modelo del catálogo es `deepseek-flash`; su visión vive en el
+        // endpoint experimental `deepseek-v4-flash-vision-exp`, que no está
+        // acá. Por eso `vision: false` (matriz de `PRD.md` Apéndice D, fila
+        // DeepSeek: "vision only on the experimental endpoint").
+        capabilities: {
+          text: true,
+          vision: false,
+          toolCalling: true,
+          structuredOutput: true,
+          ...VISION_LIMITS_UNSET,
+        },
+        // DeepSeek cobra por franja: hora pico / hora valle. Se elige la
+        // tarifa de PICO ($0.30/$1.20 cache-miss) a propósito: la reserva es
+        // una cota superior y un techo que subestima es peor que uno que
+        // sobreestima (nota fechada 2026-09-18 en tasks.md, tarea 3.2).
+        price: {
+          inputPerMtokUsd: '0.30',
+          outputPerMtokUsd: '1.20',
+          source: DEEPSEEK_PRICE_SOURCE,
+          verifiedAt: DEEPSEEK_PRICE_VERIFIED_AT,
+        },
+      },
+    ],
+    buildModel: (settings, modelId) =>
+      createDeepSeek({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+  },
+  {
+    id: 'moonshot',
+    label: 'Moonshot Kimi',
+    envKey: 'MOONSHOT_API_KEY',
+    // Tarea 3.8: tres páginas oficiales devolvieron links sin cifras. Sin
+    // precio verificado, `kimi-k2.6` NO entra al catálogo (models vacío) y el
+    // proveedor queda no seleccionable con este motivo. Nunca se adivina.
+    unavailableReason: 'price_unverified',
+    models: [],
+    buildModel: (settings, modelId) =>
+      createMoonshotAI({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+  },
+  {
+    id: 'openai-compatible',
+    label: 'Endpoint OpenAI-compatible',
+    // La clave es OPCIONAL (design D5): el endpoint puede no exigirla.
+    envKey: null,
+    unavailableReason: null,
+    // Modelos dinámicos: salen de `AI_OPENAI_COMPATIBLE_*` en la fábrica. El
+    // precio también, así que no hay ninguna cifra estática que inventar.
+    models: [],
+    buildModel: (settings, modelId) =>
+      createOpenAICompatible({
+        name: 'openai-compatible',
+        baseURL: settings.baseURL ?? '',
+        apiKey: settings.apiKey,
+      })(modelId),
+  },
+];
+
+/** Vista `AiModelView` de un modelo del catálogo, para la fábrica y el panel. */
+export function toModelView(provider: AiProviderId, model: CatalogModel): AiModelView {
+  return {
+    provider,
+    model: model.id,
+    label: model.label,
+    capabilities: model.capabilities,
+    price: model.price,
+  };
+}

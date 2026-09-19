@@ -1,0 +1,107 @@
+import type { AiCapabilities } from '@umlive/contracts';
+
+/**
+ * El único contrato de acceso a modelos del backend (`PRD.md:689`, FR-D01).
+ *
+ * Nada por encima de esta costura sabe qué proveedor está configurado: ni la
+ * forma del pedido, ni la forma de la respuesta, ni ninguna capacidad de un
+ * vendor cruza el límite (design D2). Por eso acá no aparece ningún tipo de
+ * `ai` ni de los paquetes `@ai-sdk/*`: el adaptador traduce y devuelve estos
+ * tipos neutrales.
+ *
+ * Especificación: `.../ai-provider-layer-backend/spec.md`, "`LlmProvider` es
+ * el único contrato de acceso a modelos". Diseño: `design.md` D1/D2.
+ *
+ * `apps/api` es CommonJS: los imports relativos van sin `.js`.
+ */
+
+/** Un mensaje del chat, en el dialecto neutral del backend. */
+export interface LlmMessage {
+  readonly role: 'system' | 'user' | 'assistant';
+  readonly content: string;
+}
+
+/**
+ * Una imagen de entrada. `data` acepta bytes crudos o base64; el adaptador la
+ * traduce a `FilePart` (design D2). `ImagePart` del SDK está deprecado.
+ */
+export interface LlmImage {
+  readonly mediaType: string;
+  readonly data: string | Uint8Array;
+}
+
+/**
+ * Una herramienta declarada en JSON Schema plano (FR-D09): sin dialecto de
+ * vendor. La traducción al SDK la hace `ai-sdk.provider.ts` y la validación
+ * server-side de argumentos (FR-D05) es de la rebanada 2 — acá solo viaja.
+ */
+export interface ToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  /** JSON Schema del input. Sin `additionalProperties` implícito de ningún vendor. */
+  readonly parameters: Record<string, unknown>;
+}
+
+/**
+ * El resultado de un `complete`/`completeWithImages`.
+ *
+ * `toolCalls` son llamadas devueltas por el modelo — nunca ejecutadas acá.
+ *
+ * `inputTokens`/`outputTokens` son `number | null`: el SDK los expone como
+ * `number | undefined`, y `undefined` significa "el proveedor no reportó uso".
+ * El libro de gasto (D3) distingue ese caso de un cero, porque `undefined`
+ * deja la reserva en pie en vez de cobrar cero.
+ */
+export interface LlmCompletion {
+  readonly text: string;
+  readonly toolCalls: readonly {
+    readonly toolCallId: string;
+    readonly toolName: string;
+    readonly input: unknown;
+  }[];
+  readonly usage: {
+    readonly inputTokens: number | null;
+    readonly outputTokens: number | null;
+  };
+  /** Motivo de fin del proveedor, ya normalizado a `string` por el adaptador. */
+  readonly finishReason: string;
+}
+
+/**
+ * Opciones de un llamado. `maxOutputTokens` es el tope que hace que la reserva
+ * sea una cota superior (design D2/D3); `abortSignal` es del llamador y, a
+ * diferencia de un error de proveedor, corta la cadena entera (FR-D08).
+ */
+export interface LlmCallOptions {
+  /** Si falta, el adaptador usa `MAX_OUTPUT_TOKENS`. */
+  readonly maxOutputTokens?: number;
+  readonly abortSignal?: AbortSignal;
+}
+
+/**
+ * FR-D01: exactamente tres operaciones. `complete` y `completeWithImages` no
+ * ejecutan herramientas — devuelven las llamadas y el bucle queda para la
+ * rebanada 2 (`design.md` D2, `operations-pipeline/design.md:274`).
+ *
+ * Se agrega un tercer parámetro OPCIONAL `options` en ambas: la lista de tipos
+ * de la tarea 3.1 incluye `LlmCallOptions`, así que el contrato tiene que
+ * aceptarlo en algún lado. Es opcional, de modo que una llamada de dos
+ * argumentos sigue compilando.
+ */
+export interface LlmProvider {
+  complete(
+    messages: readonly LlmMessage[],
+    tools: readonly ToolDefinition[],
+    options?: LlmCallOptions,
+  ): Promise<LlmCompletion>;
+
+  completeWithImages(
+    messages: readonly LlmMessage[],
+    images: readonly LlmImage[],
+    tools: readonly ToolDefinition[],
+    options?: LlmCallOptions,
+  ): Promise<LlmCompletion>;
+
+  /** FR-D03: declaración estática, nunca asumida por el llamador. */
+  describeCapabilities(): AiCapabilities;
+}
