@@ -30,7 +30,7 @@ import { BASE_PACKAGE } from '../build-ir';
 import { DERIVED_TYPE_SUFFIXES } from '../java-names';
 import type { IrEntity, IrField, IrRelationField } from '../codegen-ir';
 import type { GeneratedFile } from '../zip';
-import { emitOperationStub, renderRecord } from './layers';
+import { emitOperationStub, renderRecord, requiredDtoImports } from './layers';
 
 /** Raíz del código fuente emitido. Ancla del layout; la comparte `project.ts`. */
 export const JAVA_SOURCE_ROOT = `src/main/java/${BASE_PACKAGE.replace(/\./g, '/')}`;
@@ -530,6 +530,10 @@ export function emitServiceImpl(entity: IrEntity): string {
  * `Dirección` → `/api/direccion`, con su nota `route_ascii_folded` en el
  * reporte. Los códigos son los de D11: lista `200`, `GET /{id}` `200|404`,
  * `POST` `201`, `PUT` `200|404`, `DELETE` `204|404`.
+ *
+ * `create`/`update` llevan `@Valid` en el `@RequestBody` (D5, FR-F11): el
+ * rechazo por Bean Validation pasa por `ApiExceptionHandler` antes de que el
+ * `request` llegue al servicio, así que nunca toca el repositorio.
  */
 export function emitController(entity: IrEntity): string {
   const name = derivedName(entity, 'Controller');
@@ -543,6 +547,7 @@ export function emitController(entity: IrEntity): string {
     `${DTO_PACKAGE}.${response}`,
     `${SERVICE_PACKAGE}.${service}`,
     ...idField(entity).type.imports,
+    'jakarta.validation.Valid',
     'java.util.List',
     'org.springframework.http.HttpStatus',
     'org.springframework.web.bind.annotation.DeleteMapping',
@@ -579,12 +584,12 @@ export function emitController(entity: IrEntity): string {
     '',
     `${INDENT}@PostMapping`,
     `${INDENT}@ResponseStatus(HttpStatus.CREATED)`,
-    `${INDENT}public ${response} create(@RequestBody ${request} request) {`,
+    `${INDENT}public ${response} create(@Valid @RequestBody ${request} request) {`,
     `${INDENT}${INDENT}return service.create(request);`,
     `${INDENT}}`,
     '',
     `${INDENT}@PutMapping("/{id}")`,
-    `${INDENT}public ${response} update(@PathVariable("id") ${id} id, @RequestBody ${request} request) {`,
+    `${INDENT}public ${response} update(@PathVariable("id") ${id} id, @Valid @RequestBody ${request} request) {`,
     `${INDENT}${INDENT}return service.update(id, request);`,
     `${INDENT}}`,
     '',
@@ -609,11 +614,16 @@ export function emitController(entity: IrEntity): string {
  *
  * Los componentes salen de `dtoFields` (D1) y no de los campos: así la Fase 4
  * puede aplanar los ancestros sin tocar este emisor.
+ *
+ * Cada componente obligatorio (`field.required`, D5, FR-F11) lleva su anotación
+ * de Bean Validation: así un `POST`/`PUT` que le falte un campo mandatorio
+ * rechaza con `400` antes de tocar el repositorio, no en el `flush`.
  */
 export function emitRequestDto(entity: IrEntity): string {
   const name = derivedName(entity, 'Request');
   const fields = entity.dtoFields.filter((field) => field.inRequest);
-  return renderFile(DTO_PACKAGE, fields.flatMap((field) => field.imports), renderRecord(name, fields));
+  const imports = [...fields.flatMap((field) => field.imports), ...requiredDtoImports(fields)];
+  return renderFile(DTO_PACKAGE, imports, renderRecord(name, fields, { validate: true }));
 }
 
 /** `record` de respuesta: **con la PK** y con todas las referencias, dueñas o inversas (D5). */

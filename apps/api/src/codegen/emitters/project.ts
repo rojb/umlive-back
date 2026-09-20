@@ -56,10 +56,26 @@ const DATABASE_PORT = 15432;
 const SERVER_PORT = 8080;
 
 /**
+ * Versión de `springdoc-openapi` (FR-F12). El BOM de `spring-boot-starter-parent`
+ * NO gestiona `org.springdoc`, así que va de propiedad Maven explícita —el
+ * mecanismo que la tarea T3 pide— y no de un `<version>` suelto en la
+ * dependencia. `3.1.1` es la primera línea de springdoc-openapi que declara
+ * soporte para Spring Boot 4 (Jakarta EE 9, Java 17+); la línea `2.x` se quedó
+ * en Spring Boot 3. Publica OpenAPI 3.1 por defecto desde springdoc `2.8.0`,
+ * pero `application.yml` lo deja explícito para no depender de ese default.
+ */
+const SPRINGDOC_VERSION = '3.1.1';
+
+/**
  * `pom.xml` (D8). Las dependencias son exactamente las de la tabla del diseño:
  * `webmvc`, `data-jpa`, `flyway`, `flyway-database-postgresql` (el starter de
- * Flyway 4.1.0 NO trae el módulo de PostgreSQL — hallazgo 4) y `postgresql` en
- * alcance `runtime`. Todas con versión gestionada por la BOM.
+ * Flyway 4.1.0 NO trae el módulo de PostgreSQL — hallazgo 4), `postgresql` en
+ * alcance `runtime`, `validation` (FR-F11) y `springdoc-openapi-starter-webmvc-ui`
+ * (FR-F12). Las de `org.springframework.boot` van con versión gestionada por la
+ * BOM del padre; `spring-boot-starter-validation` NO se renombró en Spring Boot
+ * 4.0 —a diferencia de `web` → `webmvc`— así que conserva su artifactId de
+ * siempre. `springdoc` es de un `groupId` ajeno a la BOM, así que lleva su
+ * propia propiedad de versión gestionada.
  */
 function emitPom(artifactId: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -81,6 +97,7 @@ function emitPom(artifactId: string): string {
 \t\t<java.version>${JAVA_VERSION}</java.version>
 \t\t<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 \t\t<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+\t\t<springdoc-openapi.version>${SPRINGDOC_VERSION}</springdoc-openapi.version>
 \t</properties>
 \t<dependencies>
 \t\t<dependency>
@@ -96,6 +113,10 @@ function emitPom(artifactId: string): string {
 \t\t\t<artifactId>spring-boot-starter-webmvc</artifactId>
 \t\t</dependency>
 \t\t<dependency>
+\t\t\t<groupId>org.springframework.boot</groupId>
+\t\t\t<artifactId>spring-boot-starter-validation</artifactId>
+\t\t</dependency>
+\t\t<dependency>
 \t\t\t<groupId>org.flywaydb</groupId>
 \t\t\t<artifactId>flyway-database-postgresql</artifactId>
 \t\t</dependency>
@@ -103,6 +124,11 @@ function emitPom(artifactId: string): string {
 \t\t\t<groupId>org.postgresql</groupId>
 \t\t\t<artifactId>postgresql</artifactId>
 \t\t\t<scope>runtime</scope>
+\t\t</dependency>
+\t\t<dependency>
+\t\t\t<groupId>org.springdoc</groupId>
+\t\t\t<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+\t\t\t<version>\${springdoc-openapi.version}</version>
 \t\t</dependency>
 \t</dependencies>
 \t<build>
@@ -135,7 +161,14 @@ public class ${APPLICATION_TYPE_NAME} {
 `;
 }
 
-/** Datasource, `validate`, `open-in-view: false` y puerto HTTP (D8). Texto del golden. */
+/**
+ * Datasource, `validate`, `open-in-view: false`, puerto HTTP (D8) y la versión
+ * de OpenAPI que sirve `springdoc` (FR-F12). `OPENAPI_3_1` queda explícito en
+ * vez de confiar en el default de la librería: es el default desde springdoc
+ * `2.8.0`, pero un futuro `springdoc-openapi.version` más viejo —o un cambio de
+ * default corriente arriba— no debe volver falso «sirve OpenAPI 3.1» sin que
+ * este archivo lo refleje.
+ */
 function emitApplicationYml(): string {
   return `spring:
   datasource:
@@ -148,6 +181,10 @@ function emitApplicationYml(): string {
     open-in-view: false
   flyway:
     enabled: true
+
+springdoc:
+  api-docs:
+    version: OPENAPI_3_1
 
 server:
   port: ${SERVER_PORT}
@@ -266,14 +303,28 @@ El wrapper usa Maven 3.9.14; no hace falta tener Maven instalado.
 
 ${endpointRows(ir.entities)}
 
+## Documentación de la API
+
+| Documento | Ruta |
+| --- | --- |
+| OpenAPI 3.1 | \`GET /v3/api-docs\` |
+| Swagger UI | \`GET /swagger-ui.html\` |
+
+El documento describe cada endpoint y marca en \`required\` los campos
+obligatorios de cada \`XRequest\`: un cliente que no conoce el diagrama puede
+descubrir la API y saber, antes de enviar nada, qué campos no puede omitir.
+
 ## Límites declarados
 
 - \`ddl-auto: validate\`: el esquema lo aplica Flyway y Hibernate solo lo valida.
-- Sin Bean Validation: un \`POST\` al que le falte un campo obligatorio responde
-  \`400\`, no \`500\`. Lo produce el \`ApiExceptionHandler\` al hacer \`flush\`:
-  Hibernate detecta el nulo antes de tocar la base (\`PropertyValueException\`) y,
-  si la columna llega igual a PostgreSQL, el \`SQLState 23502\` también se traduce
-  a \`400\`. El golden de la Fase 0 (0.10) midió los dos caminos.
+- Bean Validation (\`@NotNull\`/\`@NotBlank\`/\`@NotEmpty\`) rechaza con \`400\` un
+  \`POST\`/\`PUT\` al que le falte un campo obligatorio, antes de tocar el
+  repositorio: lo hace el \`@Valid\` del controlador, y \`ApiExceptionHandler\`
+  traduce el rechazo a un cuerpo con el campo señalado. Un nulo que igual
+  llegara a Hibernate —una restricción que Bean Validation no cubre— sigue
+  cayendo en el mismo \`400\` por el camino viejo: \`PropertyValueException\` en
+  el \`flush\`, o el \`SQLState 23502\` de PostgreSQL cuando la columna llega
+  hasta la base. El golden de la Fase 0 (0.10) midió los dos caminos.
 - Las referencias se exponen por id (\`clienteId\`, \`cursoIds\`): ningún DTO contiene
   una entidad, así que no hay ciclos en el JSON ni \`@JsonIgnore\`. Un id que no
   existe responde \`400\`, y borrar un registro referenciado, \`409\`.

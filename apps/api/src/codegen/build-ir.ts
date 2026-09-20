@@ -740,7 +740,16 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     // propio espacio porque los componentes comparten nombre con los campos.
     const dtoFields: IrDtoField[] = fields.map((field) => {
       registerDto(field.name);
-      return { name: field.name, type: field.type.java, imports: field.type.imports, inRequest: !field.isId };
+      return {
+        name: field.name,
+        type: field.type.java,
+        imports: field.type.imports,
+        inRequest: !field.isId,
+        // Obligatorio cuando la columna es `NOT NULL` (`!field.nullable`, D5,
+        // FR-F11); `rebuildDtoFields` vuelve a calcularlo después de aplanar la
+        // herencia, así que este valor es solo el de partida.
+        required: !field.nullable,
+      };
     });
 
     // Operaciones: stub con la clave de firma ya mapeada (contradicción 2, D5).
@@ -1049,6 +1058,8 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       type: collectionOf(relation) ? `List<${relation.dto.idType}>` : relation.dto.idType,
       imports: [...(collectionOf(relation) ? ['java.util.List'] : []), ...pk.type.imports],
       inRequest: relation.dto.inRequest,
+      // La obligatoriedad de la referencia ya la resolvió la asociación (D3, D5).
+      required: relation.dto.required,
     });
   };
 
@@ -2050,6 +2061,10 @@ function rebuildDtoFields(entities: IrEntity[]): void {
         type: field.type.java,
         imports: field.type.imports,
         inRequest: !field.isId,
+        // `!field.nullable` (D5, FR-F11): la columna es `NOT NULL` cuando
+        // `lowerBound >= 1`, y ahí es donde `attribute.lowerBound < 1` puso
+        // `nullable = true` en la Fase B.
+        required: !field.nullable,
       })),
       ...entity.relations.map((relation) => {
         const collection = relationIsCollection(relation);
@@ -2061,6 +2076,7 @@ function rebuildDtoFields(entities: IrEntity[]): void {
             ...(relation.dto.idType === 'UUID' ? ['java.util.UUID'] : []),
           ],
           inRequest: relation.dto.inRequest,
+          required: relation.dto.required,
         };
       }),
     ];

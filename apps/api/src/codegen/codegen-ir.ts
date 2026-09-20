@@ -44,7 +44,12 @@ export interface IrField {
   type: IrTypeRef;
   /** `true` si es una enumeración modelada: `@Enumerated(EnumType.STRING)`, columna `varchar(255)`. */
   enumerated: boolean;
-  /** `true` si el campo lleva `@Column(nullable = false)` y la columna `NOT NULL` (`lowerBound >= 1`). */
+  /**
+   * `true` si la columna **admite** `NULL` (`lowerBound < 1`). La polaridad es
+   * la de JPA, no la del modelo: el campo obligatorio es `nullable === false`,
+   * y es ese el que lleva `@Column(nullable = false)` y `NOT NULL` en el DDL.
+   * `IrDtoField.required` es su negación ya resuelta, para no repetirla.
+   */
   nullable: boolean;
   /** `true` si es la clave primaria (declarada o inyectada). */
   isId: boolean;
@@ -206,6 +211,14 @@ export interface IrDtoField {
   imports: string[];
   /** `true` si el componente viaja en `XRequest`; `false` para la PK y las referencias inversas. */
   inRequest: boolean;
+  /**
+   * `true` si el componente es obligatorio: `!field.nullable` en un atributo,
+   * `relation.dto.required` en una referencia dueña (D5, FR-F11). La PK y las
+   * referencias inversas quedan en `false` —nunca viajan en `XRequest`, así que
+   * el emisor de Bean Validation no las anota— pero el valor viaja igual para
+   * que `emitResponseDto` no tenga que volver a derivarlo.
+   */
+  required: boolean;
 }
 
 /**

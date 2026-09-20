@@ -36,6 +36,39 @@ export function emitEnumFile(irEnum: IrEnum): GeneratedFile {
 }
 
 /**
+ * Anotación de Bean Validation del componente obligatorio (D5, FR-F11). `String`
+ * va con `@NotBlank` —`@NotNull` sola deja pasar `""`—; una colección
+ * obligatoria (`List<…>`) va con `@NotEmpty`; cualquier otro tipo, `@NotNull`.
+ * Solo lo consulta `renderRecord` cuando `options.validate` está prendido, así
+ * que nunca decide nada del modelo (D2): lee `field.type` y `field.required`,
+ * los dos ya resueltos en la IR.
+ */
+function requiredAnnotation(field: IrDtoField): '@NotBlank' | '@NotEmpty' | '@NotNull' {
+  if (field.type === 'String') return '@NotBlank';
+  if (field.type.startsWith('List<')) return '@NotEmpty';
+  return '@NotNull';
+}
+
+/** `import` de Bean Validation que exige cada anotación de `requiredAnnotation`. */
+const REQUIRED_ANNOTATION_IMPORTS: Record<'@NotBlank' | '@NotEmpty' | '@NotNull', string> = {
+  '@NotBlank': 'jakarta.validation.constraints.NotBlank',
+  '@NotEmpty': 'jakarta.validation.constraints.NotEmpty',
+  '@NotNull': 'jakarta.validation.constraints.NotNull',
+};
+
+/**
+ * Importaciones de Bean Validation que exige un `record` de petición (D5,
+ * FR-F11): una por anotación realmente usada entre los componentes
+ * obligatorios, para que `entity.ts` las sume a las de `field.imports` sin
+ * hard-codearlas en el renderer. Con ningún componente obligatorio, la lista
+ * sale vacía.
+ */
+export function requiredDtoImports(fields: readonly IrDtoField[]): string[] {
+  const used = new Set(fields.filter((field) => field.required).map(requiredAnnotation));
+  return [...used].map((annotation) => REQUIRED_ANNOTATION_IMPORTS[annotation]);
+}
+
+/**
  * Cuerpo de un `record` DTO (D5). Los componentes llegan ya resueltos y
  * ordenados desde `entity.dtoFields`: la PK primero, después los atributos y al
  * final los componentes de relación (`clienteId`, `cursoIds`). Acá no se decide
@@ -43,9 +76,22 @@ export function emitEnumFile(irEnum: IrEnum): GeneratedFile {
  *
  * El nombre del `record` lo pasa `entity.ts`, que es quien conoce los tipos
  * derivados de la entidad (D3): este módulo no reconstruye nombres.
+ *
+ * `options.validate` solo lo prende `emitRequestDto` (D5, FR-F11): el `record`
+ * de respuesta nunca lleva Bean Validation, porque nadie lo valida al salir.
  */
-export function renderRecord(recordName: string, fields: readonly IrDtoField[]): string {
-  const components = fields.map((field) => `${INDENT}${INDENT}${field.type} ${field.name}`).join(',\n');
+export function renderRecord(
+  recordName: string,
+  fields: readonly IrDtoField[],
+  options: { validate?: boolean } = {},
+): string {
+  const validate = options.validate ?? false;
+  const components = fields
+    .map((field) => {
+      const annotation = validate && field.required ? `${requiredAnnotation(field)} ` : '';
+      return `${INDENT}${INDENT}${annotation}${field.type} ${field.name}`;
+    })
+    .join(',\n');
   return `public record ${recordName}(\n${components}) {\n}`;
 }
 

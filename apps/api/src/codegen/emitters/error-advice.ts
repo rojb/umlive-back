@@ -1,11 +1,16 @@
 /**
- * Emisor del `ApiExceptionHandler` (tarea 2.6, D6).
+ * Emisor del `ApiExceptionHandler` (tarea 2.6, D6; extendido en la rebanada de
+ * Bean Validation, FR-F11).
  *
- * Es la pieza que convierte una violación de integridad de PostgreSQL en una
- * respuesta honesta en lugar de un `500`. El proyecto generado no lleva Bean
- * Validation (FR-F11 está cortado), así que la única defensa contra un `POST`
- * con un campo obligatorio ausente, un `DELETE` de un registro referenciado o
- * un segundo vínculo de un `1—1` es leer el `SQLState` de la causa.
+ * Es la pieza que convierte una violación de integridad de PostgreSQL —o un
+ * `record` de petición que no cumple sus anotaciones de Bean Validation— en
+ * una respuesta honesta en lugar de un `500`. `MethodArgumentNotValidException`
+ * cubre la línea principal: el `@Valid` del controlador rechaza ANTES de que el
+ * `request` llegue al servicio, así que un campo obligatorio ausente nunca toca
+ * el repositorio. El mapeo por `SQLState`/`PropertyValueException` sigue
+ * existiendo como defensa en profundidad: cubre lo que Bean Validation no
+ * anota —un `DELETE` de un registro referenciado, un segundo vínculo de un
+ * `1—1`— y lo que, por lo que sea, igual llegara nulo hasta Hibernate.
  *
  * ── Por qué recorre `getCause()` ────────────────────────────────────────────
  *
@@ -59,20 +64,43 @@ export function emitErrorAdvice(): string {
   return `package ${CONTROLLER_PACKAGE};
 
 import java.sql.SQLException;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 /**
  * Traduce las violaciones de integridad que el repositorio ya convirtio en
  * DataIntegrityViolationException, leyendo el SQLState de PostgreSQL en la
- * cadena de causas. Ninguna de estas respuestas es 500.
+ * cadena de causas, y los rechazos de Bean Validation del @Valid del
+ * controlador. Ninguna de estas respuestas es 500.
  */
 @RestControllerAdvice
 public class ApiExceptionHandler {
+
+    /**
+     * El @Valid del controlador rechaza antes de que el request llegue al
+     * servicio: por eso este handler nombra el campo sin haber tocado el
+     * repositorio todavia.
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ProblemDetail> handleValidation(MethodArgumentNotValidException exception) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        for (FieldError fieldError : exception.getBindingResult().getFieldErrors()) {
+            errors.put(fieldError.getField(), fieldError.getDefaultMessage());
+        }
+        ProblemDetail problem = ProblemDetail.forStatus(HttpStatus.BAD_REQUEST);
+        problem.setTitle("Validacion fallida");
+        problem.setDetail("Uno o mas campos no cumplen su restriccion");
+        problem.setProperty("errors", errors);
+        return new ResponseEntity<>(problem, HttpStatus.BAD_REQUEST);
+    }
 
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ProblemDetail> handleDataIntegrityViolation(DataIntegrityViolationException exception) {
