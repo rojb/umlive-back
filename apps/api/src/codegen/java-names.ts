@@ -241,6 +241,10 @@ const JAVA_RESERVED_SIMPLE_NAMES = [
   // spring — agregadas por la rebanada 4 (D6, D8): el advice generado importa
   // `ProblemDetail` y el nombre reservado `ApiExceptionHandler`.
   'ProblemDetail', 'ApiExceptionHandler',
+  // spring-web — agregada por la guarda de secreto compartido (FR-MF03): el
+  // archivo fijo `config/SharedSecretFilter.java` ocupa ese nombre en el
+  // espacio de tipos, igual que `ApiExceptionHandler`.
+  'SharedSecretFilter',
   // spring-data / colecciones / tipos
   'JpaRepository', 'List', 'Optional', 'UUID', 'BigDecimal', 'LocalDate', 'LocalDateTime', 'Set', 'Map',
   'ArrayList', 'HashMap', 'Stream', 'Collectors',

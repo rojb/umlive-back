@@ -41,6 +41,7 @@ import { emitFlywayFile } from './flyway';
 import { emitInterfaceFile } from './interface';
 import { emitEnumFile } from './layers';
 import { emitPostmanFiles } from './postman';
+import { emitSharedSecretFilterFile, SHARED_TOKEN_PROPERTY } from './shared-secret-filter';
 import { emitWrapperFiles } from './wrapper';
 
 /** Spring Boot fijo: 4.1.0 es la BOM que el golden verificó (D8, Fase 0). */
@@ -162,12 +163,19 @@ public class ${APPLICATION_TYPE_NAME} {
 }
 
 /**
- * Datasource, `validate`, `open-in-view: false`, puerto HTTP (D8) y la versión
- * de OpenAPI que sirve `springdoc` (FR-F12). `OPENAPI_3_1` queda explícito en
- * vez de confiar en el default de la librería: es el default desde springdoc
+ * Datasource, `validate`, `open-in-view: false`, puerto HTTP (D8), la versión
+ * de OpenAPI que sirve `springdoc` (FR-F12) y la propiedad de la guarda de
+ * secreto compartido (FR-MF03). `OPENAPI_3_1` queda explícito en vez de
+ * confiar en el default de la librería: es el default desde springdoc
  * `2.8.0`, pero un futuro `springdoc-openapi.version` más viejo —o un cambio de
  * default corriente arriba— no debe volver falso «sirve OpenAPI 3.1» sin que
  * este archivo lo refleje.
+ *
+ * `${SHARED_TOKEN_PROPERTY}` sale con default vacío a propósito (D«apagada
+ * por defecto» de la guarda): un proyecto recién generado arranca sin exigir
+ * ninguna variable de entorno, y `SharedSecretFilter` lee ese mismo vacío
+ * para desactivarse entero. El binding relajado de Spring Boot expone la
+ * propiedad como `UMLIVE_SECURITY_SHARED_TOKEN` sin declarar nada más acá.
  */
 function emitApplicationYml(): string {
   return `spring:
@@ -188,6 +196,10 @@ springdoc:
 
 server:
   port: ${SERVER_PORT}
+
+umlive:
+  security:
+    shared-token: ""
 `;
 }
 
@@ -314,6 +326,45 @@ El documento describe cada endpoint y marca en \`required\` los campos
 obligatorios de cada \`XRequest\`: un cliente que no conoce el diagrama puede
 descubrir la API y saber, antes de enviar nada, qué campos no puede omitir.
 
+## Guarda de secreto compartido (opcional)
+
+Por defecto este proyecto NO exige autenticación, igual que antes de esta
+sección: es lo apropiado en \`localhost\`. El problema aparece si se expone el
+backend por un túnel HTTPS o una IP de LAN: sin nada más, cualquiera con la
+URL puede leer, crear, editar y borrar todo. Antes de abrir un túnel, activá
+la guarda:
+
+\`\`\`bash
+export UMLIVE_SECURITY_SHARED_TOKEN="un-secreto-largo-y-al-azar"
+./mvnw spring-boot:run
+\`\`\`
+
+Con la variable definida, **toda ruta exige** el encabezado
+\`Authorization: Bearer un-secreto-largo-y-al-azar\`, salvo las de
+documentación que se listan abajo; sin el encabezado, o con el token
+equivocado, la respuesta es \`401\` con \`WWW-Authenticate: Bearer\` y un cuerpo
+Problem Details. Con la variable vacía o sin definir, el filtro no hace nada
+y el comportamiento es exactamente el de antes (criterio de aceptación 1).
+
+La guarda deniega por defecto a propósito: exime una lista corta y protege
+todo lo demás. Enumerar en cambio lo que se protege falla ABIERTO ante
+cualquier forma de la ruta que no se haya previsto — y una sí se coló en la
+primera versión: \`GET /%61pi/...\` (\`%61\` es \`a\`) evitaba un chequeo hecho
+sobre la URI cruda, porque Spring rutea con la ruta ya decodificada. La
+comparación se hace ahora sobre la ruta decodificada.
+
+**Esto NO es un modelo de seguridad completo**: es un único secreto
+compartido, sin usuarios, sin roles, sin expiración ni revocación — alcanza
+para no dejar el CRUD abierto a cualquiera, no para un sistema multiusuario.
+
+**Importante — el path de descripción queda público a propósito**: con la
+guarda activa, \`GET /v3/api-docs\` y \`/swagger-ui.html\` siguen respondiendo
+sin token. Cualquiera que encuentre la URL del túnel puede leer el mapa
+completo de la API — cada ruta, cada entidad, cada campo y cuál es
+obligatorio — aunque no pueda invocar nada. Es una decisión de diseño
+deliberada, no un descuido: quien abre el túnel debe saber que ese
+reconocimiento de la API queda expuesto igual.
+
 ## Límites declarados
 
 - \`ddl-auto: validate\`: el esquema lo aplica Flyway y Hibernate solo lo valida.
@@ -363,7 +414,11 @@ descubrir la API y saber, antes de enviar nada, qué campos no puede omitir.
  * ejecutable del proyecto generado, que no trae tests.
  *
  * El `ApiExceptionHandler` (tarea 2.6) entra siempre: mapea errores por
- * `SQLState` y no depende del modelo.
+ * `SQLState` y no depende del modelo. El `SharedSecretFilter` (FR-MF03) entra
+ * igual, siempre: es la guarda opcional que protege todo salvo las rutas de
+ * documentación cuando el
+ * operador configura un token, y con la propiedad en blanco se autodesactiva
+ * en runtime sin que este emisor tenga que ramificar sobre el modelo.
  */
 export function emitProject(ir: CodegenIr): GeneratedFile[] {
   const files: GeneratedFile[] = [
@@ -378,6 +433,7 @@ export function emitProject(ir: CodegenIr): GeneratedFile[] {
 
   files.push(emitFlywayFile(ir));
   files.push(emitErrorAdviceFile());
+  files.push(emitSharedSecretFilterFile());
   files.push(...emitPostmanFiles(ir));
   for (const irEnum of ir.enums) files.push(emitEnumFile(irEnum));
   for (const irInterface of ir.interfaces) files.push(emitInterfaceFile(irInterface));

@@ -22,6 +22,11 @@
  * - Un cuerpo de ejemplo por tipo, tomado de la tabla de tipos (FR-F04): el
  *   valor sale de `field.type.example`, que es el mismo que resolvió la IR.
  * - Una aserción de código por request: `201`, `200`, `200`, `200`, `204`.
+ * - Cada request lleva `Authorization: Bearer {{sharedToken}}` (`FR-MF03`),
+ *   con `sharedToken` vacío por default en la colección y en el environment.
+ *   Contra un backend sin la guarda de secreto compartido activa el
+ *   encabezado se ignora entero, así que una colección exportada de una
+ *   generación anterior a esta tarea sigue corriendo sin tocar nada.
  *
  * Función pura: `JSON.stringify` con sangría fija sobre un objeto cuyas claves
  * se insertan siempre en el mismo orden. Sin reloj, sin azar, sin locale.
@@ -130,6 +135,19 @@ interface PostmanRequest {
   response: never[];
 }
 
+/**
+ * Encabezado de la guarda de secreto compartido (FR-MF03), en TODO request de
+ * la colección. Con la variable de colección `sharedToken` vacía —el default—
+ * el valor queda `Bearer `, pero `SharedSecretFilter` ni siquiera mira el
+ * encabezado cuando la guarda está apagada, así que una colección corrida
+ * contra un backend sin token exportado se comporta igual que antes de esta
+ * tarea. Contra un backend con la guarda activa, exportar `sharedToken` en el
+ * environment alcanza para que la colección siga corriendo.
+ */
+function sharedSecretHeader(): { key: string; value: string } {
+  return { key: 'Authorization', value: 'Bearer {{sharedToken}}' };
+}
+
 function jsonRequest(
   name: string,
   method: string,
@@ -138,9 +156,10 @@ function jsonRequest(
   body: PostmanBody | null,
   description: string,
 ): PostmanRequest {
-  const request: PostmanRequest['request'] = { method, url, description };
+  const header = [sharedSecretHeader()];
+  if (body !== null) header.push({ key: 'Content-Type', value: 'application/json' });
+  const request: PostmanRequest['request'] = { method, url, description, header };
   if (body !== null) {
-    request.header = [{ key: 'Content-Type', value: 'application/json' }];
     request.body = { mode: 'raw', raw: JSON.stringify(body, null, 2), options: { raw: { language: 'json' } } };
   }
   return {
@@ -293,7 +312,13 @@ function buildCollection(ir: CodegenIr): Record<string, unknown> {
     item: ir.entities
       .filter((entity) => !entity.isAbstract && !entity.mappedSuperclass)
       .map((entity) => entityFolder(ir, entity, entityByName)),
-    variable: [{ key: 'baseUrl', value: BASE_URL, type: 'string' }],
+    // `sharedToken` vacío por defecto (FR-MF03): sin guarda activa en el
+    // backend, el header `Authorization: Bearer ` que arma cada request se
+    // ignora entero y la colección corre igual que antes de esta tarea.
+    variable: [
+      { key: 'baseUrl', value: BASE_URL, type: 'string' },
+      { key: 'sharedToken', value: '', type: 'string' },
+    ],
   };
 }
 
@@ -302,7 +327,10 @@ function buildEnvironment(ir: CodegenIr): Record<string, unknown> {
   return {
     id: ir.diagramId,
     name: `${ir.artifactId} local`,
-    values: [{ key: 'baseUrl', value: BASE_URL, type: 'default', enabled: true }],
+    values: [
+      { key: 'baseUrl', value: BASE_URL, type: 'default', enabled: true },
+      { key: 'sharedToken', value: '', type: 'default', enabled: true },
+    ],
     _postman_variable_scope: 'environment',
   };
 }
