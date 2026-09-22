@@ -941,8 +941,15 @@ export class AiTurnService {
         // modelo describe la foto en prosa en vez de dibujarla, o cuando no
         // la ve y lo dice con palabras — y las dos cosas se distinguen leyendo
         // su texto, que hasta ahora no quedaba en ninguna parte.
+        // `finishReason` y los tokens ya viajaban en `LlmCompletion` y no se
+        // registraban en ninguna parte. Son los que separan un texto vacío
+        // por tope de salida (`length`) de uno que el modelo devolvió vacío a
+        // propósito (`stop`) de uno que el adaptador perdió (`tool-calls` con
+        // la lista vacía).
         this.log.warn(
           `turno de imagen ${turn.turnId}: el modelo cerró en la iteración ${iterations} SIN llamar herramientas. ` +
+            `finishReason=${String(result.completion.finishReason)} ` +
+            `tokens entrada/salida=${String(result.completion.usage?.inputTokens)}/${String(result.completion.usage?.outputTokens)} ` +
             `Texto devuelto: ${JSON.stringify((result.completion.text ?? '').slice(0, 600))}`,
         );
         closedByModel = true;
