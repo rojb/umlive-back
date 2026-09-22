@@ -73,7 +73,17 @@ export type CodegenNoteCode =
   // D7 — clase asociación tratada como entidad.
   | 'association_class_as_entity'
   // D3 — relación que no produce código (`DEPENDENCY`/`USAGE`, extremo sobre no-entidad).
-  | 'relationship_not_emitted';
+  | 'relationship_not_emitted'
+  /**
+   * Un atributo cuyo tipo es una clase del diagrama (`Venta.cliente : Cliente`)
+   * se emitió como referencia `@ManyToOne`, igual que una asociación dibujada.
+   *
+   * Se avisa porque el código generado dice más que el diagrama: la línea no
+   * está en el lienzo, así que conviene dibujarla si se quiere que el modelo y
+   * el código cuenten lo mismo. La referencia es **unidireccional**: la clase
+   * apuntada no recibe ningún campo.
+   */
+  | 'implicit_association';
 
 /**
  * Referencia a un elemento del lienzo. `id` es SIEMPRE de elemento

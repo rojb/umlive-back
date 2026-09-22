@@ -126,6 +126,19 @@ interface EntityBookkeeping {
 }
 
 /** Un extremo de la asociación en curso, con su entidad y el extremo opuesto (D3). */
+/**
+ * Atributo cuyo tipo es una clase del diagrama, pendiente de resolverse como
+ * referencia `@ManyToOne` (la «asociación disfrazada» de `resolveType`).
+ */
+interface AsociacionImplicita {
+  /** Clase que DECLARA el atributo: es la que se lleva el campo y la FK. */
+  ownerElementId: string;
+  /** Clase apuntada por el tipo. */
+  targetElementId: string;
+  attribute: UmlFeatureView;
+  attributeName: string;
+}
+
 interface RelationshipSide {
   build: EntityBookkeeping;
   /** Extremo que cae SOBRE esta clase. */
@@ -167,7 +180,11 @@ interface ClassNode {
 interface MandatoryEdge {
   fromElementId: string;
   toElementId: string;
-  relationship: UmlRelationshipView;
+  /**
+   * Relación dibujada que produjo la arista, o `null` cuando la referencia
+   * viene de un atributo con tipo de clase: ahí no hay línea en el lienzo.
+   */
+  relationship: UmlRelationshipView | null;
   elements: CodegenElementRef[];
   relationships: CodegenRelationshipRef[];
 }
@@ -487,6 +504,14 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
   const generatorBlockers: CodegenFinding[] = [];
   const generatorNotes: CodegenNote[] = [];
   const typeSets: TypeSet[] = [];
+  /**
+   * Atributos con tipo de clase, a resolver como referencia en la Fase D.
+   *
+   * Se acumulan durante la Fase B porque ahí todavía no existen todas las
+   * entidades: la clase apuntada puede construirse después, y hace falta su
+   * clave primaria para tipar la columna y el componente del DTO.
+   */
+  const asociacionesImplicitas: AsociacionImplicita[] = [];
 
   // ── Fase A: enumeraciones ─────────────────────────────────────────────────
   const enums: IrEnum[] = [];
@@ -697,6 +722,22 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         continue;
       }
       if (resolvedType.status === 'skip') {
+        // Un atributo cuyo tipo es una CLASE del diagrama (`Venta.cliente :
+        // Cliente`) no es un dato: es una asociación escrita dentro de la caja
+        // en vez de dibujada como línea. Se encola para resolverla como
+        // referencia en la Fase D, cuando ya existen todas las entidades y sus
+        // claves primarias. Acá todavía no se puede: la clase apuntada puede no
+        // estar construida.
+        const referencia = clasificadorReferenciado(attribute, ctx);
+        if (referencia !== null) {
+          asociacionesImplicitas.push({
+            ownerElementId: el.id,
+            targetElementId: referencia,
+            attribute,
+            attributeName,
+          });
+          continue;
+        }
         generatorNotes.push(note('attribute_skipped', [ctx.ref(el.id)], `${attributeName}: ${resolvedType.reason}`));
         continue;
       }
@@ -1052,14 +1093,26 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
         : { cascade: 'NONE', orphanRemoval: false };
 
   /** Agrega el campo a su entidad, registra sus nombres e importaciones y suma el componente de DTO. */
-  const addRelation = (side: RelationshipSide, relation: IrRelationField): void => {
-    const build = side.build;
+  /**
+   * Agrega un campo de relación a una entidad y reclama sus nombres.
+   *
+   * Es el punto ÚNICO por donde entra un campo de relación, venga de una
+   * asociación dibujada o de un atributo con tipo de clase: así los tres
+   * registros de colisión (`memberOwners`, `dtoOwners`, `columnOwners`) ven
+   * todos los reclamos y la Fase E puede bloquear si dos cosas piden el mismo
+   * nombre.
+   */
+  const addOwnedRelation = (
+    build: EntityBookkeeping,
+    otherBuild: EntityBookkeeping,
+    relation: IrRelationField,
+  ): void => {
     build.entity.relations.push(relation);
-    build.extraImports.push(...relationJpaImports(relation, side.otherBuild.entity.name));
+    build.extraImports.push(...relationJpaImports(relation, otherBuild.entity.name));
     ownIn(build.memberOwners, relation.name);
     ownIn(build.dtoOwners, relation.dto.name);
     if (relation.joinColumn !== null) ownIn(build.columnOwners, relation.joinColumn.name);
-    const pk = pkField(side.otherBuild);
+    const pk = pkField(otherBuild);
     build.entity.dtoFields.push({
       name: relation.dto.name,
       type: collectionOf(relation) ? `List<${relation.dto.idType}>` : relation.dto.idType,
@@ -1068,6 +1121,10 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       // La obligatoriedad de la referencia ya la resolvió la asociación (D3, D5).
       required: relation.dto.required,
     });
+  };
+
+  const addRelation = (side: RelationshipSide, relation: IrRelationField): void => {
+    addOwnedRelation(side.build, side.otherBuild, relation);
   };
 
   // Si la construcción de entidades ya dejó bloqueos, se corta ACÁ.
@@ -1101,6 +1158,101 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
       blockers: bloqueosDeEntidades,
       notes: [...warnings, ...generatorNotes],
     };
+  }
+
+  // ── Atributos con tipo de clase, resueltos como referencia ────────────────
+  //
+  // `Venta.cliente : Cliente` produce lo mismo que produciría una asociación
+  // dibujada del lado de Venta: campo `@ManyToOne`, columna `cliente_id` y su
+  // clave foránea, y el componente `clienteId` en los DTO.
+  //
+  // Es UNIDIRECCIONAL a propósito: `Cliente` no recibe ningún campo. El
+  // diagrama dice que una venta tiene un cliente y nada sobre cuántas ventas
+  // tiene un cliente; inventar la colección inversa agregaría al código algo
+  // que el modelo no declara, y al exportar a XMI dejarían de coincidir.
+  //
+  // Si además existe la asociación dibujada, los dos caminos reclaman el mismo
+  // nombre de campo y la Fase E bloquea con `name_collision`. Es lo correcto:
+  // hay ambigüedad real y la resuelve quien modela, no el generador en
+  // silencio.
+  for (const implicita of asociacionesImplicitas) {
+    const ownerBuild = entityBuilds.get(implicita.ownerElementId);
+    const targetBuild = entityBuilds.get(implicita.targetElementId);
+    const refs = [ctx.ref(implicita.ownerElementId), ctx.ref(implicita.targetElementId)];
+    if (!ownerBuild || !targetBuild) {
+      // La clase apuntada no se emite como tabla (abstracta sin descendiente
+      // concreto, `@MappedSuperclass`, omitida por estereotipo…).
+      generatorNotes.push(
+        note('attribute_skipped', refs, `${implicita.attributeName}: la clase apuntada no se emite como entidad`),
+      );
+      continue;
+    }
+
+    const member = memberName(implicita.attributeName);
+    if (member.unrepresentable) {
+      generatorBlockers.push(blocker('name_unrepresentable', refs, implicita.attributeName));
+      continue;
+    }
+
+    const targetPk = pkField(targetBuild);
+    const nullable = implicita.attribute.lowerBound < 1;
+    const columna = shortenSql(`${snakeCase(member.name)}_id`, refs, [], 'columna');
+
+    const relation: IrRelationField = {
+      name: member.name,
+      target: targetBuild.entity.name,
+      kind: 'ManyToOne',
+      owning: true,
+      mappedBy: null,
+      // Sin agregación declarada no hay cascada: borrar en cadena nunca se
+      // infiere de un atributo (D4).
+      cascade: 'NONE',
+      orphanRemoval: false,
+      joinColumn: { name: columna, nullable, unique: false },
+      joinTable: null,
+      dto: {
+        name: `${member.name}Id`,
+        inRequest: true,
+        required: !nullable,
+        idType: targetPk.type.java,
+      },
+      inherited: false,
+    };
+    addOwnedRelation(ownerBuild, targetBuild, relation);
+
+    foreignKeys.push({
+      name: registerConstraint(
+        `fk_${ownerBuild.entity.table}_${columna}`,
+        refs,
+        [],
+        `${ownerBuild.entity.name}.${member.name}`,
+      ),
+      table: ownerBuild.entity.table,
+      columns: [columna],
+      refTable: targetBuild.entity.table,
+      refColumns: [targetPk.column],
+      onDeleteCascade: false,
+    });
+
+    // Una referencia obligatoria es una arista más del grafo de dependencias
+    // que ordena las altas de la colección Postman (D9).
+    if (!nullable) {
+      mandatoryEdges.push({
+        fromElementId: implicita.ownerElementId,
+        toElementId: implicita.targetElementId,
+        relationship: null,
+        elements: refs,
+        relationships: [],
+      });
+    }
+
+    generatorNotes.push(
+      note(
+        'implicit_association',
+        refs,
+        `${ownerBuild.entity.name}.${implicita.attributeName}: referencia a ${targetBuild.entity.name} emitida como @ManyToOne. Dibujá la asociación si querés que el diagrama lo diga también.`,
+      ),
+    );
   }
 
   for (const relationship of content.relationships) {
@@ -1944,6 +2096,29 @@ function resolveType(typeElementId: string | null, typeNameRaw: string | null, c
   return row ? { status: 'ok', type: { ...row, imports: [...row.imports] }, enumerated: false } : { status: 'unknown' };
 }
 
+/**
+ * Devuelve el id del elemento apuntado cuando el atributo es una referencia
+ * simple a una CLASE del diagrama; `null` en cualquier otro caso.
+ *
+ * Se exige `upperBound === 1` a propósito. Una referencia simple se resuelve
+ * con una columna en la tabla de quien la declara, sin tocar nada más. Una
+ * multivaluada (`items : Item [0..*]`) necesitaría una columna en la tabla
+ * AJENA o una tabla intermedia, y eso ya no es «lo que dice el atributo»: para
+ * ese caso corresponde dibujar la asociación, que declara los dos extremos.
+ *
+ * Las INTERFACES quedan fuera: no se emiten como tabla, así que no hay a qué
+ * apuntar. Los DATATYPE y las enumeraciones sin literales tampoco son
+ * referencias; siguen su camino de `attribute_skipped`.
+ */
+function clasificadorReferenciado(attribute: UmlFeatureView, ctx: BuildContext): string | null {
+  if (attribute.typeElementId === null) return null;
+  if (attribute.upperBound !== 1) return null;
+  if (attribute.isStatic || attribute.isDerived) return null;
+  const element = ctx.elementById.get(attribute.typeElementId);
+  if (!element || element.kind !== 'CLASS') return null;
+  return element.id;
+}
+
 function injectedIdField(): IrField {
   return {
     elementId: '',
@@ -2266,7 +2441,10 @@ function buildFixturePlan(
 
   const seenCycles = new Set<string>();
   for (const cycle of cycles) {
-    const key = cycle.map((edge) => edge.relationship.id).sort().join('|');
+    const key = cycle
+      .map((edge) => edge.relationship?.id ?? `${edge.fromElementId}->${edge.toElementId}`)
+      .sort()
+      .join('|');
     if (seenCycles.has(key)) continue;
     seenCycles.add(key);
     const elements = [...new Map(cycle.flatMap((edge) => edge.elements).map((ref) => [ref.id, ref])).values()];
