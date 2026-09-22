@@ -1023,6 +1023,13 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     if (relation.kind === 'ManyToOne' || relation.kind === 'OneToOne') imports.push('jakarta.persistence.FetchType');
     if (relation.joinColumn !== null) imports.push('jakarta.persistence.JoinColumn');
     if (relation.joinTable !== null) imports.push('jakarta.persistence.JoinColumn', 'jakarta.persistence.JoinTable');
+    // El emisor escribe `cascade = CascadeType.ALL` / `{CascadeType.PERSIST,
+    // CascadeType.MERGE}` (`emitters/entity.ts`), asi que el import tiene que
+    // acompañarlo: sin esto la entidad del lado inverso de una composicion no
+    // compila («cannot find symbol: variable CascadeType»).
+    if (relation.cascade === 'ALL' || relation.cascade === 'PERSIST_MERGE') {
+      imports.push('jakarta.persistence.CascadeType');
+    }
     if (relation.kind === 'OneToMany' || relation.kind === 'ManyToMany') {
       imports.push('java.util.ArrayList', 'java.util.List');
     }
