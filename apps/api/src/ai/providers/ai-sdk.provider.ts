@@ -51,6 +51,29 @@ import type {
  */
 export const MAX_OUTPUT_TOKENS = 4096;
 
+/**
+ * Tope de salida de un llamado CON IMAGEN.
+ *
+ * Medido, no elegido de arriba: cuatro turnos de imagen seguidos cerraron con
+ * `output_tokens` = 4096 EXACTOS —el tope de arriba—, texto vacío y cero
+ * llamadas a herramienta. Es decir, el modelo se quedaba sin presupuesto de
+ * salida antes de emitir una sola llamada, y la vista previa llegaba con
+ * «Ítems · 0» ya cobrada (~US$0,0078 cada intento).
+ *
+ * Solo para imagen, a propósito: los turnos de TEXTO completan de sobra con
+ * 4096 y cuestan dos órdenes de magnitud menos, y este número entra en la
+ * ESTIMACIÓN de la reserva (`estimateCost`) — subirlo para todos inflaría la
+ * reserva de cada iteración de cada turno y acercaría el techo de gasto sin
+ * necesidad.
+ *
+ * El doble y no más: 4096 está comprobado insuficiente, pero cuánto hace
+ * falta no se midió (la sospecha es que el modelo gasta la salida razonando,
+ * y el adaptador no lee `result.reasoning`). Duplicar es el paso proporcional
+ * y acotado: lleva cada intento a ~US$0,011. Si sigue agotándose, el número a
+ * revisar es este y la próxima pista es `finishReason`.
+ */
+export const IMAGE_MAX_OUTPUT_TOKENS = 8192;
+
 /** Corte por llamado. Un cuelgue no puede dejar una reserva sin liquidar. */
 export const CALL_TIMEOUT_MS = 60_000;
 

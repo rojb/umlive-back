@@ -4,6 +4,7 @@ import type { AiInputMode, AiTurnStatus } from '../generated/prisma/enums';
 import { PrismaService } from '../prisma/prisma.service';
 import { AiConfigService } from './ai-config.service';
 import { AiSpendService, type SpendRejection } from './ai-spend.service';
+import { IMAGE_MAX_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS } from './providers/ai-sdk.provider';
 import { AI_ENV, type AiEnvironment, type ProviderCredential } from './providers/llm-provider.factory';
 import type {
   LlmCompletion,
@@ -250,7 +251,14 @@ export class AiCallService {
       model: primary,
       // La reserva del turno cubre TODAS las iteraciones esperadas del bucle, que
       // en un turno de imagen reenvían la imagen entera (D9.2).
-      estimate: this.spend.estimateCost(primary, this.payloadOf(request, this.expectedIterations(requiresVision))),
+      // El tercer argumento es el tope de salida con el que se ESTIMA. Un
+      // turno con visión se llama con `IMAGE_MAX_OUTPUT_TOKENS`, así que
+      // estimarlo con el tope de texto reservaría de menos.
+      estimate: this.spend.estimateCost(
+        primary,
+        this.payloadOf(request, this.expectedIterations(requiresVision)),
+        this.outputCap(requiresVision),
+      ),
     });
     if (!opened.ok) return opened;
 
@@ -312,7 +320,7 @@ export class AiCallService {
         continue;
       }
 
-      const estimate = this.spend.estimateCost(model, payload);
+      const estimate = this.spend.estimateCost(model, payload, this.outputCap(images.length > 0));
       if (fallbackFrom !== null || !coveredByOpeningReserve) {
         const reserved = await this.spend.reserveCall({ turnId: turn.turnId, estimate });
         if (!reserved.ok) {
@@ -327,6 +335,10 @@ export class AiCallService {
           images.length > 0
             ? await provider.completeWithImages(request.messages, images, tools, {
                 abortSignal: request.abortSignal,
+                // El mismo tope que usó la estimación de arriba: si acá fuera
+                // más alto que allá, el llamado podría costar más de lo
+                // reservado.
+                maxOutputTokens: IMAGE_MAX_OUTPUT_TOKENS,
               })
             : await provider.complete(request.messages, tools, {
                 abortSignal: request.abortSignal,
@@ -582,6 +594,11 @@ export class AiCallService {
    * Iteraciones esperadas del bucle de este turno: las de imagen, que reenvían
    * la imagen, o una sola para un turno de texto (D9.2).
    */
+  /** Tope de salida de este llamado: el de imagen solo cuando hay imagen. */
+  private outputCap(hasImages: boolean): number {
+    return hasImages ? IMAGE_MAX_OUTPUT_TOKENS : MAX_OUTPUT_TOKENS;
+  }
+
   private expectedIterations(requiresVision: boolean): number {
     return requiresVision ? IMAGE_EXPECTED_ITERATIONS : 1;
   }
