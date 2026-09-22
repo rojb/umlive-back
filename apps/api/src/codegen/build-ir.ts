@@ -1070,6 +1070,39 @@ export function buildIr(content: DiagramContent, validationReport: ValidationRep
     });
   };
 
+  // Si la construcción de entidades ya dejó bloqueos, se corta ACÁ.
+  //
+  // Resolver relaciones exige que cada entidad tenga clave primaria: `pkField`
+  // la busca y, si no está, lanza «la IR de X no tiene clave primaria y no está
+  // bloqueada». Ese mensaje dice exactamente lo que este corte garantiza: que
+  // nadie pida la PK de una entidad que ya quedó bloqueada.
+  //
+  // Sin el corte, un `id` de tipo no soportado (`pk_type_invalid`) registra su
+  // bloqueo pero la construcción sigue, `pkField` lanza, y el servicio nunca
+  // llega a su `422 codegen_blocked`: la persona usuaria recibe un 500 con
+  // «No se pudo generar el código. Intentá de nuevo» y el panel de validación
+  // diciendo «Sin hallazgos», sin ninguna forma de saber qué corregir.
+  const bloqueosDeEntidades = [...blocking, ...generatorBlockers];
+  if (bloqueosDeEntidades.length > 0) {
+    return {
+      artifactId: artifactIdFor(content),
+      diagramId: content.diagram.id,
+      diagramName: content.diagram.name,
+      entities,
+      enums,
+      interfaces,
+      // Vacíos a propósito: son el resultado de resolver relaciones, que es
+      // justamente lo que no se hizo. Con bloqueos no se emite ningún archivo,
+      // así que nadie los lee.
+      joinTables,
+      foreignKeys,
+      uniques,
+      fixturePlan: {},
+      blockers: bloqueosDeEntidades,
+      notes: [...warnings, ...generatorNotes],
+    };
+  }
+
   for (const relationship of content.relationships) {
     const elements = [ctx.ref(relationship.sourceElementId), ctx.ref(relationship.targetElementId)];
     const label = relationshipLabel(relationship, ctx);
