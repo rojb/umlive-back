@@ -520,7 +520,23 @@ model ElementLayout {
   elementId String @id @map("element_id") @db.Uuid
 
   /// width/height rather than right/bottom, so a resize never has to read the
-  /// current position first. Maps to EA's Left/Top/Right/Bottom on export.
+  /// current position first. Maps to EA's Left/Top/Right/Bottom on export —
+  /// but ONLY after resolving x/y to absolute first (see the note below);
+  /// `ea-extension.ts`/`ea-export` never emit this column's x/y verbatim.
+  ///
+  /// `element-parent-containment`: x/y are RELATIVE TO THE PARENT ELEMENT
+  /// (`uml_elements.parent_id`) — absolute canvas coordinates ONLY when
+  /// `parent_id IS NULL` (the element is at the root). This lets a package
+  /// drag be a single `element.move` on the package's own row, with a single
+  /// lock: no child row changes, because the child's stored position is
+  /// already expressed relative to it. Every consumer that needs an absolute
+  /// canvas/export position — the canvas itself when a node's parent is not
+  /// rendered as an xyflow container, presence cursors/locks, the EA XMI
+  /// extension, AI-placed elements — has to sum the `parent_id` chain up to
+  /// the root; see `absolutePositionOf` in `packages/contracts/src/uml.ts`,
+  /// which both apps use for this. Migrated from absolute-everywhere by
+  /// `20260922000000_relative_child_layouts` (see that file for how existing
+  /// packages were resized to enclose their children first).
   x      Int
   y      Int
   width  Int

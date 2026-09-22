@@ -130,6 +130,29 @@ export interface UmlEnumLiteralView {
   position: number;
 }
 
+/**
+ * `element-parent-containment`: `x`/`y` son RELATIVOS AL ELEMENTO PADRE
+ * (`UmlElementView.parentId`) — absolutos SOLO cuando el elemento está en la
+ * raíz (`parentId === null`). Es el contrato más importante de este archivo:
+ * cualquier consumidor que necesite una posición de PANTALLA o de EXPORT
+ * (cursores/locks de presencia, la extensión XMI de EA, un elemento nuevo que
+ * la IA ubica dentro de un paquete) tiene que sumar la cadena de `parentId`
+ * hasta la raíz — ver `absolutePositionOf` más abajo, que hace exactamente
+ * eso y la usan tanto `apps/web` como `apps/api`.
+ *
+ * El motivo del cambio (antes todo era absoluto): así, arrastrar un PAQUETE
+ * es una sola `element.move` sobre la fila del paquete, con un solo lock —
+ * ninguna fila de hijo cambia, porque la posición del hijo ya está expresada
+ * relativa a él. `DiagramPage.tsx` (`derivedNodes`) apoya esto en xyflow
+ * fijándole `parentId` de xyflow al nodo cuando su padre de MODELO es un
+ * PACKAGE: xyflow compone la posición de pantalla sumando padre + hijo por
+ * su cuenta, sin que el store tenga que convertir nada.
+ *
+ * Migrado desde "todo absoluto" por
+ * `20260922000000_relative_child_layouts` (ver ese archivo para cómo se
+ * agrandaron los paquetes existentes para encerrar a sus hijos antes de
+ * volverlos relativos).
+ */
 export interface ElementLayoutView {
   elementId: string;
   x: number;
@@ -137,6 +160,44 @@ export interface ElementLayoutView {
   width: number;
   height: number;
   zIndex: number;
+}
+
+/**
+ * Posición ABSOLUTA de un elemento, reconstruida sumando `x`/`y` de cada
+ * antepasado por `parentId` hasta la raíz — la operación inversa de la
+ * migración `20260922000000_relative_child_layouts` (ver el comentario de
+ * `ElementLayoutView` de arriba). PURA, mismo espíritu que `qualifiedName`:
+ * un solo recorrido con guarda de ciclo, nunca se cuelga ni siquiera sobre un
+ * ciclo de contención preexistente (Hallazgo 5, D3 de `uml-classifiers`) —
+ * un ciclo corta la suma en el punto en que se repite en vez de colgarse, así
+ * que devuelve la MEJOR aproximación posible en vez de `null` de una.
+ *
+ * `null` cuando el propio elemento (o alguno de sus antepasados, antes de
+ * llegar a la raíz) no tiene fila de layout — mismo motivo que un layout es
+ * opcional 1:1 con `uml_elements` (design.md §8): un elemento recién creado
+ * en la misma llamada, o un dato inconsistente, no tienen una posición
+ * absoluta que reconstruir.
+ */
+export function absolutePositionOf(
+  elementId: string,
+  elements: Record<string, Pick<UmlElementView, 'parentId'>>,
+  layouts: Record<string, Pick<ElementLayoutView, 'x' | 'y'>>,
+): { x: number; y: number } | null {
+  let x = 0;
+  let y = 0;
+  let currentId: string | null = elementId;
+  const visited = new Set<string>();
+  while (currentId !== null) {
+    if (visited.has(currentId)) break;
+    visited.add(currentId);
+    const layout: Pick<ElementLayoutView, 'x' | 'y'> | undefined = layouts[currentId];
+    if (!layout) return null;
+    x += layout.x;
+    y += layout.y;
+    const element: Pick<UmlElementView, 'parentId'> | undefined = elements[currentId];
+    currentId = element ? element.parentId : null;
+  }
+  return { x, y };
 }
 
 /**

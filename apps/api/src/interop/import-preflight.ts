@@ -605,6 +605,27 @@ export function runImportPreflight(model: ParsedModel): ImportPlan {
   const elements: PlannedElementRow[] = [];
   for (const element of model.elements) {
     if (droppedElements.has(element.key)) continue;
+    const layout = layoutByKey.get(element.key) ?? { ...autoLayoutAt(element.documentIndex), source: 'auto_layout' };
+    // `element-parent-containment`: `element_layouts.x/y` se guarda relativo
+    // al padre (absoluto solo en la raíz), pero EA exporta TODO en absoluto
+    // (E.4 — `Left`/`Top` del archivo). Este es el único lugar de POLÍTICA
+    // antes de la transacción (D1: `import-plan.ts` es el escritor tonto, no
+    // decide nada), así que la conversión va acá, no en el escritor.
+    //
+    // Alcanza con restarle al hijo el origen ABSOLUTO del padre — sin
+    // recorrer una cadena de antepasados a mano ni ordenar por profundidad,
+    // a diferencia de la migración `20260922000000_relative_child_layouts` —
+    // porque `layoutByKey` todavía guarda la geometría CRUDA del archivo
+    // (siempre absoluta, para TODO elemento) hasta este punto: cada entrada,
+    // sin importar cuán anidado esté ese elemento, ya es su propia posición
+    // absoluta tal como EA la declaró. `layoutByKey` está completo para
+    // cualquier padre que sobreviva hasta acá (`policyLayoutSize()` ya
+    // recorrió `model.elements` entero), y un padre descartado ya se llevó a
+    // este hijo en la cascada (`cascade()`, más arriba) — así que
+    // `element.parentKey` no nulo siempre resuelve.
+    const parentLayout = element.parentKey === null ? null : (layoutByKey.get(element.parentKey) ?? null);
+    const relativeLayout =
+      parentLayout === null ? layout : { ...layout, x: layout.x - parentLayout.x, y: layout.y - parentLayout.y };
     elements.push({
       key: element.key,
       xmiId: element.xmiId,
@@ -614,7 +635,7 @@ export function runImportPreflight(model: ParsedModel): ImportPlan {
       isAbstract: abstractDowngraded.has(element.key) ? false : element.isAbstract,
       stereotype: element.stereotype,
       body: element.body,
-      layout: layoutByKey.get(element.key) ?? { ...autoLayoutAt(element.documentIndex), source: 'auto_layout' },
+      layout: relativeLayout,
       associationClassOfXmiId: element.associationClassOfXmiId,
     });
   }

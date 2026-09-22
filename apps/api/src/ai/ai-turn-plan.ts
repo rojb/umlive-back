@@ -1,4 +1,5 @@
 import {
+  absolutePositionOf,
   LOCK_REQUIREMENTS,
   type AiImageMode,
   type AiPreviewItem,
@@ -8,10 +9,12 @@ import {
   type AggregationKind,
   type DiagramContent,
   type ElementKind,
+  type ElementLayoutView,
   type OperationType,
   type PayloadFor,
   type Rect,
   type RelationshipKind,
+  type UmlElementView,
   type Visibility,
 } from '@umlive/contracts';
 import { MAX_OPS_PER_TURN } from './ai-tools';
@@ -411,17 +414,33 @@ export class TurnPlan {
   /** Marcas de baja confianza que dejó el validador de la llamada en curso. */
   private marks: AiPreviewLowReason[] = [];
 
+  /**
+   * Índices de la foto por id (`element-parent-containment`): los arma UNA
+   * vez el constructor, y los usan `nextCreateLayout` (hermanos del mismo
+   * padre) y `absolutePositionOfToken`/`storedPositionFor` (reconstruir o
+   * convertir una posición absoluta contra la cadena de `parentId`). Sin
+   * esto, cada llamada tendría que recorrer `snapshot.elements`/
+   * `snapshot.layouts` entero — barato para un turno, pero repetido sin
+   * necesidad si dos herramientas del mismo turno tocan geometría.
+   */
+  private readonly elementsById: Record<string, UmlElementView> = {};
+  private readonly layoutsById: Record<string, ElementLayoutView> = {};
+
   constructor(readonly snapshot: DiagramContent, options: TurnPlanOptions = {}) {
     this.image = options.image === true;
     this.opLimit = options.opLimit ?? MAX_OPS_PER_TURN;
     snapshot.elements.forEach((element, index) => {
       this.refs.set(`e:${index + 1}`, { kind: 'element', token: element.id });
+      this.elementsById[element.id] = element;
     });
     snapshot.features.forEach((feature, index) => {
       this.refs.set(`f:${index + 1}`, { kind: 'feature', token: feature.id });
     });
     snapshot.relationships.forEach((relationship, index) => {
       this.refs.set(`r:${index + 1}`, { kind: 'relationship', token: relationship.id });
+    });
+    snapshot.layouts.forEach((layout) => {
+      this.layoutsById[layout.elementId] = layout;
     });
   }
 
@@ -684,13 +703,29 @@ export class TurnPlan {
       }));
   }
 
-  /** Aplica al `element.create` de ese `new:N` el rectángulo que resolvió el lienzo (D7). */
+  /**
+   * Aplica al `element.create` de ese `new:N` el rectángulo que resolvió el
+   * lienzo (D7). `rect` viene en coordenadas ABSOLUTAS de lienzo —
+   * `layoutImageItems` (`image-layout.ts`) no sabe nada de `parentId`, ubica
+   * contra `nx`/`ny` de la FOTO — así que acá, antes de guardar, se convierte
+   * a lo que `element_layouts` espera (`element-parent-containment`): si la
+   * creación tiene padre, relativo a él; si no, la misma absoluta de siempre.
+   * Es el único punto de conversión para el turno de IMAGEN: si un elemento
+   * nuevo nace DENTRO de un paquete (`create_class` con `parent`, ver D7 del
+   * turno de texto), su fila tiene que guardar la posición relativa al
+   * paquete, no la absoluta que calculó `layoutImageItems` contra la foto.
+   */
   applyLayoutRect(label: string, rect: Rect): void {
     const index = this.planned.findIndex((op) => op.type === 'element.create' && op.produces === label);
     if (index < 0) return;
     const op = this.planned[index]!;
     const payload = op.payload as unknown as Record<string, unknown>;
-    this.planned[index] = { ...op, payload: { ...payload, layout: rect } } as unknown as PlannedOp;
+    const parentId = (payload['parentId'] as string | null | undefined) ?? null;
+    const stored = this.storedPositionFor(rect.x, rect.y, parentId);
+    this.planned[index] = {
+      ...op,
+      payload: { ...payload, layout: { ...rect, x: stored.x, y: stored.y } },
+    } as unknown as PlannedOp;
   }
 
   /** Guarda el centro normalizado de un `new:N` (D7). Fuera de rango cae a la grilla, no es un error. */
@@ -710,10 +745,27 @@ export class TurnPlan {
    * Ubica un elemento nuevo en una columna a la derecha de lo que ya existe
    * (D3): sin `apply_layout`, un turno que solo crea tiene que seguir siendo
    * solo de creación — y deshacible.
+   *
+   * `element-parent-containment`: "lo que ya existe" se filtra a los
+   * HERMANOS del mismo padre (`parentId`, `null` para la raíz) — mezclar la
+   * escala de un paquete (chico, relativo a sí mismo) con la del lienzo
+   * (grande, absoluta) daría una columna sin sentido. El resultado sale YA
+   * en el marco de referencia correcto para guardar sin conversión: si
+   * `parentId` es `null`, la foto solo tiene otras raíces con coordenadas
+   * absolutas: si `parentId` apunta a un paquete, sus hermanos (si los tiene)
+   * ya están en `snapshot.layouts` con coordenadas relativas A ESE PADRE —
+   * exactamente lo que hay que guardar. Un paquete sin hermanos con layout
+   * (por ejemplo, el primer hijo de un paquete que este mismo turno acaba de
+   * crear) cae al origen de siempre (`ORIGIN_X/Y`), que —relativo al padre—
+   * es la esquina superior izquierda con el mismo margen que usa el PAD de
+   * la migración `20260922000000_relative_child_layouts`.
    */
-  nextCreateLayout(kind: ElementKind): Rect {
+  nextCreateLayout(kind: ElementKind, parentId: string | null): Rect {
     const size = defaultSize(kind);
-    const existing = this.snapshot.layouts;
+    const existing = this.snapshot.layouts.filter((layout) => {
+      const element = this.elementsById[layout.elementId];
+      return (element?.parentId ?? null) === parentId;
+    });
     const baseX =
       existing.length === 0 ? ORIGIN_X : Math.max(...existing.map((l) => l.x + l.width)) + COLUMN_GAP;
     const baseY = existing.length === 0 ? ORIGIN_Y : Math.min(...existing.map((l) => l.y));
@@ -730,6 +782,12 @@ export class TurnPlan {
    * `apply_layout` sobre un `new:N` se PLIEGA en el `element.create` planificado
    * y no genera un `element.move` (D3). Devuelve `false` si la etiqueta no
    * corresponde a una creación de elemento de este turno.
+   *
+   * `x`/`y` acá son la "coordenada dentro del lienzo" que declara la
+   * herramienta (`ai-tools.ts`, `apply_layout`) — ABSOLUTA, porque el modelo
+   * razona sobre el lienzo entero, no sobre un paquete. `storedPositionFor`
+   * la convierte a relativa si la creación tiene padre (mismo motivo que
+   * `applyLayoutRect`, arriba, para el turno de imagen).
    */
   foldLayout(label: string, x: number, y: number): boolean {
     const index = this.planned.findIndex(
@@ -739,12 +797,86 @@ export class TurnPlan {
     const op = this.planned[index]!;
     const payload = op.payload as unknown as Record<string, unknown>;
     const layout = payload['layout'] as Rect;
+    const parentId = (payload['parentId'] as string | null | undefined) ?? null;
+    const stored = this.storedPositionFor(x, y, parentId);
     const next = {
       ...op,
-      payload: { ...payload, layout: { x, y, width: layout.width, height: layout.height } },
+      payload: { ...payload, layout: { x: stored.x, y: stored.y, width: layout.width, height: layout.height } },
     };
     this.planned[index] = next as unknown as PlannedOp;
     return true;
+  }
+
+  /**
+   * `elementId` (existente, de la foto) → su `parentId` de MODELO, o `null`
+   * si no tiene padre o no se encuentra. Azúcar sobre `elementsById` para
+   * quien necesita convertir una posición ABSOLUTA que declaró el modelo
+   * (`apply_layout` sobre algo que YA existe, no un `new:N`) a lo que hay
+   * que guardar — ver `storedPositionFor`.
+   */
+  elementParentIdOf(elementId: string): string | null {
+    return this.elementsById[elementId]?.parentId ?? null;
+  }
+
+  /**
+   * Posición ABSOLUTA de un token — de la foto (usa `absolutePositionOf` de
+   * `@umlive/contracts`, la misma que usan `DiagramPage.tsx`/`PresenceLayer.tsx`/
+   * `ea-extension.ts`) o de una creación que ESTE TURNO ya planificó (`new:N`,
+   * cuyo `layout`/`parentId` viven en `this.planned`, no en `snapshot`
+   * — no existen todavía en la base). Mismo criterio de "sumar la cadena de
+   * padres" que la función de contracts, pero mezclando las dos fuentes
+   * porque un padre `new:N` (un paquete que el turno acaba de crear, con una
+   * clase adentro planificada a continuación) no está en la foto.
+   *
+   * `null` si el token no resuelve en ninguna de las dos fuentes — no
+   * debería pasar en un plan válido (todo `parentId` referenciado ya se
+   * resolvió contra la foto o contra un `new:N` anterior al validar el
+   * alias), pero `storedPositionFor` cae a "sin convertir" en ese caso en vez
+   * de reventar el turno por una posición.
+   */
+  absolutePositionOfToken(token: string): { x: number; y: number } | null {
+    let x = 0;
+    let y = 0;
+    let current: string | null = token;
+    const visited = new Set<string>();
+    // Un `parentId` de un elemento YA EXISTENTE nunca puede apuntar a un
+    // `new:N` (ese elemento no existía cuando se leyó la foto), así que la
+    // cadena es, cuando mucho, un prefijo de `new:N` seguido de un sufijo
+    // 100% de foto — nunca se intercalan. Este bucle solo camina el prefijo.
+    while (current !== null && current.startsWith('new:')) {
+      if (visited.has(current)) return { x, y };
+      visited.add(current);
+      const op = this.planned.find((candidate) => candidate.type === 'element.create' && candidate.produces === current);
+      if (op === undefined) return null;
+      const payload = op.payload as unknown as { layout?: Rect; parentId?: string | null };
+      if (payload.layout === undefined) return null;
+      x += payload.layout.x;
+      y += payload.layout.y;
+      current = payload.parentId ?? null;
+    }
+    if (current === null) return { x, y };
+    // El resto de la cadena (si la hay) ya vive en la foto — mismo camino que
+    // usa cualquier otro consumidor de layouts (`DiagramPage.tsx`,
+    // `PresenceLayer.tsx`, `ea-extension.ts`).
+    const rest = absolutePositionOf(current, this.elementsById, this.layoutsById);
+    if (rest === null) return null;
+    return { x: x + rest.x, y: y + rest.y };
+  }
+
+  /**
+   * Convierte una posición ABSOLUTA de lienzo — la que declara el modelo, sea
+   * por `apply_layout` (x/y directo) o por `nx`/`ny` de una foto ya resueltas
+   * a lienzo (`layoutImageItems`) — a lo que hay que GUARDAR en
+   * `element_layouts` (`element-parent-containment`): relativa a `parentId`
+   * si lo hay, la misma absoluta si no (la raíz). Cae a "sin convertir"
+   * cuando no puede resolver la posición absoluta del padre — más seguro que
+   * rechazar la llamada del modelo por un problema de geometría interno.
+   */
+  storedPositionFor(x: number, y: number, parentId: string | null): { x: number; y: number } {
+    if (parentId === null) return { x, y };
+    const parentAbsolute = this.absolutePositionOfToken(parentId);
+    if (parentAbsolute === null) return { x, y };
+    return { x: x - parentAbsolute.x, y: y - parentAbsolute.y };
   }
 
   /** Posición del próximo atributo/operación de un dueño (foto + lo planificado). */
@@ -1226,7 +1358,7 @@ const VALIDATORS: Record<string, Validator> = {
             name,
             parentId,
             ...(isAbstract === undefined ? {} : { isAbstract }),
-            layout: plan.nextCreateLayout(effectiveKind),
+            layout: plan.nextCreateLayout(effectiveKind, parentId),
           },
         },
       ],
@@ -1483,8 +1615,14 @@ const VALIDATORS: Record<string, Validator> = {
       return { ops: [] };
     }
 
+    // `x`/`y` de la herramienta son ABSOLUTOS de lienzo (mismo criterio que
+    // arriba). Sobre un elemento EXISTENTE, su `parentId` ya está resuelto en
+    // la foto (nunca puede ser un `new:N` — no existía cuando se leyó), así
+    // que alcanza con `elementParentIdOf`, sin pasar por
+    // `absolutePositionOfToken`/el prefijo `new:N`.
+    const stored = plan.storedPositionFor(x, y, plan.elementParentIdOf(target.token));
     return {
-      ops: [{ type: 'element.move', produces: null, payload: { id: target.token, x, y } }],
+      ops: [{ type: 'element.move', produces: null, payload: { id: target.token, x: stored.x, y: stored.y } }],
     };
   },
 };

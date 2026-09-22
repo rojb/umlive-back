@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import {
+  absolutePositionOf,
   AI_TURN_ERROR,
   type AiImageConfirmResult,
   type AiImageMode,
@@ -1022,7 +1023,23 @@ export class AiTurnService {
     };
   }
 
-  /** Pasa las posiciones normalizadas de la foto al lienzo (D7). */
+  /**
+   * Pasa las posiciones normalizadas de la foto al lienzo (D7).
+   *
+   * `element-parent-containment`: `layout.x/y` de la foto es relativo al
+   * padre (absoluto solo en la raíz) — pasarlo TAL CUAL como obstáculo de
+   * `layoutImageItems` pondría a un elemento hijo en un punto cercano al
+   * origen (su offset relativo al paquete, no su posición real de lienzo),
+   * rompiendo la detección de choques contra `nx`/`ny` ya convertidas a
+   * coordenadas de lienzo. Por eso `existing` se reconstruye ABSOLUTO acá
+   * con `absolutePositionOf` — el mismo criterio que usan `DiagramPage.tsx`/
+   * `PresenceLayer.tsx`/`ea-extension.ts` del lado del cliente/export.
+   *
+   * `plan.applyLayoutRect` hace el camino INVERSO al guardar el rectángulo
+   * que resolvió `layoutImageItems` (absoluto): si la creación nace DENTRO
+   * de un paquete (`create_class` con `parent`), lo vuelve a convertir a
+   * relativo antes de guardarlo — ver el comentario de ese método.
+   */
   private applyImageLayout(
     plan: TurnPlan,
     snapshot: DiagramContent,
@@ -1033,16 +1050,19 @@ export class AiTurnService {
     const creates = plan.imageCreateOps();
     if (creates.length === 0) return;
 
+    const elementsById: Record<string, DiagramContent['elements'][number]> = {};
+    for (const element of snapshot.elements) elementsById[element.id] = element;
+    const layoutsById: Record<string, DiagramContent['layouts'][number]> = {};
+    for (const layout of snapshot.layouts) layoutsById[layout.elementId] = layout;
+
     const placements = layoutImageItems({
       items: creates.map((create) => ({ index: create.index, position: create.position })),
       imageWidth: width,
       imageHeight: height,
-      existing: snapshot.layouts.map((layout) => ({
-        x: layout.x,
-        y: layout.y,
-        width: layout.width,
-        height: layout.height,
-      })),
+      existing: snapshot.layouts.map((layout) => {
+        const absolute = absolutePositionOf(layout.elementId, elementsById, layoutsById) ?? layout;
+        return { x: absolute.x, y: absolute.y, width: layout.width, height: layout.height };
+      }),
       mode,
     });
     for (const placement of placements) {

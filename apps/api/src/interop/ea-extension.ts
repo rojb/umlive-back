@@ -1,4 +1,5 @@
 import {
+  absolutePositionOf,
   XMI_EXPORT_NOTE,
   type DiagramContent,
   type ElementKind,
@@ -25,6 +26,12 @@ import type { IdentityMap } from './xmi-identity';
  * alto se derivan, nunca se guardan. Las coordenadas negativas son válidas —
  * el lienzo usa el origen y valores negativos normalmente — y la mitad
  * `isWellFormedGeometry` de G1 las acepta.
+ *
+ * Desde `element-parent-containment`, `ElementLayout.x/y` en la base es
+ * relativo al elemento padre (absoluto solo en la raíz) — EA no modela esa
+ * relación, así que el bucle de abajo reconstruye la posición absoluta con
+ * `absolutePositionOf` ANTES de llamar a `geometryFor`; nunca se le pasa
+ * `layout.x/y` crudo.
  *
  * **`seqno` acuñado**: se numera 1..N en el orden de las filas que la consulta
  * ya trajo (orden determinista, D8). EA usa `seqno` como z-order; el
@@ -151,6 +158,18 @@ export function emitEaExtension(emitter: XmiEmitter, input: EaExtensionInput): E
     emitter.open('diagram', [att('xmi:id', diagramId), att('name', content.diagram.name)]);
     emitter.open('elements', []);
 
+    // `element-parent-containment`: `layout.x/y` pasó a ser relativo al
+    // elemento padre (absoluto solo en la raíz) — EA no conoce esa relación,
+    // así que la geometría que exporta tiene que seguir siendo absoluta.
+    // Índices por diagrama (no globales: dos `content` pueden repetir ids de
+    // `elementId` entre diagramas distintos... en realidad no, son UUID, pero
+    // igual conviene un índice propio por diagrama para no arrastrar entradas
+    // de otro `content` a `absolutePositionOf`).
+    const elementsById: Record<string, (typeof content.elements)[number]> = {};
+    for (const element of content.elements) elementsById[element.id] = element;
+    const layoutsById: Record<string, (typeof content.layouts)[number]> = {};
+    for (const layout of content.layouts) layoutsById[layout.elementId] = layout;
+
     let seqno = 0;
     for (const layout of content.layouts) {
       // Un elemento suprimido (D5) o sin identidad no tiene forma: su
@@ -159,8 +178,13 @@ export function emitEaExtension(emitter: XmiEmitter, input: EaExtensionInput): E
       const subject = input.identity.forElement(layout.elementId);
       if (subject === null) continue;
       seqno += 1;
+      // `?? layout`: si a algún antepasado le faltara el layout (dato
+      // inconsistente, nunca debería pasar con `layoutsById` construido
+      // arriba de la MISMA lista), se exporta con la coordenada cruda en vez
+      // de reventar el export — mejor una forma mal ubicada que ninguna.
+      const absolute = absolutePositionOf(layout.elementId, elementsById, layoutsById) ?? layout;
       emitter.leaf('element', [
-        att('geometry', geometryFor(layout.x, layout.y, layout.width, layout.height)),
+        att('geometry', geometryFor(absolute.x, absolute.y, layout.width, layout.height)),
         att('subject', subject),
         att('seqno', seqno),
       ]);
