@@ -15,8 +15,16 @@ import { LoginAttemptsService } from './login-attempts.service';
  *
  * Cuenta **todo intento de registro**, no solo los fallos: el abuso que se
  * quiere frenar es crear cuentas en masa, y SC-A02 hace del registro un oráculo
- * de emails. Diez intentos por IP cada 15 min dejan registrar gente en una red
- * NAT compartida y le ponen techo a un script.
+ * de emails.
+ *
+ * **El techo pasó de 10 a 30 por IP cada 15 min (2026-09-22).** Diez alcanzaba
+ * para una IP doméstica y quedaba corto para el caso que esta aplicación tiene
+ * de verdad: un aula entera detrás de una sola NAT universitaria, donde treinta
+ * personas registrándose a la vez agotaban el cupo antes de la mitad. Treinta
+ * sigue siendo un techo real —ciento veinte cuentas por hora desde un mismo
+ * origen— y no cambia nada de lo demás: la ventana, el conteo de todo intento y
+ * el no-consumo del rechazo siguen igual. Subirlo debilita el control en la
+ * misma proporción en que lo agranda; no se sube «por las dudas».
  *
  * **Rompe a propósito la regla «el guard solo lee»** de `login-throttle.guard.ts`:
  * esa regla existe porque ese guard no conoce el resultado del intento (lo
@@ -29,7 +37,7 @@ import { LoginAttemptsService } from './login-attempts.service';
  * una IP bloqueada alargaría su propio bloqueo para siempre con cada reintento,
  * y `Retry-After` mentiría.
  */
-const REGISTRATION_LIMIT = 10;
+const REGISTRATION_LIMIT = 30;
 
 @Injectable()
 export class RegistrationThrottleGuard implements CanActivate {
