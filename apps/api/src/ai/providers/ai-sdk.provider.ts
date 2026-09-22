@@ -52,27 +52,28 @@ import type {
 export const MAX_OUTPUT_TOKENS = 4096;
 
 /**
- * Tope de salida de un llamado CON IMAGEN.
+ * Tope de salida de un llamado CON IMAGEN. Hoy igual al de texto, y el camino
+ * separado existe para no volver a probar subiéndolo: ya se probó y no sirve.
  *
- * Medido, no elegido de arriba: cuatro turnos de imagen seguidos cerraron con
- * `output_tokens` = 4096 EXACTOS —el tope de arriba—, texto vacío y cero
- * llamadas a herramienta. Es decir, el modelo se quedaba sin presupuesto de
- * salida antes de emitir una sola llamada, y la vista previa llegaba con
- * «Ítems · 0» ya cobrada (~US$0,0078 cada intento).
+ * **El experimento y su resultado.** Cuatro turnos de imagen cerraron con
+ * `output_tokens` = 4096 EXACTOS —el tope—, texto vacío, cero llamadas y
+ * `finishReason=length`. Se subió a 8192 para ver si le faltaba margen: el
+ * modelo consumió los 8192 completos y devolvió lo mismo, texto vacío y cero
+ * llamadas, con el intento pasando de ~US$0,0078 a ~US$0,0127. O sea que NO
+ * le falta presupuesto: consume todo el que se le dé. Se vuelve a 4096 para no
+ * pagar el doble por el mismo resultado.
  *
- * Solo para imagen, a propósito: los turnos de TEXTO completan de sobra con
- * 4096 y cuestan dos órdenes de magnitud menos, y este número entra en la
- * ESTIMACIÓN de la reserva (`estimateCost`) — subirlo para todos inflaría la
- * reserva de cada iteración de cada turno y acercaría el techo de gasto sin
- * necesidad.
+ * Lo que queda por decidir está en el diagnóstico de `call` más abajo, que
+ * registra en qué se gastó la salida. Los dos desenlaces piden arreglos
+ * opuestos, así que el número a mover NO es este hasta tener ese dato.
  *
- * El doble y no más: 4096 está comprobado insuficiente, pero cuánto hace
- * falta no se midió (la sospecha es que el modelo gasta la salida razonando,
- * y el adaptador no lee `result.reasoning`). Duplicar es el paso proporcional
- * y acotado: lleva cada intento a ~US$0,011. Si sigue agotándose, el número a
- * revisar es este y la próxima pista es `finishReason`.
+ * Se conserva la constante y el camino por separado por una razón de gasto:
+ * este valor entra en la ESTIMACIÓN de la reserva (`estimateCost`), que desde
+ * el arreglo de la contabilidad se toma por CADA iteración. Un tope de imagen
+ * distinto del de texto tiene que poder existir sin inflar la reserva de todos
+ * los turnos, y esa cañería ya quedó tendida por las dos puntas.
  */
-export const IMAGE_MAX_OUTPUT_TOKENS = 8192;
+export const IMAGE_MAX_OUTPUT_TOKENS = 4096;
 
 /** Corte por llamado. Un cuelgue no puede dejar una reserva sin liquidar. */
 export const CALL_TIMEOUT_MS = 60_000;
@@ -169,6 +170,33 @@ export class AiSdkLlmProvider implements LlmProvider {
       timeout: CALL_TIMEOUT_MS,
       abortSignal: options?.abortSignal,
     });
+
+    // Diagnóstico del turno que se corta por presupuesto sin producir nada.
+    //
+    // Subir el tope de 4096 a 8192 no arregló el turno de imagen: el modelo
+    // consumió los 8192 igual y devolvió texto vacío y cero llamadas, con
+    // `finishReason=length` en los dos tamaños. Así que la pregunta pasa a ser
+    // EN QUÉ gastó la salida, y la respuesta está en campos que este adaptador
+    // recibe y hasta ahora descartaba: `usage.reasoningTokens` (el SDK 7 los
+    // reporta aparte) y `reasoningText`.
+    //
+    // Los dos desenlaces piden arreglos OPUESTOS, y por eso hace falta el dato
+    // antes de tocar nada: si el razonamiento se comió el presupuesto, ningún
+    // tope alcanza y hay que configurar el proveedor o leer el razonamiento;
+    // si el razonamiento es cero, la salida se fue en una llamada a
+    // herramienta gigante que quedó truncada a medio emitir, y eso lo provoca
+    // nuestra propia instrucción de imagen («pedí todas las llamadas en la
+    // MENOR cantidad de respuestas posible»), que se arregla gratis.
+    if (result.finishReason === 'length' && result.text.length === 0 && result.toolCalls.length === 0) {
+      const usage = result.usage as { reasoningTokens?: number | null };
+      // eslint-disable-next-line no-console -- este adaptador no tiene Logger de Nest inyectado.
+      console.warn(
+        `[AiSdkProvider] llamado cortado por presupuesto sin producir nada: ` +
+          `salida=${String(result.usage.outputTokens)} razonamiento=${String(usage.reasoningTokens)} ` +
+          `largoDelRazonamiento=${String(result.reasoningText?.length ?? 0)} ` +
+          `avisos=${JSON.stringify(result.warnings ?? [])}`,
+      );
+    }
 
     return {
       text: result.text,
