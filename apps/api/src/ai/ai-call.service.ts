@@ -118,6 +118,18 @@ export interface AiTurn {
    * haría que el llamado cayera a la clave del entorno sin que nadie lo decida.
    */
   readonly credentialFor: (provider: AiProviderId) => ProviderCredential;
+  /**
+   * ¿La reserva que abrió el turno ya fue consumida por un llamado?
+   *
+   * Mutable a propósito, y el único campo que lo es. `openTurn` reserva UN
+   * llamado (`expectedIterations` da 1 fuera de imagen), pero `call` se invoca
+   * una vez POR ITERACIÓN del bucle de herramientas, que en texto llega a 25.
+   * Sin esta marca, de la segunda iteración en adelante `settleCall` restaba
+   * una estimación que nadie había reservado y `cost_usd` se iba abajo de cero:
+   * `ck_ai_cost_nonneg` abortaba el UPDATE, el turno entero se reportaba como
+   * «intento del modelo falló» y no se aplicaba ningún cambio.
+   */
+  openingReserveUsed: boolean;
 }
 
 export type StartTurnResult =
@@ -252,15 +264,29 @@ export class AiCallService {
         requiresToolCalling,
         startedAt: Date.now(),
         credentialFor: resolved.credentialFor,
+        openingReserveUsed: false,
       },
     };
   }
 
   /**
-   * Recorre la cadena. El primer intento ya está reservado por `startTurn`;
-   * del segundo en adelante se reserva con `reserveCall` ANTES de llamar.
+   * Recorre la cadena. El PRIMER llamado del turno ya está reservado por
+   * `startTurn`; todo llamado posterior —otro eslabón de la cadena, u otra
+   * iteración del bucle de herramientas— se reserva con `reserveCall` ANTES
+   * de llamar.
+   *
+   * La distinción entre «intento» e «iteración» es lo que estaba roto: este
+   * método se invoca una vez por ITERACIÓN, no una vez por turno, así que
+   * reservar solo en el fallback dejaba sin cubrir las iteraciones 2..25.
    */
   async call(turn: AiTurn, request: AiCallRequest): Promise<AiCallResult> {
+    // La reserva de apertura la reclama el primer llamado del turno y nadie
+    // más. Se marca acá, antes de cualquier salida temprana: si se marcara
+    // recién al liquidar, un primer llamado que se saltea todos los eslabones
+    // dejaría la marca en falso y la iteración siguiente volvería a gastar
+    // una reserva que ya no existe.
+    const coveredByOpeningReserve = !turn.openingReserveUsed;
+    turn.openingReserveUsed = true;
     // Cada intento de la cadena se estima por UN llamado: la reserva del primer
     // intento ya cubría las iteraciones esperadas del bucle (D9.2), y acá se
     // liquida el uso real de este llamado.
@@ -287,7 +313,7 @@ export class AiCallService {
       }
 
       const estimate = this.spend.estimateCost(model, payload);
-      if (fallbackFrom !== null) {
+      if (fallbackFrom !== null || !coveredByOpeningReserve) {
         const reserved = await this.spend.reserveCall({ turnId: turn.turnId, estimate });
         if (!reserved.ok) {
           lastError = `reserva rechazada antes de ${ref} (${reserved.reason})`;
