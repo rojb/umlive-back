@@ -934,9 +934,24 @@ export class AiTurnService {
 
       modelText = result.completion.text;
       if (result.completion.toolCalls.length === 0) {
+        // El turno de imagen no tenía NINGÚN diagnóstico, y este es el caso
+        // que más lo necesita: una vista previa con «Ítems · 0» ya cobrada es
+        // indistinguible de un fallo si no se sabe qué contestó el modelo.
+        // Cerrar sin una sola llamada a herramienta es lo que pasa cuando el
+        // modelo describe la foto en prosa en vez de dibujarla, o cuando no
+        // la ve y lo dice con palabras — y las dos cosas se distinguen leyendo
+        // su texto, que hasta ahora no quedaba en ninguna parte.
+        this.log.warn(
+          `turno de imagen ${turn.turnId}: el modelo cerró en la iteración ${iterations} SIN llamar herramientas. ` +
+            `Texto devuelto: ${JSON.stringify((result.completion.text ?? '').slice(0, 600))}`,
+        );
         closedByModel = true;
         break;
       }
+      this.log.log(
+        `turno de imagen ${turn.turnId}: iteración ${iterations}, ${result.completion.toolCalls.length} llamada(s) ` +
+          `(${result.completion.toolCalls.map((c) => c.toolName).join(', ')})`,
+      );
 
       args.messages.push({
         role: 'assistant',
@@ -946,6 +961,15 @@ export class AiTurnService {
       });
       for (const toolCall of result.completion.toolCalls) {
         const outcome = args.plan.addToolCall(toolCall.toolName, toolCall.input);
+        // El mismo rastro que el turno de texto ya dejaba: sin esto, una
+        // llamada rechazada desaparecía y la vista previa quedaba con menos
+        // ítems de los que el modelo pidió, sin decir cuál se cayó ni por qué.
+        if (!outcome.ok) {
+          this.log.warn(
+            `turno de imagen ${turn.turnId}: ${toolCall.toolName} rechazada (${outcome.error}) ` +
+              `con input ${JSON.stringify(toolCall.input)}`,
+          );
+        }
         args.messages.push({
           role: 'tool',
           content: outcome.result,
