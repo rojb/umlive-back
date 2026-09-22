@@ -75,6 +75,14 @@ export const MAX_OUTPUT_TOKENS = 4096;
  */
 export const IMAGE_MAX_OUTPUT_TOKENS = 4096;
 
+/**
+ * Opciones de proveedor de un llamado de chat, DERIVADAS del propio
+ * `generateText` en vez de reescritas a mano: el SDK exige valores JSON y un
+ * `Record<string, unknown>` no lo satisface. Derivarlo tambien lo mantiene
+ * correcto si el SDK cambia la forma.
+ */
+export type ChatProviderOptions = NonNullable<Parameters<typeof generateText>[0]['providerOptions']>;
+
 /** Corte por llamado. Un cuelgue no puede dejar una reserva sin liquidar. */
 export const CALL_TIMEOUT_MS = 60_000;
 
@@ -82,6 +90,12 @@ export class AiSdkLlmProvider implements LlmProvider {
   constructor(
     private readonly model: LanguageModel,
     private readonly capabilities: AiCapabilities,
+    /**
+     * Opciones del proveedor para `generateText`, tal como las trae el
+     * catálogo. Este adaptador NO las mira: las reenvía. Interpretarlas acá
+     * lo ataría a un proveedor concreto, que es justo lo que no debe pasar.
+     */
+    private readonly chatProviderOptions?: ChatProviderOptions,
   ) {}
 
   describeCapabilities(): AiCapabilities {
@@ -166,6 +180,7 @@ export class AiSdkLlmProvider implements LlmProvider {
       messages: modelMessages,
       tools: toToolSet(tools),
       maxOutputTokens: options?.maxOutputTokens ?? MAX_OUTPUT_TOKENS,
+      ...(this.chatProviderOptions === undefined ? {} : { providerOptions: this.chatProviderOptions }),
       maxRetries: 0,
       timeout: CALL_TIMEOUT_MS,
       abortSignal: options?.abortSignal,

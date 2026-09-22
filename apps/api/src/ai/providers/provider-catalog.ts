@@ -15,6 +15,7 @@ import { createMoonshotAI } from '@ai-sdk/moonshotai';
 import { createOpenAI } from '@ai-sdk/openai';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import type { LanguageModel, TranscriptionModel } from 'ai';
+import type { ChatProviderOptions } from './ai-sdk.provider';
 import type { TranscriptionProviderOptions } from './ai-sdk.transcriber';
 
 /**
@@ -91,6 +92,15 @@ export type CatalogProvider = {
   /** Capacidad hermana de transcripción de voz (FR-D20, D1). Opcional. */
   readonly transcription?: CatalogTranscription;
   buildModel(settings: ProviderSettings, modelId: string): LanguageModel;
+  /**
+   * Opciones específicas del proveedor para los llamados de CHAT, tal como el
+   * AI SDK las espera en `providerOptions` (`{ <proveedor>: { … } }`).
+   *
+   * Viven acá y no en el adaptador porque el adaptador es agnóstico a propósito
+   * (traduce un dialecto neutral y nada más): solo las reenvía sin mirarlas,
+   * igual que ya hace `providerOptions(lang)` con la transcripción.
+   */
+  readonly chatProviderOptions?: ChatProviderOptions;
 };
 
 /**
@@ -334,6 +344,27 @@ export const PROVIDER_CATALOG: readonly CatalogProvider[] = [
     ],
     buildModel: (settings, modelId) =>
       createDeepSeek({ apiKey: settings.apiKey, baseURL: settings.baseURL })(modelId),
+    /**
+     * Modo de razonamiento APAGADO.
+     *
+     * `@ai-sdk/deepseek` lo documenta así: «Controls whether thinking mode is
+     * enabled. **Defaults to `enabled`**». Nadie lo había apagado, y en el
+     * turno de imagen eso rompía el turno entero: el modelo producía 15.563
+     * caracteres de razonamiento, agotaba el presupuesto de salida completo y
+     * cerraba con `finishReason=length`, texto vacío y CERO llamadas a
+     * herramienta. La vista previa llegaba con «Ítems · 0» ya cobrada. Medido:
+     * pasó igual con el tope en 4096 y en 8192, así que no era falta de
+     * presupuesto sino que razonaba hasta agotarlo.
+     *
+     * Acá el modelo no tiene que deliberar: tiene que EMITIR LLAMADAS A
+     * HERRAMIENTA. El razonamiento se factura como salida y no vuelve en
+     * `text`, así que en este uso es presupuesto que se paga y se tira.
+     *
+     * `reasoningEffort: 'low'` era la otra opción; se descartó porque sigue
+     * gastando salida sin techo conocido, y el problema acá no es cuánto
+     * razona sino que razone en vez de llamar.
+     */
+    chatProviderOptions: { deepseek: { thinking: { type: 'disabled' } } },
   },
   {
     id: 'moonshot',

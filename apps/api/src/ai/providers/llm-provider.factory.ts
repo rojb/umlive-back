@@ -310,7 +310,7 @@ function buildProviderFactory(
           : readSetting(config, 'AI_OPENAI_COMPATIBLE_API_KEY');
     }
 
-    return new AiSdkLlmProvider(entry.buildModel(settings, ref.model), model.capabilities);
+    return new AiSdkLlmProvider(entry.buildModel(settings, ref.model), model.capabilities, entry.chatProviderOptions);
   };
 }
 
