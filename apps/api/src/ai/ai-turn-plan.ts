@@ -491,29 +491,126 @@ export class TurnPlan {
   }
 
   /**
-   * Resuelve un alias contra la foto o contra lo que el turno ya planificó.
-   * Un alias que no resuelve es un error de herramienta, nunca un silencio.
+   * Resuelve una referencia del modelo contra el estado o contra lo que el
+   * turno ya planificó. Una referencia que no resuelve es un error de
+   * herramienta, nunca un silencio.
+   *
+   * ── Por qué acepta también el NOMBRE (2026-09-21) ──────────────────────────
+   * El alias corto existe para que los UUID no lleguen al modelo, y sigue
+   * siendo la forma preferida. Pero un modelo chico manda el nombre igual:
+   * medido, no supuesto — el log de un turno real dejó
+   * `add_attribute {"target":"Cita","name":"fecha","type":"Date"}` sobre un
+   * diagrama donde `Cita` era `e:1`, y lo repitió DESPUÉS de recibir un error
+   * que le decía «No uses el nombre del elemento» junto con el inventario
+   * completo de alias. Endurecer más el prompt es pelearle a la capacidad del
+   * modelo; resolver el nombre acá es determinista y barato.
+   *
+   * Esto NO afloja SC-D11 («no inventar»): el nombre se busca contra el estado
+   * real, tiene que coincidir con EXACTAMENTE una cosa, y un nombre que no
+   * existe se sigue rechazando. Lo que desaparece es el rebote por notación.
+   *
+   * La distinción que sostiene todo: algo con FORMA de alias (`e:0`, `new:9`)
+   * que no resuelve es un alias equivocado y se rechaza como tal — nunca se
+   * reinterpreta como nombre. El nombre es el camino de lo que no parece alias.
    */
-  resolveAlias(value: string): AliasLookup | DraftError {
-    if (!ALIAS_RE.test(value)) {
+  resolveAlias(value: string, expected?: RefKind): AliasLookup | DraftError {
+    if (ALIAS_RE.test(value)) {
+      const resolved = this.refs.get(value);
+      if (resolved !== undefined) return { ok: true, ...resolved };
       return draftError(
         'unknown_alias',
-        `"${value}" no es un alias válido. Usá e:N, f:N o r:N para algo que está en la foto del diagrama, o new:N para algo que este turno creó.`,
+        `El alias ${value} no existe en este diagrama. ${this.aliasInventory()}`,
       );
     }
-    const resolved = this.refs.get(value);
-    if (resolved === undefined) {
+
+    // Tiene forma de alias pero está mal escrito (`e:`, `new:x`): es un alias
+    // roto, no un nombre. Reinterpretarlo abriría la puerta a que una clase
+    // llamada "e:1" secuestre la referencia.
+    if (looksLikeAlias(value)) {
       return draftError(
         'unknown_alias',
-        `El alias ${value} no corresponde a nada de la foto del diagrama ni a algo que este turno planificó.`,
+        `"${value}" no es un alias válido: se espera la forma e:N, f:N o r:N (por ejemplo e:1). ${this.aliasInventory()}`,
       );
     }
-    return { ok: true, ...resolved };
+
+    return this.resolveByName(value, expected);
   }
 
-  /** Resuelve un alias exigiendo su tipo (un dueño de atributo es un elemento). */
+  /**
+   * Busca por nombre contra el estado del diagrama. Exacto primero; si no hay,
+   * sin distinguir mayúsculas. Tiene que dar UNA sola cosa: dos clases que se
+   * llaman igual son una ambigüedad real y se devuelve para que el modelo
+   * elija con el alias, que nunca es ambiguo.
+   */
+  private resolveByName(name: string, expected?: RefKind): AliasLookup | DraftError {
+    const candidates: { readonly alias: string; readonly ref: ResolvedRef; readonly name: string }[] = [];
+    const push = (kind: RefKind, alias: string, candidateName: string | null, token: string) => {
+      if (candidateName === null || candidateName.length === 0) return;
+      if (expected !== undefined && kind !== expected) return;
+      candidates.push({ alias, ref: { kind, token }, name: candidateName });
+    };
+
+    this.snapshot.elements.forEach((element, index) => {
+      push('element', elementAlias(index), element.name, element.id);
+    });
+    this.snapshot.features.forEach((feature, index) => {
+      push('feature', featureAlias(index), feature.name, feature.id);
+    });
+    this.snapshot.relationships.forEach((relationship, index) => {
+      push('relationship', relationshipAlias(index), relationship.name, relationship.id);
+    });
+
+    const exact = candidates.filter((candidate) => candidate.name === name);
+    const matches =
+      exact.length > 0
+        ? exact
+        : candidates.filter((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
+
+    if (matches.length === 1) return { ok: true, ...matches[0]!.ref };
+    if (matches.length > 1) {
+      return draftError(
+        'unknown_alias',
+        `"${name}" coincide con más de una cosa (${matches.map((m) => m.alias).join(', ')}). ` +
+          'Usá el alias para decir cuál.',
+      );
+    }
+    return draftError(
+      'unknown_alias',
+      `No hay nada llamado "${name}" en este diagrama, y tampoco es un alias. ${this.aliasInventory()}`,
+    );
+  }
+
+  /**
+   * Los alias que SÍ resuelven ahora mismo, con su nombre al lado, para que el
+   * modelo pueda elegir uno en la iteración siguiente en vez de volver a
+   * inventar. Incluye lo que este turno planificó (`new:N`), porque un
+   * atributo puede colgar de una clase recién creada.
+   */
+  private aliasInventory(): string {
+    const parts: string[] = [];
+    this.snapshot.elements.forEach((element, index) => {
+      parts.push(`${elementAlias(index)} (${element.name ?? 'sin nombre'})`);
+    });
+    this.snapshot.features.forEach((feature, index) => {
+      parts.push(`${featureAlias(index)} (${feature.name})`);
+    });
+    this.snapshot.relationships.forEach((_relationship, index) => {
+      parts.push(relationshipAlias(index));
+    });
+    for (const label of this.itemOfLabel.keys()) parts.push(label);
+    return parts.length === 0
+      ? 'El diagrama está vacío: no hay ningún alias todavía, así que primero hay que crear el elemento.'
+      : `Los alias disponibles son: ${parts.join(', ')}.`;
+  }
+
+  /**
+   * Resuelve exigiendo el tipo (un dueño de atributo es un elemento). El tipo
+   * esperado viaja hasta la búsqueda por nombre: pedir el dueño de un atributo
+   * llamado `nombre` tiene que encontrar la CLASE `nombre`, no el atributo
+   * homónimo de otra clase.
+   */
   resolveAliasOf(value: string, expected: RefKind, field: string): AliasLookup | DraftError {
-    const resolved = this.resolveAlias(value);
+    const resolved = this.resolveAlias(value, expected);
     if (isDraftError(resolved)) return resolved;
     if (resolved.kind !== expected) {
       return draftError(

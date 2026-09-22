@@ -409,6 +409,16 @@ export class AiTurnService {
 
       for (const toolCall of result.completion.toolCalls) {
         const outcome = context.plan.addToolCall(toolCall.toolName, toolCall.input);
+        // `notApplied` solo guarda `{tool, reason}` (contrato FR-D25), así que
+        // el valor que el modelo realmente mandó se perdía: el resumen decía
+        // «add_attribute: unknown_alias» y no había forma de saber si fue un
+        // `e:0`, un `Cita` o un alias fuera de rango. Sin esto, el próximo
+        // fallo se diagnostica adivinando.
+        if (!outcome.ok) {
+          this.log.warn(
+            `turno de texto: ${toolCall.toolName} rechazada (${outcome.error}) con input ${JSON.stringify(toolCall.input)}`,
+          );
+        }
         messages.push({
           role: 'tool',
           content: outcome.result,
