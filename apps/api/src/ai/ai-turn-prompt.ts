@@ -12,11 +12,27 @@ import { elementAlias, featureAlias, relationshipAlias } from './ai-turn-plan';
  *    se guardan EXACTAMENTE como los devolvió, tildes incluidas. El prompt
  *    prohíbe traducirlos y transliterarlos, que es el defecto que PO-4 detectó
  *    entre `Dirección` y `Direccion`.
- * 2. **No inventar (SC-D11)**: lo que no está en la foto del diagrama se
+ * 2. **No inventar (SC-D11)**: lo que no está en el estado del diagrama se
  *    reporta en el texto final, nunca se crea ni se referencia. Los UUID no
  *    llegan al modelo, así que tampoco los puede inventar: ve alias.
- * 3. **La foto serializada**: `e:3 CLASS Cliente {f:7 nombre: String}`, corta y
- *    estable, con la MISMA numeración que resuelve el plan.
+ * 3. **El estado serializado**: `e:3 CLASS Cliente {f:7 nombre: String}`, corto
+ *    y estable, con la MISMA numeración que resuelve el plan.
+ *
+ * ── Defecto corregido (2026-09-21) ─────────────────────────────────────────
+ * Este bloque se llamaba «la foto del diagrama» y las Referencias hablaban de
+ * «la foto». En un turno de IMAGEN la palabra es correcta y hay una foto real;
+ * en uno de TEXTO no hay ninguna, así que el modelo la leía en sentido literal
+ * y contestaba pidiendo que le mandaran la imagen — con el estado completo
+ * delante, serializado, en ese mismo prompt. Síntoma reproducido: «no tengo
+ * ninguna foto del diagrama a la vista, así que no puedo confirmar si existe la
+ * clase Cita», dicho por un modelo que en la misma respuesta usaba la palabra
+ * «alias», que sale de acá y de ningún otro lado.
+ *
+ * Regla que deja el arreglo: **«foto» se reserva para la fotografía de verdad**
+ * (`imageInstructions`, y `nx`/`ny` en `ai-tools.ts`). El contenido del diagrama
+ * es «el estado del diagrama», y se dice explícitamente que ya está en el
+ * prompt como texto. No renombrar esto de vuelta por simetría con el turno de
+ * imagen: la simetría era el defecto.
  *
  * `apps/api` es CommonJS: imports relativos sin `.js`.
  */
@@ -42,10 +58,15 @@ export function buildSystemPrompt(snapshot: DiagramContent, options: SystemPromp
     '- Si una parte de la instrucción no se puede cumplir, decilo en el texto final. No la apliques a medias ni en silencio.',
     '',
     '## Referencias',
-    '- En la foto del diagrama cada cosa tiene un alias: `e:N` elementos, `f:N` atributos u operaciones, `r:N` relaciones.',
+    '- Más abajo, en «Estado actual del diagrama», tenés el contenido COMPLETO del diagrama abierto, ya serializado como texto. Es lo que hay ahora mismo en el lienzo: leelo de ahí y trabajá sobre eso.',
+    '- No necesitás ninguna imagen ni captura para saber qué existe, y nunca pidas una: el estado ya está en este mensaje.',
+    '- En ese estado cada cosa tiene un alias: `e:N` elementos, `f:N` atributos u operaciones, `r:N` relaciones.',
+    '- La numeración EMPIEZA EN 1, no en 0: el primer elemento es `e:1`. No existe `e:0`.',
+    '- Copiá el alias TAL CUAL aparece en el estado; no lo deduzcas ni lo renumeres.',
+    '- Preferí siempre el alias. Si mandás el nombre exacto («Cita»), el servidor lo resuelve igual, pero el nombre falla cuando dos cosas se llaman parecido y el alias nunca.',
     '- Cuando una herramienta necesita referirse a algo que ya existe, usá su alias; nunca un id ni un UUID.',
     '- Lo que este turno crea queda disponible como `new:N`, en el orden en que lo creaste. Podés usarlo en las llamadas siguientes.',
-    '- Si el alias que necesitás no aparece en la foto, la clase o el atributo NO existe: decilo en el texto final, no lo inventes.',
+    '- Si el alias que necesitás no aparece en el estado del diagrama, la clase o el atributo NO existe: decilo en el texto final, no lo inventes.',
     '',
     '## Nombres (regla dura)',
     '- Escribí cada nombre — clase, atributo, operación, parámetro y relación — EXACTAMENTE como lo dijo la persona: en español, con sus tildes y su ortografía.',
@@ -57,7 +78,8 @@ export function buildSystemPrompt(snapshot: DiagramContent, options: SystemPromp
     '## Herramientas',
     ...tools.map((tool) => `- \`${tool.name}\`: ${tool.description}`),
     '',
-    '## Foto del diagrama',
+    '## Estado actual del diagrama',
+    'Esto es lo que el diagrama contiene AHORA. Es la fuente de verdad de este turno; no hace falta nada más para leerlo.',
     'Formato: `e:N TIPO Nombre {f:M nombre: tipo}` para elementos y sus miembros, `r:N TIPO e:origen -> e:destino` para relaciones.',
     describeDiagram(snapshot),
   ].join('\n');

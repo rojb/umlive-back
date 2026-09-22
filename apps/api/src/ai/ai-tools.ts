@@ -99,9 +99,16 @@ const AGGREGATIONS: AggregationKind[] = ['NONE', 'SHARED', 'COMPOSITE'];
 
 const PARAMETER_DIRECTIONS: EditableParameterDirection[] = ['IN', 'OUT', 'INOUT'];
 
-/** Descripción uniforme del alias, para no repetirla en cada esquema. */
+/**
+ * Descripción uniforme del alias, para no repetirla en cada esquema.
+ *
+ * Decía «de la foto del diagrama». Igual que en `ai-turn-prompt.ts`, esa
+ * palabra empujaba al modelo a esperar una imagen en un turno de texto: acá
+ * pesa más todavía, porque esta línea se repite en el esquema de CADA
+ * herramienta. «Estado del diagrama» es lo que realmente recibe.
+ */
 const ALIAS_HELP =
-  'Alias de la foto del diagrama (e:3 elemento, f:7 atributo u operación, r:2 relación) o new:1 para algo que este turno creó.';
+  'Alias del estado del diagrama (e:3 elemento, f:7 atributo u operación, r:2 relación) o new:1 para algo que este turno creó.';
 
 /**
  * Las siete herramientas del turno de texto. El orden es el de la tabla de D6
