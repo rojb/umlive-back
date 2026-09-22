@@ -73,11 +73,35 @@ import type {
   XmiImportPreview,
   XmiImportResult,
 } from '@umlive/contracts';
-import { isBlockingRule } from '@umlive/contracts';
+import { isBlockingRule, PASSWORD_MIN_LENGTH } from '@umlive/contracts';
 import { buildDiagramContent, emitXmiDocument, PROJECT_SPECS, type DiagramSpec, type ProjectSpec } from './demo-dataset';
 
-/** Fija en las cuatro cuentas (design decision del brief). Nunca se imprime. */
-const PASSWORD = '***REDACTADO-VER-SEED_DEMO_PASSWORD***';
+/**
+ * La misma contraseña para las cuatro cuentas, leída del entorno y nunca
+ * impresa.
+ *
+ * **No va escrita acá, y la razón no es estética.** `rojb/umlive-back` es un
+ * repositorio **público**, y estas cuentas existen de verdad en el hosteado:
+ * una de ellas es anfitriona de los tres proyectos. Dejar la contraseña en el
+ * código sería publicar la llave de una instancia viva —diagramas que se pueden
+ * borrar, y un presupuesto de IA real detrás del techo de `AI_SPEND_CEILING_USD`.
+ *
+ * Es además la convención que el seed de producto ya sigue:
+ * `src/seed/seed-blocks.ts` lee `SEED_DEMO_PASSWORD` del entorno y nunca la
+ * registra. Este script usa la misma variable a propósito, para que sembrar
+ * con uno o con el otro no pida dos secretos distintos.
+ */
+const PASSWORD = (() => {
+  const raw = process.env.SEED_DEMO_PASSWORD ?? '';
+  if (raw.length < PASSWORD_MIN_LENGTH) {
+    throw new Error(
+      `falta SEED_DEMO_PASSWORD (o tiene menos de ${PASSWORD_MIN_LENGTH} caracteres). ` +
+        'Es la contraseña de las cuatro cuentas de demostración; no se escribe en el código ' +
+        'porque este repositorio es público. Ejemplo: SEED_DEMO_PASSWORD=… npx tsx scripts/seed-demo-dataset.ts --base …',
+    );
+  }
+  return raw;
+})();
 
 interface AccountSpec {
   displayName: string;
