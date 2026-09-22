@@ -588,7 +588,10 @@ export class AiCallService {
 
   private payloadOf(request: AiCallRequest, imageIterations: number) {
     return {
-      instructions: request.instructions,
+      // `instructions` NO entra en la cuenta: desde que el prompt de sistema
+      // viaja como mensaje `system` dentro de `messages` —que es lo que de
+      // verdad se envía—, sumarlo de los dos lados estimaría dos veces el
+      // mismo texto, y esa estimación es la reserva que se toma por iteración.
       messages: request.messages,
       tools: request.tools ?? [],
       images: request.images ?? [],

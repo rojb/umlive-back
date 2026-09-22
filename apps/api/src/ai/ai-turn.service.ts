@@ -296,7 +296,32 @@ export class AiTurnService {
     const plan = new TurnPlan(snapshot, { opLimit: TURN_LIMITS[dto.inputMode as AiInputMode].ops });
     const tools = buildTools(dto.inputMode as AiInputMode);
     const instructions = buildSystemPrompt(snapshot, { tools });
-    const messages: LlmMessage[] = [{ role: 'user', content: dto.prompt }];
+    // El prompt de sistema viaja como MENSAJE `system`, que es el único camino
+    // por el que llega al modelo: `AiCallService` pasa `request.messages` al
+    // adaptador y nada más, y `AiSdkProvider` arma su bloque de instrucciones
+    // recorriendo esos mensajes (`ai-sdk.provider.ts`, `case 'system'`).
+    //
+    // Hasta acá `instructions` se calculaba, se pagaba en la estimación de
+    // costo y NO SE ENVIABA: el campo `AiCallRequest.instructions` solo entra a
+    // `payloadOf`, que es contabilidad. El modelo nunca vio el estado del
+    // diagrama; lo único que le llegaba era la descripción de los parámetros de
+    // las herramientas, que menciona los alias sin enumerarlos. De ahí salían
+    // las dos respuestas que parecían de otro problema: primero «no tengo
+    // ninguna foto del diagrama a la vista» (cuando esa descripción decía «la
+    // foto del diagrama») y después «no veo ningún alias para Cita», con el
+    // modelo adivinando si el atributo se llamaba `fecha`, `fechaCita` o
+    // `fechaHora` — exactamente lo que hace quien no recibió la lista.
+    const messages: LlmMessage[] = [
+      { role: 'system', content: instructions },
+      { role: 'user', content: dto.prompt },
+    ];
+    // Deja rastro de que el estado viajó y de cuánto: un turno que vuelva a
+    // decir «no veo el diagrama» se resuelve mirando esta línea en vez de
+    // deduciéndolo del texto del modelo.
+    this.log.log(
+      `turno de texto: prompt de sistema adjunto (${instructions.length} caracteres, ` +
+        `${snapshot.elements.length} elementos, ${snapshot.features.length} miembros)`,
+    );
     // El plazo y la cancelación del cliente, combinados (D9). Mantener las dos
     // señales SEPARADAS es lo que permite distinguir al final una cancelación
     // del usuario (CANCELLED) del plazo agotado (FAILED).
@@ -601,7 +626,12 @@ export class AiTurnService {
       const tools = buildTools('IMAGE');
       const instructions = buildSystemPrompt(snapshot, { tools, imageMode: dto.mode });
       const promptText = dto.prompt ?? DEFAULT_IMAGE_PROMPT;
-      const messages: LlmMessage[] = [{ role: 'user', content: promptText }];
+      // Mismo defecto que en el turno de texto: sin el mensaje `system` el
+      // modelo no recibía ni las reglas de la foto ni el estado del diagrama.
+      const messages: LlmMessage[] = [
+        { role: 'system', content: instructions },
+        { role: 'user', content: promptText },
+      ];
       const effective = AbortSignal.timeout(AI_TURN_DEADLINE_MS);
       // La versión se lee ANTES que la foto (D8/PO-D): con una carrera el
       // resultado es un `409` de más, nunca uno de menos.
